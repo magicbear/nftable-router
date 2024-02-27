@@ -677,7 +677,7 @@ def ip_mark(packet):
 
         packet_payload = packet.get_payload()
         pkt_version = packet_payload[0] >> 4
-        qos_flag = packet_payload[1]
+        qos_flag = packet_payload[1] >> 2
         if pkt_version == 4:
             proto = packet_payload[9]
             src = str(socket.inet_ntoa(packet_payload[12:16]))
@@ -760,7 +760,7 @@ def ip_mark(packet):
                 out_interface = cache_ecmp.tun_id
                 geodata = None
                 test_session = 2
-            elif qos_flag != 0 and proto == 1 and qos_flag <= len(config['proxy']):
+            elif qos_flag != 0 and (proto == 1 or (proto == 6 and port == 53)) and qos_flag <= len(config['proxy']):
                 proxy = list(config['proxy'].values())[qos_flag - 1]
                 mark = proxy['mark']
                 packet.set_mark(mark)
