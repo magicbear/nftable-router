@@ -13,6 +13,10 @@ import netfilterqueue
 import ipaddress
 import sys
 import os
+module_dir = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, module_dir)
+sys.path.insert(0, os.path.join(module_dir, "../"))
+
 import redis
 from scapy.layers.dns import DNSRR, DNS, DNSQR
 from pyroute2 import IPSet
@@ -1381,6 +1385,7 @@ if __name__ == "__main__":
     unbuffered_stdin = os.fdopen(sys.stdin.fileno(), 'rb', buffering=0)
 
     selected_proxy = None
+    cps = 0
 
     while not term.value:
         try:
@@ -1465,7 +1470,8 @@ if __name__ == "__main__":
                                     msg="IPv6 Proxy: %s" % g_proxy_index[(mouse_offset - base_offset)]),
                           "            ")
 
-                error_msg = " " * 40
+                # error_msg = " " * 40
+                error_msg = "CPS: %-35s" % cps
 
                 if g_overload_flag.value:
                     error_msg = tf.format("{msg:s,bg_yellow,red} ",
@@ -1491,13 +1497,14 @@ if __name__ == "__main__":
                              range(len(g_dead_proxy_ipv6.values()))]),
                     "" if selected_proxy is None else " Proxy: %s" % (
                         tf.format("{proxy:s,cyan}", proxy=selected_proxy)),
-                    error_msg), end="\r" if g_overload_flag.value == False else "\n")
+                    error_msg), end="\r" if not g_overload_flag.value else "\n")
 
                 mouse_offset = 0
                 g_io_lock.release()
 
             now = time.time()
             if now - g_cps_reset.value >= 1:
+                cps = g_cps.value
                 with g_cps_reset.get_lock():
                     g_cps_reset.value = now
                 with g_cps.get_lock():
@@ -1506,8 +1513,7 @@ if __name__ == "__main__":
                     g_cps_dup.value = 0
 
                 if g_overload_flag.value:
-                    with g_overload_flag.get_lock():
-                        g_overload_flag.value = False
+                    g_overload_flag.value = False
                     # g_io_lock.acquire()
                     # print(tf.format("{msg:s,bg_yellow,red} Working: {working:d,yellow,bold} ",msg="Warning: Queue overloaded", working=g_running_process.value))
                     # g_io_lock.release()
