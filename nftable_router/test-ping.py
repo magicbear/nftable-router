@@ -34,12 +34,20 @@ for file in file_path:
 
 for n in range(len(config["proxy"])):
     proxy = list(config["proxy"].values())[n]
-    if 'port' in proxy:
-        continue
-    print(tf.format("{msg:s,cyan}{line:s,yellow,bold}  Mark: {mark:d,green,bold,bold}  Route: ", msg="[+] PING by Line : ",
+    # dig -4 TXT +short o-o.myaddr.l.google.com @ns1.google.com
+    dns_rc = subprocess.run(
+        ["dig", "myip.opendns.com", "+short", "@resolver1.opendns.com", "+retry=1", "+timeout=1", "+dscp=%d" % (n + 1), "+tcp"],
+        capture_output=True)
+    print(tf.format("{msg:s,cyan}{line:s,yellow,bold}  Mark: {mark:d,green,bold}  IP: {ip:s,%s,bold}  Route: " % (
+        "cyan" if dns_rc.returncode == 0 else "bg_red"
+    ),
+                    msg="[+] PING by Line : ",
+                    ip=dns_rc.stdout.decode("utf-8").strip().split("\n")[-1] if dns_rc.returncode == 0 else " CONNECTION ERROR ",
                     line=list(config["proxy"].keys())[n], mark=proxy['mark']),
           subprocess.run(["ip", "route", "show", "table", "%d" % proxy['mark']], capture_output=True).stdout.
           decode("utf-8").strip())
+    if 'port' in proxy:
+        continue
     p = subprocess.Popen(["ping", "-i", "0.3", "-c", "3", "-Q", "%d" % ((n + 1) << 2), args.ip], stdout=subprocess.PIPE)
     while p.poll() is None:
         read = p.stdout.readline()
