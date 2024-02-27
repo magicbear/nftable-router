@@ -621,10 +621,11 @@ class PrintResultThread(threading.Thread):
 
                     if rc.test_session == 1:
                         src_interfaces = tf.format("{dev:30s,yellow}", dev=" >> Check Alive Connection << ")
-
                     if rc.test_session == 2:
                         with g_cps_dup.get_lock():
                             g_cps_dup.value += 1
+                    elif rc.test_session == 4:
+                        src_interfaces = tf.format("{dev:30s,cyan}", dev=" >> QoS Test Connection << ")
                     else:
                         with g_cps.get_lock():
                             g_cps.value += 1
@@ -676,6 +677,7 @@ def ip_mark(packet):
 
         packet_payload = packet.get_payload()
         pkt_version = packet_payload[0] >> 4
+        qos_flag = packet_payload[1]
         if pkt_version == 4:
             proto = packet_payload[9]
             src = str(socket.inet_ntoa(packet_payload[12:16]))
@@ -758,6 +760,13 @@ def ip_mark(packet):
                 out_interface = cache_ecmp.tun_id
                 geodata = None
                 test_session = 2
+            elif qos_flag != 0 and proto == 1 and qos_flag <= len(config['proxy']):
+                proxy = list(config['proxy'].values())[qos_flag - 1]
+                mark = proxy['mark']
+                packet.set_mark(mark)
+                packet.repeat()
+                test_session = 4
+                out_interface = g_proxy_index[qos_flag - 1]
             else:
                 if g_parallel_process - g_running_process.value <= 2:
                     packet.accept()
@@ -1446,6 +1455,10 @@ if __name__ == "__main__":
                             tf.format("{msg:s,bg_red,black}",
                                       msg="[-] Filter Error: Invalid IP Address / Network: %s" % e),
                             file=sys.stderr)
+                elif queue_stdin[0] == b"d":
+                    queue_stdin = queue_stdin[1:]
+                    for n in range(g_parallel_process):
+                        print("[+] Process %02d process: %d" % (n, g_worker_process_connections[n].value))
                 else:
                     queue_stdin = queue_stdin[1:]
 
