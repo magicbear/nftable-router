@@ -13,6 +13,7 @@ from scapy.layers.dns import DNSRR, DNS, DNSQR
 from pytput import TputFormatter
 import prctl
 import signal
+import json
 
 tf = TputFormatter()
 
@@ -128,11 +129,10 @@ class MPDNSList(list):
                 del self[k]
 
 class DNSProcess(multiprocessing.Process):
-    def __init__(self, dns_list, term):
+    def __init__(self, dns_list: list[MPDNSItem], term):
         super().__init__()
         self.dns_list = dns_list
         self.term = term
-        self.last_title_update = 0
 
     def update_dns_item(self, ver, dns, dnsrr):
         ttl = dnsrr.ttl
@@ -198,27 +198,63 @@ class DNSProcess(multiprocessing.Process):
                 f.write("%s: DNS Worker Process Error: %s\n  %s\n" % (
                     datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
         packet.accept()
-        if time.time() - self.last_title_update >= 5:
-            self.last_title_update = time.time()
-            prctl.set_proctitle("Policy Route - DNS %02d" % len(self.dns_list))
 
     def dump_dns(self, signum, sigframe):
         print(tf.format("{msg:s,bg_cyan,black}", msg="[+] DNS Thread Dumping"))
-        with open("/dev/shm/dns_list.log", "a+") as f:
+        with open("/dev/shm/dns_list.json", "w", encoding="utf-8") as f:
+            dns_lists = []
             for dns in self.dns_list:
-                f.write(str(dns) + "\n")
+                dns_lists.append({
+                    "ip_family": dns.ip_family,
+                    "ip_addr": dns.ip_addr,
+                    "expire": dns.expire,
+                    "qname": dns.qname
+                })
+            json.dump(dns_lists, f, indent=4)
+
+    def load_dns(self):
+        if os.path.exists("/dev/shm/dns_list.json"):
+            with open("/dev/shm/dns_list.json", "r", encoding="utf-8") as f:
+                dns_lists = json.load(f)
+                for dns in dns_lists:
+                    item = MPDNSItem()
+                    item.ip_family = dns['ip_family']
+                    item.ip_addr = dns['ip_addr']
+                    item.expire = dns['expire']
+                    item.qname = dns['qname']
+                    self.dns_list.append(item)
+            print(tf.format("{msg:s,bg_cyan,black}", msg="[+] DNS Thread Load %d" % len(self.dns_list)))
+
+    def quit(self, signum, sigframe):
+        self.dump_dns(signum, sigframe)
+        os._exit(0)
 
     def run(self):
         signal.signal(signal.SIGUSR1, self.dump_dns)
+        signal.signal(signal.SIGTERM, self.quit)
+        signal.signal(signal.SIGHUP, self.quit)
         nfqueue = netfilterqueue.NetfilterQueue()
         nfqueue.bind(53, self.dnsSpoof, mode=netfilterqueue.COPY_PACKET)
+        prctl.set_proctitle("Policy Route - DNS")
+        try:
+            self.load_dns()
+        except Exception as e:
+            print("[-] Error: %s" % e)
+            with open("nft_route.log", "a+") as f:
+                f.write("%s: DNS Worker Process Load Error: %s\n  %s\n" % (
+                    datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
 
         while not self.term.value:
             try:
                 print("[*] waiting for data (DNS Process, PID: %d)" % (os.getpid()), flush=True)
                 nfqueue.run()
+            except KeyboardInterrupt:
+                break
             except Exception as e:
                 print("[-] Error: %s" % e)
                 with open("nft_route.log", "a+") as f:
                     f.write("%s: DNS Worker Process Error: %s\n  %s\n" % (
                         datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+
+        self.dump_dns(0, 0)
+        print("[-] DNS process exit")
