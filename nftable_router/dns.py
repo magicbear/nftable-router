@@ -71,11 +71,11 @@ class MPDNSList(list):
             raise ValueError("Share Memory closed")
         if self.prop.current >= MPDNSList.DNS_MAX_LENGTH:
             raise MemoryError("Out of memory")
-        self.lock.acquire()
         if not self.closed and self.prop.current < MPDNSList.DNS_MAX_LENGTH:
+            self.lock.acquire()
             ctypes.memmove(ctypes.byref(self[self.prop.current]), ctypes.byref(obj), ctypes.sizeof(MPDNSItem))
             self.prop.current += 1
-        self.lock.release()
+            self.lock.release()
 
     def __iter__(self):
         x = self
@@ -86,11 +86,11 @@ class MPDNSList(list):
 
     def __delitem__(self, item):
         self.lock.acquire()
-        self.prop.current -= 1
-        if self.prop.current - item > 0:
+        if self.prop.current - item > 1:
             ctypes.memmove(self.memaddr + self.offset + ctypes.sizeof(MPDNSItem) * item,
                            self.memaddr + self.offset + ctypes.sizeof(MPDNSItem) * (item + 1),
-                           ctypes.sizeof(MPDNSItem) * (self.prop.current - item))
+                           ctypes.sizeof(MPDNSItem) * (self.prop.current - item - 1))
+        self.prop.current -= 1
         self.prop.version += 1
         self.lock.release()
 
@@ -105,7 +105,6 @@ class MPDNSList(list):
         if isinstance(item, int):
             return super().__getitem__(item)
         if self.MapCache['version'] != self.prop.version:
-            self.lock.acquire()
             self.MapCache['version'] = self.prop.version
             self.MapCache['count'] = len(self)
             self.MapCache['map'] = {}
@@ -113,7 +112,6 @@ class MPDNSList(list):
                 if x.ip_addr not in self.MapCache['map']:
                     self.MapCache['map'][x.ip_addr] = []
                 self.MapCache['map'][x.ip_addr].append(x)
-            self.lock.release()
         elif self.MapCache['count'] != self.prop.current:
             for n in range(self.MapCache['count'], self.prop.current):
                 if self[n].ip_addr not in self.MapCache['map']:
