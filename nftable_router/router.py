@@ -54,7 +54,6 @@ if g_parallel_process <= 16:
 g_lock = Lock()
 g_io_lock = Lock()
 g_test_ip = Array(ctypes.c_wchar, 40)
-g_filter_ip = Array(ctypes.c_wchar, 44)
 g_test_proxy_id = Value('i', -1)
 g_running_process = Value('i', 0)
 g_cps = Value('i', 0)
@@ -77,7 +76,6 @@ cmt_class = '**AUTOGEN BY PolicyRoute**'
 protos = {1: "ICMP", 2: "IGMP", 6: {"color": "green", "name": "TCP"}, 17: {"color": "blue", "name": "UDP"}, 47: "GRE",
           58: "ICMP6"}
 
-g_filter_ip[0] = "\0"
 raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
 
 
@@ -92,6 +90,7 @@ class TestThread(threading.Thread):
 
     def run(self):
         global config, g_test_ip, g_test_proxy_id, g_dead_proxy_ipv4, g_dead_proxy_ipv6
+        prctl.set_name("PR - %s" % self.__class__.__name__)
         time.sleep(3)
         while not term.value:
             flog = open("/var/log/nft_route.log", "a+")
@@ -306,6 +305,7 @@ class ECMPThread(threading.Thread):
         self.fdr_cb, self.fdw_cb = os.pipe()
 
     def run(self):
+        prctl.set_name("PR - %s" % self.__class__.__name__)
         self.r = None
         last_check = 0
         while term.value == False:
@@ -447,10 +447,12 @@ class PrintResultThread(threading.Thread):
         threading.Thread.__init__(self)
         self.device_list = None
         self.lock = threading.Lock()
-        self.fdr, self.fdw = os.pipe()
+        self.filter_ip = None
 
     def run(self) -> None:
         global queue, term
+
+        prctl.set_name("PR - %s" % self.__class__.__name__)
 
         self.r = None
         while not term.value:
@@ -493,11 +495,9 @@ class PrintResultThread(threading.Thread):
                     print(tf.format("{msg:s,bg_red,black}", msg="[-] PrintResult Thread Error: %s" % e))
                     self.r = None
 
-                if g_filter_ip[0] != "\0":
-                    filter_ip = str(g_filter_ip[:])
-                    filter_ip = filter_ip[0:filter_ip.index("\0")]
-                    filter = ipaddress.ip_network(filter_ip)
-                    if ipaddress.ip_address(rc.src) not in filter and ipaddress.ip_address(rc.dst) not in filter:
+                if isinstance(self.filter_ip, ipaddress.IPv4Network) or isinstance(self.filter_ip, ipaddress.IPv6Network):
+                    if (ipaddress.ip_address(rc.src) not in self.filter_ip and
+                            ipaddress.ip_address(rc.dst) not in self.filter_ip):
                         self.lock.release()
                         continue
 
@@ -552,15 +552,24 @@ class PrintResultThread(threading.Thread):
                     except KeyError:
                         resolve = None
 
+                    ignorePrint = False
                     if resolve is not None and 'ignore_print_domain' in config:
-                        ignorePrint = False
                         for dns_item in resolve:
                             if dns_item.qname in config['ignore_print_domain']:
                                 ignorePrint = True
                                 break
-                        if ignorePrint:
-                            self.lock.release()
-                            continue
+
+                    if isinstance(self.filter_ip, str) and self.filter_ip != "":
+                        ignorePrint = True
+                        if resolve is not None:
+                            for dns_item in resolve:
+                                if self.filter_ip in dns_item.qname:
+                                    ignorePrint = False
+
+                    if ignorePrint:
+                        self.lock.release()
+                        continue
+
                     extra_string = "%02d:%02d:%02d %.2f ms (%.2f ms) Resolve: %s" % (
                         datetime.now().hour, datetime.now().minute, datetime.now().second, rc.t_total, rc.t_init,
                         ",".join({res.qname for res in resolve}) if resolve is not None else "")
@@ -1433,28 +1442,30 @@ if __name__ == "__main__":
                     print()
                     termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
                     print("Source Filter: ", end="", flush=True)
-                    g_lock.acquire()
-                    g_filter_ip[0:11] = "0.0.0.0/32\0"
-                    g_lock.release()
+                    tp.lock.acquire()
+                    tp.filter_ip = ipaddress.ip_network("0.0.0.0/32")
+                    tp.lock.release()
                     filter_ip = unbuffered_stdin.readline().strip().decode("utf-8")
                     tty.setcbreak(sys.stdin.fileno())
                     try:
                         assert filter_ip != ""
-                        ipaddress.ip_network(filter_ip)
+                        filter = ipaddress.ip_network(filter_ip)
+                        tp.lock.acquire()
+                        tp.filter_ip = filter
+                        tp.lock.release()
                         # assert len(filter_ip.split("/")) == 2
                         # assert isinstance(int(filter_ip.split("/")[1]), int)
-
-                        g_lock.acquire()
-                        g_filter_ip[0:len(filter_ip) + 1] = filter_ip + "\0"
-                        g_lock.release()
                     except AssertionError:
-                        g_filter_ip[0] = "\0"
+                        tp.lock.acquire()
+                        tp.filter_ip = None
+                        tp.lock.release()
                         print(tf.format("{msg:s,bg_yellow,black}", msg="[-] Filter clear"), file=sys.stderr)
                     except ValueError as e:
-                        g_filter_ip[0] = "\0"
-                        print(
-                            tf.format("{msg:s,bg_red,black}",
-                                      msg="[-] Filter Error: Invalid IP Address / Network: %s" % e),
+                        tp.lock.acquire()
+                        tp.filter_ip = filter_ip
+                        tp.lock.release()
+                        print(tf.format("{msg:s,bg_red,black}",
+                            msg="[-] Filter Error: Invalid IP Address / Network: %s, domain: %s" % (e, filter_ip)),
                             file=sys.stderr)
                 elif queue_stdin[0] == b"d":
                     queue_stdin = queue_stdin[1:]
