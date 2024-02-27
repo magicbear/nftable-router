@@ -5,22 +5,34 @@ Software Policy Router for nftables
 ## Status ICON
 ### ALIVE:
 > 🟩   - Global Lock Idle
+
 > 🔴   - Process Dead
+
 > 🟡   - Process Busying
+
 > 🟩   - Process Idle > 30s
+
 > 🟢   - Process Idle
 
 ### Proxy Test Status:
 > ⚫ for Line
+
 > ⬛ for Proxy
 
 > ⚫   - N/A
+
 > 🔴   - Failed
+
 > 🟢   - <= 100ms
+
 > 🔵   - <= 200ms
+
 > 🟣   - <= 400ms
+
 > 🟡   - <= 600ms
+
 > 🟠   - <= 800ms
+
 > 🟤   - > 800ms
 
 # Config.json
