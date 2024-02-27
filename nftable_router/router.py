@@ -74,14 +74,6 @@ protos = {1: "ICMP", 2: "IGMP", 6: {"color": "green", "name": "TCP"}, 17: {"colo
 g_filter_ip[0] = "\0"
 raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
 
-print("[+] create nftables mangle checking rules")
-nfu.delete_rules(comment=cmt_class, family=None)
-
-print("[*] initalize dns memory")
-dns_list = MPDNSList()
-dns_proc = DNSProcess(dns_list, term)
-dns_proc.start()
-
 
 class TestThread(threading.Thread):
     def __init__(self):
@@ -411,24 +403,6 @@ def load_config():
                     datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
 
 
-load_config()
-
-print("[*] load ipdb")
-db = ipdb.City(config['ipdb_v4'])
-db_v6 = None
-if config.get(config['ipdb_v6'], None):
-    db_v6 = ipdb.City(config['ipdb_v6'])
-elif db.is_ipv6():
-    db_v6 = db
-
-
-test_thread = TestThread()
-test_thread.start()
-
-# Internal Interface
-nat_interfaces = config['nat_interfaces']
-
-
 def create_tproxy(mark, port, ip_family, udp=False):
     # hkfdc ss-redir
     nfu.add_rule({'family': ip_family, 'chain': ['nat_PREROUTING'], 'table': 'policy_route', 'comment': cmt_class,
@@ -460,221 +434,6 @@ def create_tproxy(mark, port, ip_family, udp=False):
                       # {'accept': None}
                       ]
              })
-
-for ip_version, ip_family in [(4, "ip"), (6, "ip6")]:
-    # nfu.delete_set(family=ip_family, table="nat", name="local")
-    # nfu.delete_set(family=ip_family, table="nat", name="ignore_list")
-    # nfu.delete_set(family=ip_family, table="nat", name="policy_mark")
-
-    nfu.delete_table(family=ip_family, name="policy_route")
-
-    nfu.add_table(family=ip_family, name="policy_route")
-
-    nfu.add_set(family=ip_family, table="policy_route", name="local", set_type="ipv%d_addr" % (ip_version))
-    nfu.add_set(family=ip_family, table="policy_route", name="tunnel_ip", set_type="ipv%d_addr" % (ip_version))
-    nfu.add_set(family=ip_family, table="policy_route", name="ignore_list", set_type="ipv%d_addr" % (ip_version))
-    nfu.add_set(family=ip_family, table="policy_route", name="policy_mark", set_type="mark")
-
-    nfu.add_chain(
-        {"family": ip_family, "table": "policy_route", "name": "nat_PREROUTING", "type": "nat", "hook": "prerouting",
-         "prio": -90, "policy": 'accept'})
-    nfu.add_chain(
-        {"family": ip_family, "table": "policy_route", "name": "nat_FULLCONE", "type": "nat", "hook": "prerouting",
-         "prio": -89, "policy": 'accept'})
-    nfu.add_chain({"family": ip_family, "table": "policy_route", "name": "nat_OUTPUT", "type": "nat", "hook": "output",
-                   "prio": -90, "policy": 'accept'})
-    nfu.add_chain(
-        {"family": ip_family, "table": "policy_route", "name": "nat_POSTROUTING", "type": "nat", "hook": "postrouting",
-         "prio": 110, "policy": 'accept'})
-    # Add Rules to marking for TProxy tables
-    # Priority = mangle + 5
-    nfu.add_chain({"family": ip_family, "table": "policy_route", "name": "mangle_PREROUTING", "type": "filter",
-                   "hook": "prerouting", "prio": -145, "policy": 'accept'})
-    # Priority = mangle + 10
-    nfu.add_chain({"family": ip_family, "table": "policy_route", "name": "mangle_TPROXY_PREROUTING", "type": "filter",
-                   "hook": "prerouting", "prio": -140, "policy": 'accept'})
-
-    nfu.add_chain({"family": 'ip', "table": "policy_route", "name": "INPUT", "type": "filter", "hook": "input",
-                   "prio": 0, "policy": 'accept'})
-    nfu.add_rule({'family': 'ip', 'chain': 'INPUT', 'table': 'policy_route', 'comment': cmt_class,
-                  'expr': [{'match': nfu.match_payload('sport', 53, protocol='udp')},
-                           {'counter': {'bytes': 0, 'packets': 0}},
-                           {'queue': {'num': 53}}]
-                  })
-
-    if ip_version == 4:
-        nfu.add_set_element(family=ip_family, table="policy_route", name="local",
-                            element=[nfu.cidr('127.0.0.0', 8), nfu.cidr('10.0.0.0', 8), nfu.cidr('172.16.0.0', 13),
-                                     nfu.cidr('192.168.0.0', 16), nfu.cidr('224.0.0.0', 8), nfu.cidr('239.0.0.0', 8),
-                                     nfu.cidr('255.0.0.0', 8)])
-        # Add Tunnel IP
-    else:
-        nfu.add_set_element(family=ip_family, table="policy_route", name="local",
-                            element=[nfu.cidr('fc00::', 6), "::1"])
-    nfu.add_set_element(family=ip_family, table="policy_route", name="tunnel_ip",
-                        element=config["tunnel_ip"]["ipv%d" % (ip_version)])
-    nfu.add_set_element(family=ip_family, table="policy_route", name="ignore_list",
-                        element=config["ignore_list"]["ipv%d" % (ip_version)])
-
-    # Return CIDR Process by Queue
-    for priority in range(0, len(config["rules"])):
-        for tun_id, rule_cfg in config["rules"][priority].items():
-            for geo_k, geo_list in rule_cfg.items():
-                if geo_k == "cidr" and config["proxy"][tun_id]["ipv%d" % (ip_version)]:
-                    for cidr in geo_list:
-                        if cidr.version == ip_version and cidr.is_private:
-                            nfu.add_rule({'family': ip_family, 'chain': ['nat_PREROUTING'], 'table': 'policy_route',
-                                          'comment': cmt_class,
-                                          'expr': [{'match': nfu.match_payload(field='saddr', protocol=ip_family,
-                                                                               right='@ignore_list',
-                                                                               op='!=')},
-                                                   {'match': nfu.match_payload(field='daddr', protocol=ip_family,
-                                                                               right={"prefix": {
-                                                                                   'addr': str(cidr.network_address),
-                                                                                   'len': cidr.prefixlen}})},
-                                                   {'match': nfu.match_iifname({'set': nat_interfaces})},
-                                                   {'match': nfu.match_mark(0)},
-                                                   {'counter': {'bytes': 0, 'packets': 0}},
-                                                   {'queue': {'num': 4}}]
-                                          })
-
-                            nfu.add_rule({'family': ip_family, 'chain': ['nat_OUTPUT'], 'table': 'policy_route',
-                                          'comment': cmt_class,
-                                          'expr': [{'match': nfu.match_payload(field='daddr', protocol=ip_family,
-                                                                               right={"prefix": {
-                                                                                   'addr': str(cidr.network_address),
-                                                                                   'len': cidr.prefixlen}})},
-                                                   {'match': nfu.match_payload(field='saddr', protocol=ip_family,
-                                                                               right='@ignore_list',
-                                                                               op='!=')},
-                                                   {'match': nfu.match_mark(0)},
-                                                   {'counter': {'bytes': 0, 'packets': 0}},
-                                                   {'queue': {'num': 4}}]
-                                          })
-
-                            # nfu.add_rule(
-                            #     dict(family=ip_family, chain=['nat_PREROUTING', 'nat_OUTPUT'], table='policy_route',
-                            #          comment=cmt_class, expr=[
-                            #             {'match': nfu.match_payload(field='saddr', protocol=ip_family, right='@ignore_list',
-                            #                                         op='!=')},
-                            #             {'match': nfu.match_payload(field='daddr', protocol=ip_family, right={
-                            #                 "prefix": {'addr': str(cidr.network_address), 'len': cidr.prefixlen}})},
-                            #             {'match': nfu.match_l4proto('udp', op='!=')},
-                            #             {'match': nfu.match_mark(0)},
-                            #             # {'queue': {'num': 4}}]
-                            #             {'mangle': {'key': {'meta': {'key': 'mark'}},
-                            #                         'value': config["proxy"][tun_id]["mark"]}},
-                            #             {'mangle': {'key': {'ct': {'key': 'mark'}}, 'value': {'meta': {'key': 'mark'}}}},
-                            #             {'counter': {'bytes': 0, 'packets': 0}}]
-                            #         ))
-
-                            if config["proxy"][tun_id]["udp_v%d" % (ip_version)]:
-                                nfu.add_rule(
-                                    dict(family=ip_family, chain=['mangle_PREROUTING'], table='policy_route',
-                                         comment=cmt_class, expr=[
-                                            {'match': nfu.match_payload(field='saddr', protocol=ip_family,
-                                                                        right='@ignore_list',
-                                                                        op='!=')},
-                                            {'match': nfu.match_payload(field='daddr', protocol=ip_family, right={
-                                                "prefix": {'addr': str(cidr.network_address), 'len': cidr.prefixlen}})},
-                                            {'match': nfu.match_mark(0)},
-                                            {'match': nfu.match_ct('new', key='state')},
-                                            {'match': nfu.match_l4proto('udp')},
-                                            {'match': nfu.match_iifname({'set': nat_interfaces})},
-                                            {'counter': {'bytes': 0, 'packets': 0}},
-                                            {'queue': {'num': 4}}]
-                                         # {'mangle': {'key': {'meta': {'key': 'mark'}},
-                                         #             'value': config["proxy"][tun_id]["mark"]}},
-                                         # {'mangle': {'key': {'ct': {'key': 'mark'}},
-                                         #             'value': {'meta': {'key': 'mark'}}}},
-                                         # {'counter': {'bytes': 0, 'packets': 0}}]
-                                         ))
-
-    nrc = nfu.add_rule({'family': ip_family, 'chain': ['nat_PREROUTING'], 'table': 'policy_route', 'comment': cmt_class,
-                        'expr': [
-                            {'match': nfu.match_payload(field='daddr', protocol=ip_family, right='@local', op='!=')},
-                            {'match': nfu.match_payload(field='saddr', protocol=ip_family, right='@ignore_list',
-                                                        op='!=')},
-                            {'match': nfu.match_iifname({'set': nat_interfaces})},
-                            {'match': nfu.match_mark(0)},
-                            {'counter': {'bytes': 0, 'packets': 0}},
-                            {'queue': {'num': 4}}]
-                        })
-    if functools.reduce(lambda a, b: a | b, [add_rule_rc[0] for add_rule_rc in nrc]):
-        print("[-] %s" % tf.format("{msg:s,bg_red,white,bold}",
-                                   msg="add rule %s nat_PREROUTING NFQUEUE failed: %s" % (ip_family, nrc)))
-
-    nrc = nfu.add_rule({'family': ip_family, 'chain': ['nat_OUTPUT'], 'table': 'policy_route', 'comment': cmt_class,
-                        'expr': [
-                            {'match': nfu.match_payload(field='daddr', protocol=ip_family, right='@local', op='!=')},
-                            {'match': nfu.match_payload(field='daddr', protocol=ip_family, right='@tunnel_ip',
-                                                        op='!=')},
-                            {'match': nfu.match_payload(field='saddr', protocol=ip_family, right='@ignore_list',
-                                                        op='!=')},
-                            {'match': nfu.match_mark(0)},
-                            {'counter': {'bytes': 0, 'packets': 0}},
-                            {'queue': {'num': 4}}]
-                        })
-    if functools.reduce(lambda a, b: a | b, [add_rule_rc[0] for add_rule_rc in nrc]):
-        print("[-] %s" % tf.format("{msg:s,bg_red,white,bold}",
-                                   msg="add rule %s nat_OUTPUT NFQUEUE failed: %s" % (ip_family, nrc)))
-
-    # For Marking UDP First Packet
-    nrc = nfu.add_rule(
-        {'family': ip_family, 'chain': ['mangle_PREROUTING'], 'table': 'policy_route', 'comment': cmt_class,
-         'expr': [{'match': nfu.match_payload(field='daddr', protocol=ip_family, right='@local', op='!=')},
-                  {'match': nfu.match_payload(field='saddr', protocol=ip_family, right='@ignore_list',
-                                              op='!=')},
-                  {'match': nfu.match_mark(0)},
-                  {'match': nfu.match_ct('new', key='state')},
-                  {'match': nfu.match_l4proto('udp')},
-                  {'match': nfu.match_iifname({'set': nat_interfaces})},
-                  {'counter': {'bytes': 0, 'packets': 0}},
-                  {'queue': {'num': 4}}]
-         })
-    if functools.reduce(lambda a, b: a | b, [add_rule_rc[0] for add_rule_rc in nrc]):
-        print("[-] %s" % tf.format("{msg:s,bg_red,white,bold}",
-                                   msg="add rule %s mangle_PREROUTING NFQUEUE failed: %s" % (ip_family, nrc)))
-    # end For Marking UDP First Packet
-
-    proxy_marks = [0x99]
-    for k, proxy_cfg in config["proxy"].items():
-        # tap0 ss-redir
-        if proxy_cfg["ipv%d" % (ip_version)]:
-            if "port" in proxy_cfg:
-                create_tproxy(mark=proxy_cfg["mark"], port=proxy_cfg["port"], ip_family=ip_family,
-                              udp=proxy_cfg["udp_v%d" % (ip_version)])
-            if proxy_cfg["mark"] not in proxy_marks:
-                proxy_marks.append(proxy_cfg["mark"])
-            # [0x1, 0x2, 0x5, 0x6, 0x7, 0x8, 0x99]
-
-    nfu.add_set_element(family=ip_family, table="policy_route", name="policy_mark", element=proxy_marks)
-
-    nfu.add_rule(
-        {'family': ip_family, 'chain': ['nat_PREROUTING', 'nat_OUTPUT', 'mangle_PREROUTING'], 'table': 'policy_route',
-         'comment': cmt_class,
-         'expr': [
-             {'match': nfu.match_mark('@policy_mark')},
-             {'match': nfu.match_ct_mark(0)},
-             {'counter': {'bytes': 0, 'packets': 0}},
-             # {'log': {'prefix': 'AUTOGEN SAVE MARK '}},
-             {'mangle': {'key': {'ct': {'key': 'mark'}}, 'value': {'meta': {'key': 'mark'}}}}]
-         })
-
-    if ip_version == 4:
-        nfu.add_rule({'family': ip_family, 'chain': 'nat_POSTROUTING', 'table': 'policy_route', 'comment': cmt_class,
-                      'expr': [
-                          {'match': nfu.match_mark('@policy_mark')},
-                          {'counter': {'bytes': 0, 'packets': 0}},
-                          {'masquerade': None}]
-                      })
-    elif ip_version == 6:
-        nfu.add_rule({'family': ip_family, 'chain': 'nat_POSTROUTING', 'table': 'policy_route', 'comment': cmt_class,
-                      'expr': [
-                          {'match': nfu.match_mark('@policy_mark')},
-                          {'counter': {'bytes': 0, 'packets': 0}},
-                          {'masquerade': None}]
-                      })
 
 
 class PrintResultThread(threading.Thread):
@@ -781,7 +540,6 @@ class PrintResultThread(threading.Thread):
                                            region=geodata["region_name"] if geodata["region_name"] != geodata[
                                                "country_name"] else "",
                                            isp=geodata["isp_domain"])
-
 
                     try:
                         resolve = dns_list[rc.dst]
@@ -1183,8 +941,6 @@ def ip_mark(packet):
                 datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
         packet.accept()
 
-nfqueue = netfilterqueue.NetfilterQueue()
-nfqueue.bind(4, ip_mark, mode=netfilterqueue.COPY_PACKET)
 
 def clearRules():
     print("[*] clear rules -> delete_table")
@@ -1326,17 +1082,6 @@ class NFQUEUE_Executeor(Process):
         os.kill(os.getpid(), signal.SIGKILL)
 
 
-signal.signal(signal.SIGTERM, quit)
-signal.signal(signal.SIGQUIT, quit)
-signal.signal(signal.SIGHUP, quit)
-signal.signal(signal.SIGUSR1, reload_queue)
-
-load_executor()
-
-fcnat_listner = None
-fcnat_cleaner = None
-
-
 def time_to_level(t, proxy_id):
     # tf.format("{off:2d,green,bold}",off=x)
     global config
@@ -1361,156 +1106,425 @@ def time_to_level(t, proxy_id):
         return "🟤" if "port" not in config['proxy'][proxy_id] else "🟫"
 
 
-t_dns_clean = 0
-t_print = 0
-queue_stdin = []
-mouse_offset = 0
-old_settings = termios.tcgetattr(sys.stdin.fileno())
-tty.setcbreak(sys.stdin.fileno())
-unbuffered_stdin = os.fdopen(sys.stdin.fileno(), 'rb', buffering=0)
+if __name__ == "__main__":
+    print("[+] create nftables mangle checking rules")
+    nfu.delete_rules(comment=cmt_class, family=None)
 
-selected_proxy = None
+    print("[*] initalize dns memory")
+    dns_list = MPDNSList()
+    dns_proc = DNSProcess(dns_list, term)
+    dns_proc.start()
 
-while not term.value:
-    try:
-        l_read = [unbuffered_stdin]
-        s = select.select(l_read, [], [], 0.25)
-        if len(s[0]) > 0:
-            n = unbuffered_stdin.read(1)
-            queue_stdin.append(n)
+    load_config()
 
-        while len(queue_stdin) > 0:
-            if queue_stdin[0] == b"\x1B":
-                if len(queue_stdin) >= 3:
-                    if b"".join(queue_stdin[0:3]) == b"\x1b[C":
-                        mouse_offset += 1
-                    queue_stdin = queue_stdin[4:]
-                else:
-                    break
-            elif queue_stdin[0] == b"l":
-                queue_stdin = queue_stdin[1:]
-                print()
-                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
-                print("Source Filter: ", end="", flush=True)
-                g_lock.acquire()
-                g_filter_ip[0:11] = "0.0.0.0/32\0"
-                g_lock.release()
-                filter_ip = unbuffered_stdin.readline().strip().decode("utf-8")
-                tty.setcbreak(sys.stdin.fileno())
-                try:
-                    assert filter_ip != ""
-                    ipaddress.ip_network(filter_ip)
-                    # assert len(filter_ip.split("/")) == 2
-                    # assert isinstance(int(filter_ip.split("/")[1]), int)
+    print("[*] load ipdb")
+    db = ipdb.City(config['ipdb_v4'])
+    db_v6 = None
+    if config.get(config['ipdb_v6'], None):
+        db_v6 = ipdb.City(config['ipdb_v6'])
+    elif db.is_ipv6():
+        db_v6 = db
 
+    test_thread = TestThread()
+    test_thread.start()
+
+    # Internal Interface
+    nat_interfaces = config['nat_interfaces']
+
+    for ip_version, ip_family in [(4, "ip"), (6, "ip6")]:
+        # nfu.delete_set(family=ip_family, table="nat", name="local")
+        # nfu.delete_set(family=ip_family, table="nat", name="ignore_list")
+        # nfu.delete_set(family=ip_family, table="nat", name="policy_mark")
+
+        nfu.delete_table(family=ip_family, name="policy_route")
+
+        nfu.add_table(family=ip_family, name="policy_route")
+
+        nfu.add_set(family=ip_family, table="policy_route", name="local", set_type="ipv%d_addr" % (ip_version))
+        nfu.add_set(family=ip_family, table="policy_route", name="tunnel_ip", set_type="ipv%d_addr" % (ip_version))
+        nfu.add_set(family=ip_family, table="policy_route", name="ignore_list", set_type="ipv%d_addr" % (ip_version))
+        nfu.add_set(family=ip_family, table="policy_route", name="policy_mark", set_type="mark")
+
+        nfu.add_chain(
+            {"family": ip_family, "table": "policy_route", "name": "nat_PREROUTING", "type": "nat",
+             "hook": "prerouting",
+             "prio": -90, "policy": 'accept'})
+        nfu.add_chain(
+            {"family": ip_family, "table": "policy_route", "name": "nat_FULLCONE", "type": "nat", "hook": "prerouting",
+             "prio": -89, "policy": 'accept'})
+        nfu.add_chain(
+            {"family": ip_family, "table": "policy_route", "name": "nat_OUTPUT", "type": "nat", "hook": "output",
+             "prio": -90, "policy": 'accept'})
+        nfu.add_chain(
+            {"family": ip_family, "table": "policy_route", "name": "nat_POSTROUTING", "type": "nat",
+             "hook": "postrouting",
+             "prio": 110, "policy": 'accept'})
+        # Add Rules to marking for TProxy tables
+        # Priority = mangle + 5
+        nfu.add_chain({"family": ip_family, "table": "policy_route", "name": "mangle_PREROUTING", "type": "filter",
+                       "hook": "prerouting", "prio": -145, "policy": 'accept'})
+        # Priority = mangle + 10
+        nfu.add_chain(
+            {"family": ip_family, "table": "policy_route", "name": "mangle_TPROXY_PREROUTING", "type": "filter",
+             "hook": "prerouting", "prio": -140, "policy": 'accept'})
+
+        nfu.add_chain({"family": 'ip', "table": "policy_route", "name": "INPUT", "type": "filter", "hook": "input",
+                       "prio": 0, "policy": 'accept'})
+        nfu.add_rule({'family': 'ip', 'chain': 'INPUT', 'table': 'policy_route', 'comment': cmt_class,
+                      'expr': [{'match': nfu.match_payload('sport', 53, protocol='udp')},
+                               {'counter': {'bytes': 0, 'packets': 0}},
+                               {'queue': {'num': 53}}]
+                      })
+
+        if ip_version == 4:
+            nfu.add_set_element(family=ip_family, table="policy_route", name="local",
+                                element=[nfu.cidr('127.0.0.0', 8), nfu.cidr('10.0.0.0', 8), nfu.cidr('172.16.0.0', 13),
+                                         nfu.cidr('192.168.0.0', 16), nfu.cidr('224.0.0.0', 8),
+                                         nfu.cidr('239.0.0.0', 8),
+                                         nfu.cidr('255.0.0.0', 8)])
+            # Add Tunnel IP
+        else:
+            nfu.add_set_element(family=ip_family, table="policy_route", name="local",
+                                element=[nfu.cidr('fc00::', 6), "::1"])
+        nfu.add_set_element(family=ip_family, table="policy_route", name="tunnel_ip",
+                            element=config["tunnel_ip"]["ipv%d" % (ip_version)])
+        nfu.add_set_element(family=ip_family, table="policy_route", name="ignore_list",
+                            element=config["ignore_list"]["ipv%d" % (ip_version)])
+
+        # Return CIDR Process by Queue
+        for priority in range(0, len(config["rules"])):
+            for tun_id, rule_cfg in config["rules"][priority].items():
+                for geo_k, geo_list in rule_cfg.items():
+                    if geo_k == "cidr" and config["proxy"][tun_id]["ipv%d" % (ip_version)]:
+                        for cidr in geo_list:
+                            if cidr.version == ip_version and cidr.is_private:
+                                nfu.add_rule({'family': ip_family, 'chain': ['nat_PREROUTING'], 'table': 'policy_route',
+                                              'comment': cmt_class,
+                                              'expr': [{'match': nfu.match_payload(field='saddr', protocol=ip_family,
+                                                                                   right='@ignore_list',
+                                                                                   op='!=')},
+                                                       {'match': nfu.match_payload(field='daddr', protocol=ip_family,
+                                                                                   right={"prefix": {
+                                                                                       'addr': str(
+                                                                                           cidr.network_address),
+                                                                                       'len': cidr.prefixlen}})},
+                                                       {'match': nfu.match_iifname({'set': nat_interfaces})},
+                                                       {'match': nfu.match_mark(0)},
+                                                       {'counter': {'bytes': 0, 'packets': 0}},
+                                                       {'queue': {'num': 4}}]
+                                              })
+
+                                nfu.add_rule({'family': ip_family, 'chain': ['nat_OUTPUT'], 'table': 'policy_route',
+                                              'comment': cmt_class,
+                                              'expr': [{'match': nfu.match_payload(field='daddr', protocol=ip_family,
+                                                                                   right={"prefix": {
+                                                                                       'addr': str(
+                                                                                           cidr.network_address),
+                                                                                       'len': cidr.prefixlen}})},
+                                                       {'match': nfu.match_payload(field='saddr', protocol=ip_family,
+                                                                                   right='@ignore_list',
+                                                                                   op='!=')},
+                                                       {'match': nfu.match_mark(0)},
+                                                       {'counter': {'bytes': 0, 'packets': 0}},
+                                                       {'queue': {'num': 4}}]
+                                              })
+
+                                # nfu.add_rule(
+                                #     dict(family=ip_family, chain=['nat_PREROUTING', 'nat_OUTPUT'], table='policy_route',
+                                #          comment=cmt_class, expr=[
+                                #             {'match': nfu.match_payload(field='saddr', protocol=ip_family, right='@ignore_list',
+                                #                                         op='!=')},
+                                #             {'match': nfu.match_payload(field='daddr', protocol=ip_family, right={
+                                #                 "prefix": {'addr': str(cidr.network_address), 'len': cidr.prefixlen}})},
+                                #             {'match': nfu.match_l4proto('udp', op='!=')},
+                                #             {'match': nfu.match_mark(0)},
+                                #             # {'queue': {'num': 4}}]
+                                #             {'mangle': {'key': {'meta': {'key': 'mark'}},
+                                #                         'value': config["proxy"][tun_id]["mark"]}},
+                                #             {'mangle': {'key': {'ct': {'key': 'mark'}}, 'value': {'meta': {'key': 'mark'}}}},
+                                #             {'counter': {'bytes': 0, 'packets': 0}}]
+                                #         ))
+
+                                if config["proxy"][tun_id]["udp_v%d" % (ip_version)]:
+                                    nfu.add_rule(
+                                        dict(family=ip_family, chain=['mangle_PREROUTING'], table='policy_route',
+                                             comment=cmt_class, expr=[
+                                                {'match': nfu.match_payload(field='saddr', protocol=ip_family,
+                                                                            right='@ignore_list',
+                                                                            op='!=')},
+                                                {'match': nfu.match_payload(field='daddr', protocol=ip_family, right={
+                                                    "prefix": {'addr': str(cidr.network_address),
+                                                               'len': cidr.prefixlen}})},
+                                                {'match': nfu.match_mark(0)},
+                                                {'match': nfu.match_ct('new', key='state')},
+                                                {'match': nfu.match_l4proto('udp')},
+                                                {'match': nfu.match_iifname({'set': nat_interfaces})},
+                                                {'counter': {'bytes': 0, 'packets': 0}},
+                                                {'queue': {'num': 4}}]
+                                             # {'mangle': {'key': {'meta': {'key': 'mark'}},
+                                             #             'value': config["proxy"][tun_id]["mark"]}},
+                                             # {'mangle': {'key': {'ct': {'key': 'mark'}},
+                                             #             'value': {'meta': {'key': 'mark'}}}},
+                                             # {'counter': {'bytes': 0, 'packets': 0}}]
+                                             ))
+
+        nrc = nfu.add_rule(
+            {'family': ip_family, 'chain': ['nat_PREROUTING'], 'table': 'policy_route', 'comment': cmt_class,
+             'expr': [
+                 {'match': nfu.match_payload(field='daddr', protocol=ip_family, right='@local', op='!=')},
+                 {'match': nfu.match_payload(field='saddr', protocol=ip_family, right='@ignore_list',
+                                             op='!=')},
+                 {'match': nfu.match_iifname({'set': nat_interfaces})},
+                 {'match': nfu.match_mark(0)},
+                 {'counter': {'bytes': 0, 'packets': 0}},
+                 {'queue': {'num': 4}}]
+             })
+        if functools.reduce(lambda a, b: a | b, [add_rule_rc[0] for add_rule_rc in nrc]):
+            print("[-] %s" % tf.format("{msg:s,bg_red,white,bold}",
+                                       msg="add rule %s nat_PREROUTING NFQUEUE failed: %s" % (ip_family, nrc)))
+
+        nrc = nfu.add_rule({'family': ip_family, 'chain': ['nat_OUTPUT'], 'table': 'policy_route', 'comment': cmt_class,
+                            'expr': [
+                                {'match': nfu.match_payload(field='daddr', protocol=ip_family, right='@local',
+                                                            op='!=')},
+                                {'match': nfu.match_payload(field='daddr', protocol=ip_family, right='@tunnel_ip',
+                                                            op='!=')},
+                                {'match': nfu.match_payload(field='saddr', protocol=ip_family, right='@ignore_list',
+                                                            op='!=')},
+                                {'match': nfu.match_mark(0)},
+                                {'counter': {'bytes': 0, 'packets': 0}},
+                                {'queue': {'num': 4}}]
+                            })
+        if functools.reduce(lambda a, b: a | b, [add_rule_rc[0] for add_rule_rc in nrc]):
+            print("[-] %s" % tf.format("{msg:s,bg_red,white,bold}",
+                                       msg="add rule %s nat_OUTPUT NFQUEUE failed: %s" % (ip_family, nrc)))
+
+        # For Marking UDP First Packet
+        nrc = nfu.add_rule(
+            {'family': ip_family, 'chain': ['mangle_PREROUTING'], 'table': 'policy_route', 'comment': cmt_class,
+             'expr': [{'match': nfu.match_payload(field='daddr', protocol=ip_family, right='@local', op='!=')},
+                      {'match': nfu.match_payload(field='saddr', protocol=ip_family, right='@ignore_list',
+                                                  op='!=')},
+                      {'match': nfu.match_mark(0)},
+                      {'match': nfu.match_ct('new', key='state')},
+                      {'match': nfu.match_l4proto('udp')},
+                      {'match': nfu.match_iifname({'set': nat_interfaces})},
+                      {'counter': {'bytes': 0, 'packets': 0}},
+                      {'queue': {'num': 4}}]
+             })
+        if functools.reduce(lambda a, b: a | b, [add_rule_rc[0] for add_rule_rc in nrc]):
+            print("[-] %s" % tf.format("{msg:s,bg_red,white,bold}",
+                                       msg="add rule %s mangle_PREROUTING NFQUEUE failed: %s" % (ip_family, nrc)))
+        # end For Marking UDP First Packet
+
+        proxy_marks = [0x99]
+        for k, proxy_cfg in config["proxy"].items():
+            # tap0 ss-redir
+            if proxy_cfg["ipv%d" % (ip_version)]:
+                if "port" in proxy_cfg:
+                    create_tproxy(mark=proxy_cfg["mark"], port=proxy_cfg["port"], ip_family=ip_family,
+                                  udp=proxy_cfg["udp_v%d" % (ip_version)])
+                if proxy_cfg["mark"] not in proxy_marks:
+                    proxy_marks.append(proxy_cfg["mark"])
+                # [0x1, 0x2, 0x5, 0x6, 0x7, 0x8, 0x99]
+
+        nfu.add_set_element(family=ip_family, table="policy_route", name="policy_mark", element=proxy_marks)
+
+        nfu.add_rule(
+            {'family': ip_family, 'chain': ['nat_PREROUTING', 'nat_OUTPUT', 'mangle_PREROUTING'],
+             'table': 'policy_route',
+             'comment': cmt_class,
+             'expr': [
+                 {'match': nfu.match_mark('@policy_mark')},
+                 {'match': nfu.match_ct_mark(0)},
+                 {'counter': {'bytes': 0, 'packets': 0}},
+                 # {'log': {'prefix': 'AUTOGEN SAVE MARK '}},
+                 {'mangle': {'key': {'ct': {'key': 'mark'}}, 'value': {'meta': {'key': 'mark'}}}}]
+             })
+
+        if ip_version == 4:
+            nfu.add_rule(
+                {'family': ip_family, 'chain': 'nat_POSTROUTING', 'table': 'policy_route', 'comment': cmt_class,
+                 'expr': [
+                     {'match': nfu.match_mark('@policy_mark')},
+                     {'counter': {'bytes': 0, 'packets': 0}},
+                     {'masquerade': None}]
+                 })
+        elif ip_version == 6:
+            nfu.add_rule(
+                {'family': ip_family, 'chain': 'nat_POSTROUTING', 'table': 'policy_route', 'comment': cmt_class,
+                 'expr': [
+                     {'match': nfu.match_mark('@policy_mark')},
+                     {'counter': {'bytes': 0, 'packets': 0}},
+                     {'masquerade': None}]
+                 })
+
+    nfqueue = netfilterqueue.NetfilterQueue()
+    nfqueue.bind(4, ip_mark, mode=netfilterqueue.COPY_PACKET)
+
+    signal.signal(signal.SIGTERM, quit)
+    signal.signal(signal.SIGQUIT, quit)
+    signal.signal(signal.SIGHUP, quit)
+    signal.signal(signal.SIGUSR1, reload_queue)
+
+    load_executor()
+
+    fcnat_listner = None
+    fcnat_cleaner = None
+
+    t_dns_clean = 0
+    t_print = 0
+    queue_stdin = []
+    mouse_offset = 0
+    old_settings = termios.tcgetattr(sys.stdin.fileno())
+    tty.setcbreak(sys.stdin.fileno())
+    unbuffered_stdin = os.fdopen(sys.stdin.fileno(), 'rb', buffering=0)
+
+    selected_proxy = None
+
+    while not term.value:
+        try:
+            l_read = [unbuffered_stdin]
+            s = select.select(l_read, [], [], 0.25)
+            if len(s[0]) > 0:
+                n = unbuffered_stdin.read(1)
+                queue_stdin.append(n)
+
+            while len(queue_stdin) > 0:
+                if queue_stdin[0] == b"\x1B":
+                    if len(queue_stdin) >= 3:
+                        if b"".join(queue_stdin[0:3]) == b"\x1b[C":
+                            mouse_offset += 1
+                        queue_stdin = queue_stdin[4:]
+                    else:
+                        break
+                elif queue_stdin[0] == b"l":
+                    queue_stdin = queue_stdin[1:]
+                    print()
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+                    print("Source Filter: ", end="", flush=True)
                     g_lock.acquire()
-                    g_filter_ip[0:len(filter_ip) + 1] = filter_ip + "\0"
+                    g_filter_ip[0:11] = "0.0.0.0/32\0"
                     g_lock.release()
-                except AssertionError:
-                    g_filter_ip[0] = "\0"
-                    print(tf.format("{msg:s,bg_yellow,black}", msg="[-] Filter clear"), file=sys.stderr)
-                except ValueError as e:
-                    g_filter_ip[0] = "\0"
-                    print(
-                        tf.format("{msg:s,bg_red,black}", msg="[-] Filter Error: Invalid IP Address / Network: %s" % e),
-                        file=sys.stderr)
-            else:
-                queue_stdin = queue_stdin[1:]
+                    filter_ip = unbuffered_stdin.readline().strip().decode("utf-8")
+                    tty.setcbreak(sys.stdin.fileno())
+                    try:
+                        assert filter_ip != ""
+                        ipaddress.ip_network(filter_ip)
+                        # assert len(filter_ip.split("/")) == 2
+                        # assert isinstance(int(filter_ip.split("/")[1]), int)
 
-        if time.time() - t_dns_clean > 15:
-            t_dns_clean = time.time()
-            dns_list.clean()
+                        g_lock.acquire()
+                        g_filter_ip[0:len(filter_ip) + 1] = filter_ip + "\0"
+                        g_lock.release()
+                    except AssertionError:
+                        g_filter_ip[0] = "\0"
+                        print(tf.format("{msg:s,bg_yellow,black}", msg="[-] Filter clear"), file=sys.stderr)
+                    except ValueError as e:
+                        g_filter_ip[0] = "\0"
+                        print(
+                            tf.format("{msg:s,bg_red,black}",
+                                      msg="[-] Filter Error: Invalid IP Address / Network: %s" % e),
+                            file=sys.stderr)
+                else:
+                    queue_stdin = queue_stdin[1:]
 
-        if time.time() - t_print > 0.25:
-            t_print = time.time()
+            if time.time() - t_dns_clean > 15:
+                t_dns_clean = time.time()
+                dns_list.clean()
 
-            # if fcnat_listner is None or not fcnat_listner.is_alive():
-            #     fcnat_listner = FullConeNAT_Listener()
-            #     fcnat_listner.start()
-            # if fcnat_cleaner is None or not fcnat_cleaner.is_alive():
-            #     fcnat_cleaner = FullConeNAT_Cleaner()
-            #     fcnat_cleaner.start()
+            if time.time() - t_print > 0.25:
+                t_print = time.time()
 
-            g_io_lock.acquire(timeout=1.0)
+                # if fcnat_listner is None or not fcnat_listner.is_alive():
+                #     fcnat_listner = FullConeNAT_Listener()
+                #     fcnat_listner.start()
+                # if fcnat_cleaner is None or not fcnat_cleaner.is_alive():
+                #     fcnat_cleaner = FullConeNAT_Cleaner()
+                #     fcnat_cleaner.start()
 
-            base_offset = len(" ALIVE: [🟩🟩")
-            if base_offset <= mouse_offset < base_offset + len(g_runner):
-                selected_proxy = None
-                print(tf.format("{msg:s,red,bold}", msg="ALIVE Process: %d" % (mouse_offset - base_offset)),
-                      "            ")
+                g_io_lock.acquire(timeout=1.0)
 
-            base_offset += len(g_runner) + len("]  IPv4: [")
-            if base_offset <= mouse_offset < base_offset + len(g_proxy_index):
-                selected_proxy = g_proxy_index[(mouse_offset - base_offset)]
-                print(tf.format("{msg:s,red,bold}", msg="IPv4 Proxy: %s" % g_proxy_index[(mouse_offset - base_offset)]),
-                      "            ")
+                base_offset = len(" ALIVE: [🟩🟩")
+                if base_offset <= mouse_offset < base_offset + len(g_runner):
+                    selected_proxy = None
+                    print(tf.format("{msg:s,red,bold}", msg="ALIVE Process: %d" % (mouse_offset - base_offset)),
+                          "            ")
 
-            base_offset += len(g_proxy_index) + len("]  IPv6: [")
-            if base_offset <= mouse_offset < base_offset + len(g_proxy_index):
-                selected_proxy = g_proxy_index[(mouse_offset - base_offset)]
-                print(tf.format("{msg:s,red,bold}", msg="IPv6 Proxy: %s" % g_proxy_index[(mouse_offset - base_offset)]),
-                      "            ")
+                base_offset += len(g_runner) + len("]  IPv4: [")
+                if base_offset <= mouse_offset < base_offset + len(g_proxy_index):
+                    selected_proxy = g_proxy_index[(mouse_offset - base_offset)]
+                    print(tf.format("{msg:s,red,bold}",
+                                    msg="IPv4 Proxy: %s" % g_proxy_index[(mouse_offset - base_offset)]),
+                          "            ")
 
-            error_msg = " " * 40
+                base_offset += len(g_proxy_index) + len("]  IPv6: [")
+                if base_offset <= mouse_offset < base_offset + len(g_proxy_index):
+                    selected_proxy = g_proxy_index[(mouse_offset - base_offset)]
+                    print(tf.format("{msg:s,red,bold}",
+                                    msg="IPv6 Proxy: %s" % g_proxy_index[(mouse_offset - base_offset)]),
+                          "            ")
 
-            if g_overload_flag.value:
-                error_msg = tf.format("{msg:s,bg_yellow,red} ",
-                                      msg="Warning: Queue overloaded, working: %d" % g_running_process.value)
+                error_msg = " " * 40
 
-            if g_cps_dup.value >= 20:
-                error_msg = tf.format("{msg:s,cyan} ", msg="Info: Print Cached Result overloaded")
+                if g_overload_flag.value:
+                    error_msg = tf.format("{msg:s,bg_yellow,red} ",
+                                          msg="Warning: Queue overloaded, working: %d" % g_running_process.value)
 
-            if g_cps.value >= 50:
-                error_msg = tf.format("{msg:s,bg_cyan,red} ",
-                                      msg="Info: Print Result overloaded")
+                if g_cps_dup.value >= 20:
+                    error_msg = tf.format("{msg:s,cyan} ", msg="Info: Print Cached Result overloaded")
 
-            print(" ALIVE: [%s%s%s]  IPv4: [%s]  IPv6: [%s]%s %s" % (
-                "🟧" if g_lock.locked() else "🟩",
-                "🟧" if g_running_process._lock._semlock._count() > 0 else "🟩",
-                "".join(["🔴" if g_runner[x].join(0) is None and not g_runner[x].is_alive() else (
-                    "🟡" if g_working_flag[x].value else ("🟢" if t_print - g_worker_last_active[x].value <= 30 else "🟩"))
-                         for x in range(len(g_runner))]),
-                "".join([time_to_level(g_dead_proxy_ipv4[g_proxy_index[x]].value, g_proxy_index[x]) for x in
-                         range(len(g_dead_proxy_ipv4.values()))]),
-                "".join([time_to_level(g_dead_proxy_ipv6[g_proxy_index[x]].value, g_proxy_index[x]) for x in
-                         range(len(g_dead_proxy_ipv6.values()))]),
-                "" if selected_proxy is None else " Proxy: %s" % (tf.format("{proxy:s,cyan}", proxy=selected_proxy)),
-                error_msg), end="\r" if g_overload_flag.value == False else "\n")
+                if g_cps.value >= 50:
+                    error_msg = tf.format("{msg:s,bg_cyan,red} ",
+                                          msg="Info: Print Result overloaded")
 
-            mouse_offset = 0
-            g_io_lock.release()
+                print(" ALIVE: [%s%s%s]  IPv4: [%s]  IPv6: [%s]%s %s" % (
+                    "🟧" if g_lock.locked() else "🟩",
+                    "🟧" if g_running_process._lock._semlock._count() > 0 else "🟩",
+                    "".join(["🔴" if g_runner[x].join(0) is None and not g_runner[x].is_alive() else (
+                        "🟡" if g_working_flag[x].value else (
+                            "🟢" if t_print - g_worker_last_active[x].value <= 30 else "🟩"))
+                             for x in range(len(g_runner))]),
+                    "".join([time_to_level(g_dead_proxy_ipv4[g_proxy_index[x]].value, g_proxy_index[x]) for x in
+                             range(len(g_dead_proxy_ipv4.values()))]),
+                    "".join([time_to_level(g_dead_proxy_ipv6[g_proxy_index[x]].value, g_proxy_index[x]) for x in
+                             range(len(g_dead_proxy_ipv6.values()))]),
+                    "" if selected_proxy is None else " Proxy: %s" % (
+                        tf.format("{proxy:s,cyan}", proxy=selected_proxy)),
+                    error_msg), end="\r" if g_overload_flag.value == False else "\n")
 
-        now = time.time()
-        if now - g_cps_reset.value >= 1:
-            with g_cps_reset.get_lock():
-                g_cps_reset.value = now
-            with g_cps.get_lock():
-                g_cps.value = 0
-            with g_cps_dup.get_lock():
-                g_cps_dup.value = 0
+                mouse_offset = 0
+                g_io_lock.release()
 
-            if g_overload_flag.value:
-                with g_overload_flag.get_lock():
-                    g_overload_flag.value = False
-                # g_io_lock.acquire()
-                # print(tf.format("{msg:s,bg_yellow,red} Working: {working:d,yellow,bold} ",msg="Warning: Queue overloaded", working=g_running_process.value))
-                # g_io_lock.release()
-    except KeyboardInterrupt:
-        term.value = True
-        clearRules()
-        for run_p in g_runner:
-            run_p.release_process()
-        print("[*] system exit")
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
-        os.kill(os.getpid(), signal.SIGKILL)
-        break
-    except RuntimeError:
-        pass
-    except Exception as e:
-        print(tf.format("{msg:s,bg_red,black}", msg="[-] System Error: %s" % e), file=sys.stderr)
-        print(''.join(traceback.format_tb(e.__traceback__)), file=sys.stderr)
-        with open("nft_route.log", "a+") as f:
-            f.write("%s: Main Process Error: %s\n  %s\n" % (
-                datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+            now = time.time()
+            if now - g_cps_reset.value >= 1:
+                with g_cps_reset.get_lock():
+                    g_cps_reset.value = now
+                with g_cps.get_lock():
+                    g_cps.value = 0
+                with g_cps_dup.get_lock():
+                    g_cps_dup.value = 0
 
-# wait for packets
+                if g_overload_flag.value:
+                    with g_overload_flag.get_lock():
+                        g_overload_flag.value = False
+                    # g_io_lock.acquire()
+                    # print(tf.format("{msg:s,bg_yellow,red} Working: {working:d,yellow,bold} ",msg="Warning: Queue overloaded", working=g_running_process.value))
+                    # g_io_lock.release()
+        except KeyboardInterrupt:
+            term.value = True
+            clearRules()
+            for run_p in g_runner:
+                run_p.release_process()
+            print("[*] system exit")
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+            os.kill(os.getpid(), signal.SIGKILL)
+            break
+        except RuntimeError:
+            pass
+        except Exception as e:
+            print(tf.format("{msg:s,bg_red,black}", msg="[-] System Error: %s" % e), file=sys.stderr)
+            print(''.join(traceback.format_tb(e.__traceback__)), file=sys.stderr)
+            with open("nft_route.log", "a+") as f:
+                f.write("%s: Main Process Error: %s\n  %s\n" % (
+                    datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
