@@ -11,6 +11,8 @@ from scapy.all import *
 import scapy.layers.inet
 from scapy.layers.dns import DNSRR, DNS, DNSQR
 from pytput import TputFormatter
+import prctl
+import signal
 
 tf = TputFormatter()
 
@@ -119,10 +121,10 @@ class MPDNSList(list):
             self.MapCache['count'] = len(self)
         return self.MapCache['map'][item]
 
-    def clean(self):
+    def clean(self, force=False):
         now = time.time()
         for k, v in enumerate(self):
-            if v.expire < now:
+            if v.expire < now or (force and v.expire < now + 1500):
                 del self[k]
 
 class DNSProcess(multiprocessing.Process):
@@ -130,6 +132,46 @@ class DNSProcess(multiprocessing.Process):
         super().__init__()
         self.dns_list = dns_list
         self.term = term
+        self.last_title_update = 0
+
+    def update_dns_item(self, ver, dns, dnsrr):
+        ttl = dnsrr.ttl
+        if ttl < 1800:
+            ttl = 1800
+        rrname = dnsrr.rrname.decode("utf-8")
+        qname = dns[DNS].qd.qname.decode("utf-8")
+        foundQname = False
+        foundRRName = False
+        try:
+            list = self.dns_list[dnsrr.rdata]
+            for item in list:
+                if item.ip_family == dns.version and item.qname == qname:
+                    item.expire = time.time() + ttl
+                    foundQname = True
+                if item.ip_family == dns.version and item.qname == rrname:
+                    item.expire = time.time() + ttl
+                    foundRRName = True
+        except KeyError:
+            pass
+        if not foundQname or not foundRRName:
+            rc = MPDNSItem()
+            rc.expire = time.time() + ttl
+            rc.ip_family = ver
+            rc.qname = qname
+            rc.ip_addr = dnsrr.rdata
+        if not foundQname:
+            try:
+                self.dns_list.append(rc)
+            except MemoryError:
+                self.dns_list.clean(True)
+                self.dns_list.append(rc)
+        if dnsrr.rrname != dns[DNS].qd.qname and not foundRRName:
+            rc.qname = dnsrr.rrname.decode("utf-8")
+            try:
+                self.dns_list.append(rc)
+            except MemoryError:
+                self.dns_list.clean(True)
+                self.dns_list.append(rc)
 
     def dnsSpoof(self, packet):
         try:
@@ -143,43 +185,31 @@ class DNSProcess(multiprocessing.Process):
                     #     dnsrr.rrname, dnsrr.type, dnsrr.rdata))
                     if dnsrr.type == 1:
                         # A Record
-                        ttl = dnsrr.ttl
-                        if ttl < 1800:
-                            ttl = 1800
-                        rc = MPDNSItem()
-                        rc.expire = time.time() + ttl
-                        rc.ip_family = dns.version
-                        rc.qname = dns[DNS].qd.qname.decode("utf-8")
-                        rc.ip_addr = dnsrr.rdata
-                        self.dns_list.append(rc)
-                        if dnsrr.rrname != dns[DNS].qd.qname:
-                            rc.qname = dnsrr.rrname.decode("utf-8")
-                            self.dns_list.append(rc)
+                        self.update_dns_item(4, dns, dnsrr)
                     elif dnsrr.type == 5:
                         # CName
                         pass
                     elif dnsrr.type == 28:
                         # AAAA Record
-                        ttl = dnsrr.ttl
-                        if ttl < 1800:
-                            ttl = 1800
-                        rc = MPDNSItem()
-                        rc.expire = time.time() + ttl
-                        rc.ip_family = dns.version
-                        rc.qname = dns[DNS].qd.qname.decode("utf-8")
-                        rc.ip_addr = dnsrr.rdata
-                        self.dns_list.append(rc)
-                        if dnsrr.rrname != dns[DNS].qd.qname:
-                            rc.qname = dnsrr.rrname.decode("utf-8")
-                            self.dns_list.append(rc)
+                        self.update_dns_item(6, dns, dnsrr)
         except Exception as e:
             print(tf.format("{msg:s,bg_red,black}", msg="[-] DNS Thread Error: %s" % e))
             with open("nft_route.log", "a+") as f:
                 f.write("%s: DNS Worker Process Error: %s\n  %s\n" % (
                     datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
         packet.accept()
+        if time.time() - self.last_title_update >= 5:
+            self.last_title_update = time.time()
+            prctl.set_proctitle("Policy Route - DNS %02d" % len(self.dns_list))
+
+    def dump_dns(self, signum, sigframe):
+        print(tf.format("{msg:s,bg_cyan,black}", msg="[+] DNS Thread Dumping"))
+        with open("/dev/shm/dns_list.log", "a+") as f:
+            for dns in self.dns_list:
+                f.write(str(dns) + "\n")
 
     def run(self):
+        signal.signal(signal.SIGUSR1, self.dump_dns)
         nfqueue = netfilterqueue.NetfilterQueue()
         nfqueue.bind(53, self.dnsSpoof, mode=netfilterqueue.COPY_PACKET)
 

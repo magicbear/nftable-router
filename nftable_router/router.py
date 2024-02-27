@@ -13,6 +13,7 @@ import netfilterqueue
 import ipaddress
 import sys
 import os
+
 module_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, module_dir)
 sys.path.insert(0, os.path.join(module_dir, "../"))
@@ -62,6 +63,7 @@ g_cps_reset = Value('d', 0)
 g_overload_flag = Value('b', False)
 g_working_flag = [Value('b', False) for x in range(g_parallel_process)]
 g_worker_last_active = [Value('d', time.time()) for x in range(g_parallel_process)]
+g_worker_process_connections = [Value(ctypes.c_ulong, 0) for x in range(g_parallel_process)]
 g_proxy_index = []
 g_dead_proxy_ipv4 = {}
 g_dead_proxy_ipv6 = {}
@@ -693,6 +695,7 @@ def ip_mark(packet):
         pkt_version_str = "ipv%d" % pkt_version
 
         g_worker_last_active[worker_id].value = t1
+        g_worker_process_connections[worker_id].value += 1
 
         allow_ecmp = proto in [6, 17] and 'allow_ecmp_port' in config and port in config['allow_ecmp_port']
 
@@ -1172,9 +1175,13 @@ if __name__ == "__main__":
             {"family": ip_family, "table": "policy_route", "name": "mangle_TPROXY_PREROUTING", "type": "filter",
              "hook": "prerouting", "prio": -140, "policy": 'accept'})
 
-        nfu.add_chain({"family": 'ip', "table": "policy_route", "name": "INPUT", "type": "filter", "hook": "input",
+        nfu.add_chain({"family": ip_family, "table": "policy_route", "name": "INPUT", "type": "filter", "hook": "input",
                        "prio": 0, "policy": 'accept'})
-        nfu.add_rule({'family': 'ip', 'chain': 'INPUT', 'table': 'policy_route', 'comment': cmt_class,
+
+        nfu.add_chain({"family": ip_family, "table": "policy_route", "name": "FORWARD", "type": "filter",
+                       "hook": "forward", "prio": 0, "policy": 'accept'})
+
+        nfu.add_rule({'family': ip_family, 'chain': 'INPUT', 'table': 'policy_route', 'comment': cmt_class,
                       'expr': [{'match': nfu.match_payload('sport', 53, protocol='udp')},
                                {'counter': {'bytes': 0, 'packets': 0}},
                                {'queue': {'num': 53}}]
@@ -1195,6 +1202,14 @@ if __name__ == "__main__":
         nfu.add_set_element(family=ip_family, table="policy_route", name="ignore_list",
                             element=config["ignore_list"]["ipv%d" % (ip_version)])
 
+        nfu.add_rule({'family': ip_family, 'chain': ['FORWARD'], 'table': 'policy_route',
+                      'comment': "Fix TCP MSS for tunnel/ppp",
+                      'expr': [
+                          {"match": nfu.match_syn()},
+                          {'counter': {'bytes': 0, 'packets': 0}},
+                          {"mangle": {"key": {"tcp option": {"name": "maxseg", "field": "size"}},
+                                      "value": {"rt": {"key": "mtu"}}}}
+                      ]})
         # Return CIDR Process by Queue
         for priority in range(0, len(config["rules"])):
             for tun_id, rule_cfg in config["rules"][priority].items():
