@@ -1135,8 +1135,7 @@ if __name__ == "__main__":
 
     print("[*] initalize dns memory")
     dns_list = MPDNSList()
-    dns_proc = DNSProcess(dns_list, term)
-    dns_proc.start()
+    dns_proc = None
 
     load_config()
 
@@ -1481,6 +1480,9 @@ if __name__ == "__main__":
             if time.time() - t_print > 0.25:
                 t_print = time.time()
 
+                if dns_proc is None or not dns_proc.is_alive():
+                    dns_proc = DNSProcess(dns_list, term)
+                    dns_proc.start()
                 # if fcnat_listner is None or not fcnat_listner.is_alive():
                 #     fcnat_listner = FullConeNAT_Listener()
                 #     fcnat_listner.start()
