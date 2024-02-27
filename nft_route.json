@@ -1,4 +1,6 @@
 {
+   "ipdb_v4": "/usr/local/opt/mtr/ipdotnet.ipdb",
+   "ipdb_v6": "/usr/local/opt/mtr/ipdotnet.ipdb",
    "nat_interfaces": ["eno1"],
    "tunnel_ip": {
       "ipv4": [
