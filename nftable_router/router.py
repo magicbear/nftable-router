@@ -71,7 +71,7 @@ g_runner = []
 is_master = True
 worker_id = 0  # Modified by Process
 process_term = False  # Modified by Process
-queue = Queue()
+queue = ProcessQueue()
 
 cmt_class = '**AUTOGEN BY PolicyRoute**'
 protos = {1: "ICMP", 2: "IGMP", 6: {"color": "green", "name": "TCP"}, 17: {"color": "blue", "name": "UDP"}, 47: "GRE",
@@ -1073,8 +1073,6 @@ class NFQUEUE_Executeor(Process):
         signal.signal(signal.SIGQUIT, self.quit)
 
         is_master = False
-        tp = PrintResultThread()
-        tp.start()
 
         ecmp_thread = ECMPThread()
         ecmp_thread.start()
@@ -1094,7 +1092,7 @@ class NFQUEUE_Executeor(Process):
                     f.write("%s: Worker %d Process Error: %s\n  %s\n" % (
                         datetime.now().isoformat(), worker_id, str(e), '  '.join(traceback.format_tb(e.__traceback__))))
 
-        tp.raise_exception()
+        # tp.raise_exception()
         os.kill(os.getpid(), signal.SIGKILL)
 
 
@@ -1410,6 +1408,9 @@ if __name__ == "__main__":
 
     selected_proxy = None
     cps = 0
+
+    tp = PrintResultThread()
+    tp.start()
 
     while not term.value:
         try:
