@@ -1,0 +1,147 @@
+{
+   "nat_interfaces": ["eno1"],
+   "tunnel_ip": {
+      "ipv4": [
+         
+      ],
+      "ipv6": [
+         
+      ]
+   },
+   "allow_ecmp": [
+      
+   ],
+   "allow_ecmp_port": [
+   ],
+   "ignore_print_domain": [
+      "connectivitycheck.gstatic.com.",
+      "connectivitycheck.platform.hicloud.com",
+      "connect.rom.miui.com"
+   ],
+   "ignore_list": {
+      "ipv4": [
+      ],
+      "ipv6": []
+   },
+   "proxy": {
+      "line1": {
+         "ipv4": true,
+         "ipv6": false,
+         "mark": 51,
+         "weight": 1,
+         "udp_v4": true,
+         "udp_v6": false,
+         "fullcone": true,
+         "bind": "192.168.200.2:10051",
+         "test_dns": ["116.228.111.118", "180.168.255.18", "114.114.114.114"],
+         "test_url": "http://connectivitycheck.platform.hicloud.com/generate_204"
+      },
+      "line2": {
+         "ipv4": true,
+         "ipv6": false,
+         "mark": 903,
+         "weight": 1,
+         "fullcone": true,
+         "bind": "192.168.200.2:10903",
+         "test_dns": ["116.228.111.118", "180.168.255.18", "223.5.5.5"],
+         "test_url": "http://connect.rom.miui.com/generate_204"
+      },
+      "line3-proxy": {
+         "ipv4": true,
+         "ipv6": true,
+         "port": 506,
+         "mark": 35,
+         "udp_v4": false,
+         "udp_v6": false,
+         "weight":1,
+         "proxy_ip": "12.34.56.78",
+         "bind": "192.168.200.2:10506",
+         "test_dns": "1.1.1.1",
+         "test_url": "http://www.google.com/generate_204"
+      }
+   },
+   "rules": [
+      {
+         "line1": {
+            "resolve": [
+               "ifconfig.co.",
+               ".nflxvideo.net.",
+               ".nflxext.com.",
+               ".nflxso.com.",
+               ".netflix.com.",
+               ".disneyplus.com.",
+               ".cloudfront.net.",
+               "f1prodlive.akamaized.net.",
+               ".formula1.com.",
+               ".bitmovin.com.",
+               ".watchliveformula1.com."
+            ],
+            "cidr": [
+               "192.168.48.0/24"
+            ]
+         },
+         "line2": {
+            "any": true,
+            "from": ["192.168.1.0/24"]
+         }
+      },
+      {
+         "line1": {
+            "isp_domain": [
+               "阿里云",
+               "阿里云/电信/联通/移动/教育网"
+            ],
+            "cidr": [
+               "116.228.111.118", "180.168.255.18", "110.43.134.155",
+            ],
+            "region_name": [
+               "DNSPOD.COM"
+            ],
+            "resolve": [
+               "cli.speedtest.net.",
+               ".speedtest.net.",
+               "test-ipv6.com.",
+               ".apple.com.",
+               ".tmall.com.",
+               ".mmstat.com.",
+               ".taobao.com.",
+               ".m.taobao.com.",
+               ".alicdn.com.",
+               ".alibabachengdun.com.",
+               ".aliapp.org.",
+               ".alipay.com.",
+               ".jd.com.",
+               ".360buyimg.com."
+            ]
+         },
+         "line2": {
+            "region_name": [
+               "DNSPOD.COM"
+            ],
+            "resolve": [
+               "netreport.sh.189.cn."
+            ]
+         }
+      },
+      {
+         "line3-proxy": {
+            "country_code": [
+               "AT","BE","BG","CH","CZ","DK","DE","ES","EE","FI","FR","GR","GB","HR","HU","IS","IE","IT","LU","LV","LT","MT","MD","MC","NL","NO","PL","PT","RO","RU","SM","SK","SE","UA","UK","YU",
+               "KR", "JP",
+               "MO","HK"
+            ]
+         },
+         "line1": {
+            "country_name": [
+               "保留地址",
+               "共享地址"
+            ]
+         }
+      },
+      {
+         "line1": {
+            "any": true
+         }
+      }
+   ]
+}
