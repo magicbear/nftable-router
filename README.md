@@ -57,6 +57,6 @@ Software Policy Router for nftables
 	- `owner_domain`	- match by owner domain (such as `github.com`, `twitter.com`)
 	- `isp_domain`		- match by ISP (such as `阿里云`, `阿里云/电信/联通/移动/教育网`)
 	- `country_code`	- match by 2 char country code (such as `CN`)
-	- `anycast`			- match by is anycast ip (only `` or `ANYCAST`)
-	- `idc`				- match by is idc ip (only `` or `IDC`)
-	- `base_station`	- match by is base_station ip
+	- `anycast`			- match by is anycast ip (only ` ` or `ANYCAST`)
+	- `idc`				- match by is idc ip (only ` ` or `IDC`)
+	- `base_station`	- match by is base_station ip (only ` ` or `基站`)
