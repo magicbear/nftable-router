@@ -133,6 +133,14 @@ class nftUtils():
             'elem': element
         }}}]})
 
+    def add_set_interface(self, name, element, table='filter', family="ip"):
+        return self.nft.json_cmd({"nftables": [{"add": {"element": {
+            'name': name,
+            'table': table,
+            'family': family,
+            'elem': element
+        }}}]})
+
     def delete_set_element(self, name, element, table='filter', family="ip"):
         # print("[-] delete set elements %s %s %s -> %s" % (family, name, table, element))
         return self.nft.json_cmd({"nftables": [{"delete": {"element": {
@@ -203,6 +211,11 @@ class nftUtils():
 
     def match_mark(self, mark, op='=='):
         return {'left': {'meta': {'key': 'mark'}},
+                'op': op,
+                'right': mark}
+
+    def match_iif(self, mark, op='=='):
+        return {'left': {'meta': {'key': 'iif'}},
                 'op': op,
                 'right': mark}
 
