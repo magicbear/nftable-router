@@ -4,6 +4,7 @@ import threading
 from multiprocessing import Queue as ProcessQueue
 from multiprocessing import Process, Value, Array, Lock
 from datetime import datetime
+import syslog
 
 import ipdb
 import scapy.layers.inet
@@ -38,6 +39,7 @@ from queue import Queue
 import traceback
 import itertools
 import prctl, tty, termios
+import netifaces
 
 tf = TputFormatter()
 
@@ -77,7 +79,7 @@ protos = {1: "ICMP", 2: "IGMP", 6: {"color": "green", "name": "TCP"}, 17: {"colo
           58: "ICMP6"}
 
 raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-
+syslog.openlog(ident="PolicyRoute[%d]" % os.getpid())
 
 class TestThread(threading.Thread):
     def __init__(self):
@@ -169,7 +171,7 @@ class TestThread(threading.Thread):
                             pcurl = subprocess.Popen(curl_args, stdout=subprocess.PIPE, shell=False)
                             tquery = pcurl.stdout.read().decode('utf-8').split(" ")
                             # print(tquery)
-                            if tquery[1] == '200' or tquery[1] == '204':
+                            if tquery[1] == '200' or tquery[1] == '204' or tquery[1] == '302':
                                 # print("[+] \033[38;5;157mProxy Check IPv%d %s OK\033[0m, time %s" % (
                                 # ip_version, proxy_id, tquery[0]))
                                 test_result.append([proxy_id, ip_version, "%s %s" % (tquery[0], self.test_ip)])
@@ -404,9 +406,8 @@ def load_config():
             g_proxy_index = proxy_index
         except Exception as e:
             print("[-] \033[41mLoad Config Error: %s\033[0m" % (e))
-            with open("nft_route.log", "a+") as f:
-                f.write("%s: Load Config Error: %s\n  %s\n" % (
-                    datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+            syslog.syslog(syslog.LOG_CRIT, "Load Config Error: %s\n  %s" % (
+                    str(e), '  '.join(traceback.format_tb(e.__traceback__))))
 
 
 def create_tproxy(mark, port, ip_family, udp=False):
@@ -414,7 +415,7 @@ def create_tproxy(mark, port, ip_family, udp=False):
     nfu.add_rule({'family': ip_family, 'chain': ['nat_PREROUTING'], 'table': 'policy_route', 'comment': cmt_class,
                   'expr': [{'match': nfu.match_mark(mark)},
                            {'match': nfu.match_l4proto('tcp')},
-                           {'match': nfu.match_iifname({'set': nat_interfaces})},
+                           {'match': nfu.match_iif("@nat_interfaces")},
                            {'counter': {'bytes': 0, 'packets': 0}},
                            {'redirect': {'port': port}}]
                   })
@@ -430,7 +431,7 @@ def create_tproxy(mark, port, ip_family, udp=False):
             {'family': ip_family, 'chain': ['mangle_TPROXY_PREROUTING'], 'table': 'policy_route', 'comment': cmt_class,
              'expr': [{'match': nfu.match_mark(mark)},
                       {'match': nfu.match_l4proto(17)},
-                      {'match': nfu.match_iifname({'set': nat_interfaces})},
+                      {'match': nfu.match_iif("@nat_interfaces")},
                       {'counter': {'bytes': 0, 'packets': 0}},
                       {'mangle': {'key': {'meta': {'key': 'mark'}}, 'value': 0x100}},  # Force Traffic to Local
                       # {'log': {'prefix': 'AUTOGEN SAVE MARK '}},
@@ -781,6 +782,8 @@ def ip_mark(packet):
                     packet.accept()
                     if not g_overload_flag.value:
                         g_overload_flag.value = True
+                        syslog.syslog(syslog.LOG_NOTICE,
+                              f"[*] running process overload, running: {g_running_process.value}")
                     return
 
                 try:
@@ -939,12 +942,11 @@ def ip_mark(packet):
                         packet.set_mark(0x99)
                         packet.repeat()
                 except Exception as e:
+                    syslog.syslog(syslog.LOG_CRIT,
+                          "IP Mark Process Error: %s\n  %s\n" % (str(e), '  '.join(traceback.format_tb(e.__traceback__))))
                     print("ERROR: ", e)
                     print(''.join(traceback.format_tb(e.__traceback__)))
                     print(packet)
-                    with open("nft_route.log", "a+") as f:
-                        f.write("%s: IP Mark Process Error: %s\n  %s\n" % (
-                            datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
                     packet.accept()
                 finally:
                     with g_running_process.get_lock():
@@ -961,9 +963,8 @@ def ip_mark(packet):
         print("ERROR: ", e)
         print(''.join(traceback.format_tb(e.__traceback__)))
         print(packet)
-        with open("nft_route.log", "a+") as f:
-            f.write("%s: IP Mark Process Error: %s\n  %s\n" % (
-                datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+        syslog.syslog(syslog.LOG_CRIT,
+            "IP Mark Process Error: %s\n  %s\n" % (str(e), '  '.join(traceback.format_tb(e.__traceback__))))
         packet.accept()
 
 
@@ -1045,9 +1046,9 @@ def reload_queue(signum, sigframe):
         except Exception as e:
             print(tf.format("{msg:s,bg_red,black}", msg="[-] Reload Error: %s" % e))
             print(''.join(traceback.format_tb(e.__traceback__)))
-            with open("nft_route.log", "a+") as f:
-                f.write("%s: Reload Process Error: %s\n  %s\n" % (
-                    datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+
+            syslog.syslog(syslog.LOG_CRIT, "Reload Process Error: %s\n  %s" % (
+                 str(e), '  '.join(traceback.format_tb(e.__traceback__))))
     print("[+] %s" % tf.format("{msg:s,green,bold}", msg="reboot executer done"))
 
 
@@ -1076,6 +1077,8 @@ class NFQUEUE_Executeor(Process):
     def run(self):
         global ecmp_thread, is_master, worker_id, process_term, nfu
 
+        syslog.openlog(ident="PolicyRoute[%d]::W%02d" % (os.getpid(), self.worker_id))
+
         worker_id = self.worker_id
 
         signal.signal(signal.SIGTERM, self.quit)
@@ -1090,6 +1093,8 @@ class NFQUEUE_Executeor(Process):
 
         while not term.value and not process_term:
             try:
+                syslog.syslog(syslog.LOG_INFO,
+                              "[*] waiting for data (Process %2d, PID: %d)" % (self.worker_id, os.getpid()))
                 print("[*] waiting for data (Process %2d, PID: %d)" % (self.worker_id, os.getpid()), flush=True)
                 nfqueue.run()
             except KeyboardInterrupt:
@@ -1097,9 +1102,8 @@ class NFQUEUE_Executeor(Process):
                 pass
             except Exception as e:
                 print("[-] Error: %s" % e)
-                with open("nft_route.log", "a+") as f:
-                    f.write("%s: Worker %d Process Error: %s\n  %s\n" % (
-                        datetime.now().isoformat(), worker_id, str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+                syslog.syslog(syslog.LOG_ERR, "%s: Worker %d Process Error: %s\n  %s\n" % (
+                    datetime.now().isoformat(), worker_id, str(e), '  '.join(traceback.format_tb(e.__traceback__))))
 
         # tp.raise_exception()
         os.kill(os.getpid(), signal.SIGKILL)
@@ -1152,6 +1156,10 @@ if __name__ == "__main__":
 
     # Internal Interface
     nat_interfaces = config['nat_interfaces']
+    for n, _interface in enumerate(nat_interfaces):
+        if _interface not in netifaces.interfaces():
+            syslog.syslog(syslog.LOG_WARNING, f"Interface {_interface} not exists")
+            nat_interfaces.pop(n)
 
     for ip_version, ip_family in [(4, "ip"), (6, "ip6")]:
         # nfu.delete_set(family=ip_family, table="nat", name="local")
@@ -1166,6 +1174,8 @@ if __name__ == "__main__":
         nfu.add_set(family=ip_family, table="policy_route", name="tunnel_ip", set_type="ipv%d_addr" % (ip_version))
         nfu.add_set(family=ip_family, table="policy_route", name="ignore_list", set_type="ipv%d_addr" % (ip_version))
         nfu.add_set(family=ip_family, table="policy_route", name="policy_mark", set_type="mark")
+        nfu.add_set(family=ip_family, table="policy_route", name="nat_interfaces", set_type="iface_index")
+        nfu.add_set_element(family=ip_family, table="policy_route", name="nat_interfaces", element=nat_interfaces)
 
         nfu.add_chain(
             {"family": ip_family, "table": "policy_route", "name": "nat_PREROUTING", "type": "nat",
@@ -1242,7 +1252,8 @@ if __name__ == "__main__":
                                                                                        'addr': str(
                                                                                            cidr.network_address),
                                                                                        'len': cidr.prefixlen}})},
-                                                       {'match': nfu.match_iifname({'set': nat_interfaces})},
+                                                       # {'match': nfu.match_iifname({'set': nat_interfaces})},
+                                                       {'match': nfu.match_iif("@nat_interfaces")},
                                                        {'match': nfu.match_mark(0)},
                                                        {'counter': {'bytes': 0, 'packets': 0}},
                                                        {'queue': {'num': 4}}]
@@ -1292,7 +1303,7 @@ if __name__ == "__main__":
                                                 {'match': nfu.match_mark(0)},
                                                 {'match': nfu.match_ct('new', key='state')},
                                                 {'match': nfu.match_l4proto('udp')},
-                                                {'match': nfu.match_iifname({'set': nat_interfaces})},
+                                                {'match': nfu.match_iif("@nat_interfaces")},
                                                 {'counter': {'bytes': 0, 'packets': 0}},
                                                 {'queue': {'num': 4}}]
                                              # {'mangle': {'key': {'meta': {'key': 'mark'}},
@@ -1308,7 +1319,7 @@ if __name__ == "__main__":
                  {'match': nfu.match_payload(field='daddr', protocol=ip_family, right='@local', op='!=')},
                  {'match': nfu.match_payload(field='saddr', protocol=ip_family, right='@ignore_list',
                                              op='!=')},
-                 {'match': nfu.match_iifname({'set': nat_interfaces})},
+                 {'match': nfu.match_iif("@nat_interfaces")},
                  {'match': nfu.match_mark(0)},
                  {'counter': {'bytes': 0, 'packets': 0}},
                  {'queue': {'num': 4}}]
@@ -1342,7 +1353,7 @@ if __name__ == "__main__":
                       {'match': nfu.match_mark(0)},
                       {'match': nfu.match_ct('new', key='state')},
                       {'match': nfu.match_l4proto('udp')},
-                      {'match': nfu.match_iifname({'set': nat_interfaces})},
+                      {'match': nfu.match_iif("@nat_interfaces")},
                       {'counter': {'bytes': 0, 'packets': 0}},
                       {'queue': {'num': 4}}]
              })
@@ -1573,6 +1584,5 @@ if __name__ == "__main__":
         except Exception as e:
             print(tf.format("{msg:s,bg_red,black}", msg="[-] System Error: %s" % e), file=sys.stderr)
             print(''.join(traceback.format_tb(e.__traceback__)), file=sys.stderr)
-            with open("nft_route.log", "a+") as f:
-                f.write("%s: Main Process Error: %s\n  %s\n" % (
-                    datetime.now().isoformat(), str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+            syslog.syslog(syslog.LOG_CRIT, "Main Process Error: %s\n  %s" % (
+                    str(e), '  '.join(traceback.format_tb(e.__traceback__))))
