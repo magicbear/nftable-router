@@ -95,6 +95,14 @@ class TestThread(threading.Thread):
         prctl.set_name("PR - %s" % self.__class__.__name__)
         time.sleep(3)
         while not term.value:
+            # 获取当前连接数
+            with open("/proc/sys/net/netfilter/nf_conntrack_max") as f:
+                MAX_CONNTRACK = int(f.read().strip())
+            with open("/proc/sys/net/netfilter/nf_conntrack_count") as f:
+                count = int(f.read().strip())
+            # 超过80%容量时告警
+            if count > 0.8 * MAX_CONNTRACK:
+                syslog.syslog(syslog.LOG_ALERT, f"Conntrack table 80% full: {count}/{MAX_CONNTRACK}")
             flog = open("/var/log/nft_route.log", "a+")
             test_result = []
             for proxy_id in config['proxy']:
@@ -171,7 +179,7 @@ class TestThread(threading.Thread):
                             pcurl = subprocess.Popen(curl_args, stdout=subprocess.PIPE, shell=False)
                             tquery = pcurl.stdout.read().decode('utf-8').split(" ")
                             # print(tquery)
-                            if tquery[1] == '200' or tquery[1] == '204' or tquery[1] == '302':
+                            if tquery[1] == '200' or tquery[1] == '204' or tquery[1] == '301' or tquery[1] == '302':
                                 # print("[+] \033[38;5;157mProxy Check IPv%d %s OK\033[0m, time %s" % (
                                 # ip_version, proxy_id, tquery[0]))
                                 test_result.append([proxy_id, ip_version, "%s %s" % (tquery[0], self.test_ip)])
@@ -571,8 +579,11 @@ class PrintResultThread(threading.Thread):
                         self.lock.release()
                         continue
 
-                    extra_string = "%02d:%02d:%02d %.2f ms (%.2f ms) Resolve: %s" % (
-                        datetime.now().hour, datetime.now().minute, datetime.now().second, rc.t_total, rc.t_init,
+                    # extra_string = "%02d:%02d:%02d %.2f ms (%.2f ms) Resolve: %s" % (
+                    #     datetime.now().hour, datetime.now().minute, datetime.now().second, rc.t_total, rc.t_init,
+                    #     ",".join({res.qname for res in resolve}) if resolve is not None else "")
+                    extra_string = "%.2f ms (%.2f ms) Resolve: %s" % (
+                        rc.t_total, rc.t_init,
                         ",".join({res.qname for res in resolve}) if resolve is not None else "")
                     try:
                         if (rc.proto == 6 or rc.proto == 17) and rc.port == 53:
@@ -779,11 +790,15 @@ def ip_mark(packet):
                 out_interface = g_proxy_index[qos_flag - 1]
             else:
                 if g_parallel_process - g_running_process.value <= 2:
-                    packet.accept()
+                    packet.set_mark(0x99)
+                    packet.repeat()
                     if not g_overload_flag.value:
                         g_overload_flag.value = True
-                        syslog.syslog(syslog.LOG_NOTICE,
-                              f"[*] running process overload, running: {g_running_process.value}")
+                        with open("/proc/sys/net/netfilter/nf_conntrack_count") as f:
+                            conntrack_count = int(f.read().strip())
+                        with open("/proc/net/netfilter/nfnetlink_queue") as f:
+                            queue_info = f.read()
+                        syslog.syslog(syslog.LOG_NOTICE, f"[*] running process overload, running: {g_running_process.value}, conntrack: {conntrack_count}, queue_info: {queue_info}")
                     return
 
                 try:
@@ -947,7 +962,8 @@ def ip_mark(packet):
                     print("ERROR: ", e)
                     print(''.join(traceback.format_tb(e.__traceback__)))
                     print(packet)
-                    packet.accept()
+                    packet.set_mark(0x99)
+                    packet.repeat()
                 finally:
                     with g_running_process.get_lock():
                         g_running_process.value -= 1
@@ -958,14 +974,16 @@ def ip_mark(packet):
                                      matched_priority, test_session,
                                      1000 * (time.time() - t1), 1000 * t_init, packet_payload, process_fullcone))
         else:
-            packet.accept()
+            packet.set_mark(0x99)
+            packet.repeat()
     except Exception as e:
         print("ERROR: ", e)
         print(''.join(traceback.format_tb(e.__traceback__)))
         print(packet)
         syslog.syslog(syslog.LOG_CRIT,
             "IP Mark Process Error: %s\n  %s\n" % (str(e), '  '.join(traceback.format_tb(e.__traceback__))))
-        packet.accept()
+        packet.set_mark(0x99)
+        packet.repeat()
 
 
 def clearRules():
@@ -1212,6 +1230,14 @@ if __name__ == "__main__":
                                {'queue': {'num': 53}}]
                       })
 
+        nfu.add_rule(
+            {'family': ip_family, 'chain': ['nat_PREROUTING'], 'table': 'policy_route', 'comment': cmt_class,
+             'expr': [
+                 {'match': nfu.match_iifname('lo')},
+                 {'counter': {'bytes': 0, 'packets': 0}},
+                 {'accept': None}
+             ]})
+
         if ip_version == 4:
             nfu.add_set_element(family=ip_family, table="policy_route", name="local",
                                 element=[nfu.cidr('127.0.0.0', 8), nfu.cidr('10.0.0.0', 8), nfu.cidr('172.16.0.0', 13),
@@ -1230,6 +1256,7 @@ if __name__ == "__main__":
         nfu.add_rule({'family': ip_family, 'chain': ['FORWARD'], 'table': 'policy_route',
                       'comment': "Fix TCP MSS for tunnel/ppp",
                       'expr': [
+                          {'match': nfu.match_mark('@policy_mark')},
                           {"match": nfu.match_syn()},
                           {'counter': {'bytes': 0, 'packets': 0}},
                           {"mangle": {"key": {"tcp option": {"name": "maxseg", "field": "size"}},
@@ -1391,6 +1418,7 @@ if __name__ == "__main__":
             nfu.add_rule(
                 {'family': ip_family, 'chain': 'nat_POSTROUTING', 'table': 'policy_route', 'comment': cmt_class,
                  'expr': [
+                     {'match': nfu.match_oif("@nat_interfaces", op='!=')},
                      {'match': nfu.match_mark('@policy_mark')},
                      {'counter': {'bytes': 0, 'packets': 0}},
                      {'masquerade': None}]
@@ -1399,6 +1427,7 @@ if __name__ == "__main__":
             nfu.add_rule(
                 {'family': ip_family, 'chain': 'nat_POSTROUTING', 'table': 'policy_route', 'comment': cmt_class,
                  'expr': [
+                     {'match': nfu.match_oif("@nat_interfaces", op='!=')},
                      {'match': nfu.match_mark('@policy_mark')},
                      {'counter': {'bytes': 0, 'packets': 0}},
                      {'masquerade': None}]

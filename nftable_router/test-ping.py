@@ -72,7 +72,9 @@ for n in range(len(config["proxy"])):
           decode("utf-8").strip())
     if 'port' in proxy:
         continue
-    p = subprocess.Popen(["ping", "-i", "0.3", "-c", "3", "-Q", "%d" % ((n + 1) << 2), ip_parsed],
+    # p = subprocess.Popen(["ping", "-i", "0.3", "-c", "3", "-Q", "%d" % ((n + 1) << 2), ip_parsed],
+    #                      stdout=subprocess.PIPE)
+    p = subprocess.Popen(["ping", "-i", "0.3", "-c", "3", "-m", "%d" % proxy['mark'], ip_parsed],
                          stdout=subprocess.PIPE)
     while p.poll() is None:
         read = p.stdout.readline()

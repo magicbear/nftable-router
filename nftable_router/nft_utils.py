@@ -219,6 +219,11 @@ class nftUtils():
                 'op': op,
                 'right': mark}
 
+    def match_oif(self, mark, op='=='):
+        return {'left': {'meta': {'key': 'oif'}},
+                'op': op,
+                'right': mark}
+
     def match_iifname(self, mark, op='=='):
         return {'left': {'meta': {'key': 'iifname'}},
                 'op': op,
