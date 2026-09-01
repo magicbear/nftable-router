@@ -154,6 +154,21 @@ def upstream_of(cfg):
     return None if up in (None, "", False) else str(up)
 
 
+def upstream_kind(proxy_cfgs, up_name):
+    """'port' = chained through upstream transparent listener (redirect);
+       'mark' = upstream is an ip-rule line (fwmark routing, tcp+udp, no
+              listener / need not be managed);
+       None   = not chainable."""
+    up = proxy_cfgs.get(up_name)
+    if up is None:
+        return None
+    if up.get("port"):
+        return "port"
+    if isinstance(up.get("mark"), int) and up.get("mark") > 0:
+        return "mark"
+    return None
+
+
 def validate_chain(proxy_cfgs):
     """Returns ordered list [deepest dependency first]. Raises ValueError
     describing the first problem found (unknown/unmanaged/self/cycle)."""
@@ -165,11 +180,13 @@ def validate_chain(proxy_cfgs):
             raise ValueError("%s: upstream points to itself" % name)
         if up not in proxy_cfgs:
             raise ValueError("%s: unknown upstream %r" % (name, up))
-        if not is_managed(proxy_cfgs[up]):
-            raise ValueError("%s: upstream %s is not managed (no 'daemon'), "
-                             "cannot guarantee it is up" % (name, up))
-        if not proxy_cfgs[up].get("port"):
-            raise ValueError("%s: upstream %s has no transparent 'port'" % (name, up))
+        kind = upstream_kind(proxy_cfgs, up)
+        if kind is None:
+            raise ValueError("%s: upstream %s is not chainable (needs a "
+                             "transparent 'port' or an ip-rule 'mark')" % (name, up))
+        if kind == "port" and not is_managed(proxy_cfgs[up]):
+            raise ValueError("%s: upstream %s has 'port' but no 'daemon' -- "
+                             "cannot guarantee the listener is up" % (name, up))
     # DFS with colors for cycle + topo
     WHITE, GRAY, BLACK = 0, 1, 2
     color = {n: WHITE for n in proxy_cfgs}
@@ -227,6 +244,20 @@ def plan_proxy_chain_rules(proxy_cfgs, uid_cache, family="ip"):
                               skuid, not_local,
                               {"counter": {"bytes": 0, "packets": 0}},
                               {"accept": None}]})
+            continue
+        if upstream_kind(proxy_cfgs, up_name) == "mark":
+            # ip-rule upstream: stamp this proxy's own egress with the
+            # upstream line mark -> `ip rule fwmark M table M` sends it out
+            # that line (works for tcp AND udp, no listener involved).
+            up_mark = int(proxy_cfgs[up_name]["mark"])
+            rules.append({"family": family, "table": "policy_route", "chain": "nat_OUTPUT",
+                          "comment": CHAIN_CMT, "expr": [
+                              skuid, not_local,
+                              {"counter": {"bytes": 0, "packets": 0}},
+                              {"mangle": {"key": {"meta": {"key": "mark"}}, "value": up_mark}},
+                              {"mangle": {"key": {"ct": {"key": "mark"}},
+                                           "value": {"meta": {"key": "mark"}}}},
+                          ]})
             continue
         up_port = int(proxy_cfgs[up_name]["port"])
         expr = [
@@ -380,9 +411,9 @@ class ProxySupervisor(threading.Thread):
         if not self.name_cfg[n].get("autostart", True):
             return
         up = upstream_of(self.name_cfg[n])
-        if up is not None:
+        if up is not None and up in self.proxies:   # mark-type upstreams are not processes: nothing to wait for
             up_p = self.proxies.get(up)
-            if up_p is None or up_p.proc is None or up_p.proc.poll() is not None:
+            if up_p.proc is None or up_p.proc.poll() is not None:
                 p.state = "deferred"
                 self.log("%s: dependency %s not up, deferring" % (n, up))
                 return
@@ -526,9 +557,9 @@ class ProxySupervisor(threading.Thread):
                             and p.proc.poll() is None:
                         continue                     # already healthy again
                     up = upstream_of(self.name_cfg.get(n, {}))
-                    if up is not None:
+                    if up is not None and up in self.proxies:
                         up_p = self.proxies.get(up)
-                        if up_p is None or not up_p.proc or up_p.proc.poll() is not None:
+                        if not up_p.proc or up_p.proc.poll() is not None:
                             continue                 # dependency down: retried next round
                     try:
                         if self.proxies.get(n) is p:

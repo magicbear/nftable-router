@@ -382,11 +382,85 @@ def test_monitor_thread_safe_with_reconfigure():
     check("thread exits after stop_all", not sup.is_alive())
 
 
+def _mk(skuid=None, m=None, verdicts=("accept", "redirect", "drop", "queue")):
+    return skuid, m, set(verdicts)
+
+
+def test_mark_upstream_chain():
+    print("[11] upstream as ip-rule line (mark type)")
+    cfgs = {
+        "IPRULE": {"mark": 903, "ipv4": True},
+        "TPROXY": {"daemon": "ss-redir", "port": 10510, "server": "1.1.1.1",
+                   "password_file": "/pw", "uid": 1210, "mark": 40},
+        "M": {"daemon": "ss-redir", "port": 10511, "server": "2.2.2.2",
+              "password_file": "/pw", "uid": 1211, "mark": 41, "upstream": "IPRULE"},
+        "T": {"daemon": "ss-redir", "port": 10512, "server": "3.3.3.3",
+              "password_file": "/pw", "uid": 1212, "mark": 42, "upstream": "TPROXY"},
+    }
+    check("kind: ip-rule line -> mark", pm.upstream_kind(cfgs, "IPRULE") == "mark")
+    check("kind: tproxy line -> port", pm.upstream_kind(cfgs, "TPROXY") == "port")
+    order = pm.validate_chain(cfgs)
+    check("mark upstream validated (unmanaged OK)", "M" in order and "IPRULE" in order)
+
+    uids = {"M": 1211, "T": 1212, "TPROXY": 1210}
+    rules = pm.plan_proxy_chain_rules(cfgs, uids, "ip")
+
+    def expr_of(skuid_v):
+        return [r["expr"] for r in rules
+                if any(e.get("match", {}).get("left") == {"meta": {"key": "skuid"}}
+                       and e["match"]["right"] == skuid_v for e in r["expr"])]
+
+    m_rules = expr_of(1211)
+    check("M has exactly one rule", len(m_rules) == 1)
+    e = m_rules[0]
+    check("M stamps upstream line mark 903",
+          {"mangle": {"key": {"meta": {"key": "mark"}}, "value": 903}} in e)
+    check("M saves into ct mark (session affinity)",
+          {"mangle": {"key": {"ct": {"key": "mark"}}, "value": {"meta": {"key": "mark"}}}} in e)
+    check("M has NO redirect/verdict",
+          not any(set(x.keys()) & {"accept", "redirect", "drop", "queue", "reject"} for x in e))
+    check("M no l4proto filter (tcp+udp both)",
+          not any(x.get("match", {}).get("left") == {"meta": {"key": "l4proto"}} for x in e))
+    check("M keeps daddr != @local guard",
+          any(x.get("match", {}).get("right") == "@local" and x["match"]["op"] == "!=" for x in e))
+    t_rules = expr_of(1212)
+    check("T still port-type: redirect :10510",
+          any(x.get("redirect", {}).get("port") == 10510 for r in t_rules for x in r))
+
+    # mark-type upstream must NOT be process/port-gated at launch
+    spawned = []
+    def sp(argv):
+        p = FakeProc(argv); spawned.append(argv[-1]); return p
+    sup_cfgs = {"IPRULE": {"mark": 903, "ipv4": True},
+                "M": {"daemon": "custom", "port": 10511, "cmd": ["/bin/x", "M"], "uid": 1211,
+                      "upstream": "IPRULE"}}
+    sup = pm.ProxySupervisor(sup_cfgs, spawn=sp, sleep=lambda s: None, now=lambda: 0,
+                             port_wait=lambda p, **k: False)
+    sup.launch()
+    check("M launched without waiting for a port (mark upstream)", spawned == ["M"], str(spawned))
+
+    # unchainable upstream (no port, no mark) -> clear error
+    bad = {"Z": {"daemon": "custom", "port": 1, "cmd": ["/bin/x"], "uid": 1, "upstream": "W"},
+           "W": {"ipv4": True}}
+    try:
+        pm.validate_chain(bad)
+        check("non-chainable upstream rejected", False)
+    except ValueError as e2:
+        check("non-chainable upstream rejected", "chainable" in str(e2), str(e2))
+
+    # cycle through a mark line still detected
+    cyc = {"X": {"daemon": "custom", "port": 1, "cmd": ["/bin/x"], "uid": 1, "upstream": "Y"},
+           "Y": {"mark": 60, "ipv4": True, "upstream": "X"}}
+    check("cycle via mark line caught", _raises(pm.validate_chain, cyc))
+
+
 if __name__ == "__main__":
-    for t in (test_build_cmd, test_chain_validation, test_chain_rules,
+    for t in (test_build_cmd, test_chain_validation, test_chain_rules, test_mark_upstream_chain,
               test_supervisor_restart, test_supervisor_stop_semantics,
               test_dependency_gating, test_redact, test_uid_requirement,
               test_reconfigure_diff, test_monitor_thread_safe_with_reconfigure):
         t()
     print("\n==== %d passed, %d failed ====" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)
+
+
