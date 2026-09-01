@@ -1530,16 +1530,19 @@ def reload_queue(signum, sigframe):
 
 
 class NFQUEUE_Executeor(Process):
+    _stop_evt = None   # per-process Event, created in __init__ (post-fork)
+
     def __init__(self, worker_id):
+        NFQUEUE_Executeor._stop_evt = threading.Event()
         # threading.Thread.__init__(self)
         super().__init__()
         self.worker_id = worker_id
 
     def release_process(self, grace=2.5) -> None:
-        """terminate -> the worker's SIGTERM handler raises SystemExit and it
-        dies within ~ms. join, force-kill only on the rare miss. The previous
-        version acquired g_lock/g_io_lock (2s timeouts each) and polled
-        is_alive 2s PER worker -> 38 workers * ~2.2s = 60-90s reloads."""
+        """terminate -> worker's main thread sits in Event.wait() (real Python
+        frame, handler runs instantly) -> os._exit. join, force-kill only on
+        the rare miss. Previous versions: 2s lock-poll per worker (60-90s
+        reloads), then SystemExit which netfilterqueue's C loop swallows."""
         try:
             self.terminate()
         except OSError:
@@ -1555,48 +1558,69 @@ class NFQUEUE_Executeor(Process):
     def quit(signum, sigframe):
         global process_term
         process_term = True
-        # the worker's life is spent blocked inside nfqueue.run() (C recv,
-        # auto-retried after EINTR per PEP475) -> a mere flag would NEVER be
-        # observed. raise SystemExit: it propagates out of the C call, the
-        # timed_lock finallys unwind (g_lock/ct state stay clean) and the
-        # child exits immediately on SIGTERM.
-        raise SystemExit(0)
+        # signal-safe: only flag+wake; main thread of run() does the exiting
+        # (a raise here dies in netfilterqueue's PyErr_Print path or never
+        # runs while the main thread sits inside the C recv)
+        try:
+            NFQUEUE_Executeor._stop_evt.set()
+        except Exception:
+            pass
 
     def run(self):
         global ecmp_thread, is_master, worker_id, process_term, nfu
 
         syslog.openlog(ident="PolicyRoute[%d]::W%02d" % (os.getpid(), self.worker_id))
-
         worker_id = self.worker_id
 
+        stop = NFQUEUE_Executeor._stop_evt
         signal.signal(signal.SIGTERM, self.quit)
         signal.signal(signal.SIGQUIT, self.quit)
         signal.signal(signal.SIGUSR1, signal.SIG_IGN)   # reload is master-only
         signal.signal(signal.SIGUSR2, signal.SIG_IGN)
 
         is_master = False
-
         ecmp_thread = ECMPThread()
+        ecmp_thread.daemon = True
         ecmp_thread.start()
-
         prctl.set_proctitle("Policy Route - W%02d" % (self.worker_id))
 
-        while not term.value and not process_term:
-            try:
-                syslog.syslog(syslog.LOG_INFO,
-                              "[*] waiting for data (Process %2d, PID: %d)" % (self.worker_id, os.getpid()))
-                print("[*] waiting for data (Process %2d, PID: %d)" % (self.worker_id, os.getpid()), flush=True)
-                nfqueue.run()
-            except KeyboardInterrupt:
-                term.value = True
-                pass
-            except Exception as e:
-                print("[-] Error: %s" % e)
-                syslog.syslog(syslog.LOG_ERR, "%s: Worker %d Process Error: %s\n  %s\n" % (
-                    datetime.now().isoformat(), worker_id, str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+        # nfqueue.run() must NOT hold the main thread: it sits inside a C recv
+        # (no Python handler runs when no packet arrives) and swallows callback
+        # exceptions (PyErr_Print), so SIGTERM previously only killed the worker
+        # via the master's force-kill after the full grace window. Keep the
+        # blocking loop on a daemon thread; main thread waits on an Event ->
+        # signal handler executes immediately and shutdown is bounded.
+        def _loop():
+            while not stop.is_set() and not term.value and not process_term:
+                try:
+                    syslog.syslog(syslog.LOG_INFO,
+                                  "[*] waiting for data (Process %2d, PID: %d)" % (self.worker_id, os.getpid()))
+                    print("[*] waiting for data (Process %2d, PID: %d)" % (self.worker_id, os.getpid()), flush=True)
+                    nfqueue.run()
+                except KeyboardInterrupt:
+                    term.value = True
+                    break
+                except Exception as e:
+                    if stop.is_set():
+                        break
+                    print("[-] Error: %s" % e)
+                    syslog.syslog(syslog.LOG_ERR, "%s: Worker %d Process Error: %s\n  %s\n" % (
+                        datetime.now().isoformat(), worker_id, str(e),
+                        '  '.join(traceback.format_tb(e.__traceback__))))
+                    stop.wait(1.0)
 
-        # tp.raise_exception()
-        os.kill(os.getpid(), signal.SIGKILL)
+        th = threading.Thread(target=_loop, daemon=True)
+        th.start()
+        stop.wait()
+
+        # let in-flight callbacks finish so timed_lock finallys release g_lock
+        # (never leave a semaphore held by a dead process); bounded, then hard exit
+        deadline = time.time() + 1.0
+        while time.time() < deadline and g_lock.locked():
+            time.sleep(0.05)
+        process_term = True
+        syslog.syslog(syslog.LOG_INFO, "worker %d exiting gracefully" % self.worker_id)
+        os._exit(0)
 
 
 def time_to_level(t, proxy_id):
