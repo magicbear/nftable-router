@@ -281,10 +281,103 @@ def test_uid_requirement():
         check("raises uid required", "uid" in str(e))
 
 
+
+
+def test_reconfigure_diff():
+    print("[9] reconfigure: incremental start/stop/keep/restart")
+    spawned, sup_cfgs = [], {
+        "B": _cfg(port=10507, uid=1201),
+        "A": _cfg(port=10506, uid=1200, upstream="B"),
+        "X": _cfg(port=10508, uid=1202),
+    }
+    def fake_spawn(argv):
+        p = FakeProc(argv); spawned.append(argv[argv.index("-l") + 1]); return p
+    pw = lambda p, **k: (p in (10507,)) and k.get("timeout") != 0.5
+    sup = pm.ProxySupervisor(sup_cfgs, spawn=fake_spawn, sleep=lambda s: None,
+                             now=lambda: 0, port_wait=pw)
+    sup.launch()
+    assert spawned == ["10507", "10506", "10508"], spawned
+    b_proc = sup.get("B").proc
+
+    # case 1: remove X, keep A,B unchanged -> X stopped, A/B process objects adopted
+    new_cfgs = {k: dict(v) for k, v in sup_cfgs.items() if k != "X"}
+    sup.reconfigure(new_cfgs)
+    check("removed proxy stopped", sup.get("X") is None)
+    check("unchanged B adopted running proc (no respawn)", sup.get("B").proc is b_proc)
+    check("no new spawn for unchanged", spawned == ["10507", "10506", "10508"])
+
+    # case 2: B server changed -> B restarts, A adopted (A argv unchanged? A depends on B port... A keeps)
+    new2 = {k: dict(v) for k, v in new_cfgs.items()}
+    new2["B"]["server"] = "9.9.9.9"
+    sup.reconfigure(new2)
+    check("changed B respawned", "10507" in spawned and spawned.count("10507") == 2, str(spawned))
+    check("B is a new process object", sup.get("B").proc is not b_proc)
+
+    # case 3: add C chained to B -> C started (gated), existing untouched
+    spawned_n = len(spawned)
+    new3 = {k: dict(v) for k, v in new2.items()}
+    new3["C"] = _cfg(port=10509, uid=1203, upstream="B")
+    sup.reconfigure(new3)
+    check("new chained C spawned once", spawned.count("10509") == 1)
+    check("others untouched by add", len(spawned) == spawned_n + 1, str(spawned[spawned_n:]))
+
+    # case 4: reconfigure with a CYCLE raises and leaves everything running
+    bad = {k: dict(v) for k, v in new3.items()}
+    bad["C"]["upstream"] = "A"; bad["A"]["upstream"] = "C"
+    check("cyclic reconfigure rejected", _raises(pm.ProxySupervisor.reconfigure, sup, bad))
+    check("live set intact after rejection", set(sup.proxies) == {"A", "B", "C"} and
+          sup.get("B").proc.poll() is None)
+
+    # case 5: restart_all -> every proxy stopped+started, gaveup state cleared
+    sup.get("C").state = "gaveup"     # simulate rate-limited one
+    before = dict(spawned_counts := {x: spawned.count(x) for x in set(spawned)})
+    sup.restart_all()
+    check("restart_all respawned all 3",
+          all(spawned.count(p) > before[p] for p in ("10507", "10506", "10509")), str(spawned))
+    check("gaveup cleared on restart_all", sup.get("C").state == "running")
+
+    # case 6: bad spec for a RUNNING proxy -> keeps old process, others reconfigure
+    b_live = sup.get("B").proc
+    new6 = {k: dict(v) for k, v in sup.proxies.items() and {
+        "B": {**dict(new3["B"]), "password": None, "password_file": None},  # invalid ss-redir spec
+        "A": dict(new3["A"]), "C": dict(new3["C"])}.items()}
+    sup.reconfigure(new6)
+    check("invalid-spec running B kept alive", sup.get("B").proc is b_live)
+
+    sup.stop_all()
+    check("final stop", sup.get("B").state == "stopped")
+
+
+def test_monitor_thread_safe_with_reconfigure():
+    import threading as _th
+    print("[10] monitor thread keeps running across reconfigure (no crash/deadlock)")
+    cfgs = {"A": _cfg(port=10601, uid=1200)}
+    spawned = []
+    def sp(argv):
+        p = FakeProc(argv); spawned.append(1); return p
+    sup = pm.ProxySupervisor(cfgs, spawn=sp, sleep=lambda s: None, now=lambda: 0,
+                             port_wait=lambda p, **k: False)
+    sup.start()   # real thread: launch + monitor
+    for _ in range(20):
+        if sup.get("A").proc:
+            break
+        time.sleep(0.02)
+    check("thread launched A", sup.get("A").proc is not None)
+    sup.reconfigure({"A": _cfg(port=10601, uid=1200, server="8.8.8.8")})  # changed -> restart
+    deadline = time.time() + 3
+    while time.time() < deadline and sup.get("A").proc is None:
+        time.sleep(0.05)
+    check("reconfigured by live thread", len(spawned) >= 2)
+    sup.stop_all()
+    time.sleep(0.1)
+    check("thread exits after stop_all", not sup.is_alive())
+
+
 if __name__ == "__main__":
     for t in (test_build_cmd, test_chain_validation, test_chain_rules,
               test_supervisor_restart, test_supervisor_stop_semantics,
-              test_dependency_gating, test_redact, test_uid_requirement):
+              test_dependency_gating, test_redact, test_uid_requirement,
+              test_reconfigure_diff, test_monitor_thread_safe_with_reconfigure):
         t()
     print("\n==== %d passed, %d failed ====" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

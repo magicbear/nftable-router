@@ -326,6 +326,7 @@ class ProxySupervisor(threading.Thread):
                     self.log("uid error: %s" % e)
         self.uid_cache = uid_cache
         self._stop_evt = threading.Event()
+        self._lock = threading.RLock()   # guards self.proxies/order vs monitor thread
         self.order = validate_chain(proxy_cfgs)          # raises on cycle/bad upstream
         self.proxies = {}
         for n in self.order:
@@ -347,75 +348,169 @@ class ProxySupervisor(threading.Thread):
                 for n, p in self.proxies.items()}
 
     # -- launch with dependency gating -------------------------------------
-    def launch(self):
-        for n in self.order:
-            p = self.proxies.get(n)
-            if p is None or not self.name_cfg[n].get("autostart", True):
-                continue
-            up = upstream_of(self.name_cfg[n])
-            if up is not None:
-                up_p = self.proxies.get(up)
-                if up_p is None or up_p.proc is None or up_p.proc.poll() is not None:
-                    self.log("%s: dependency %s not up, deferring" % (n, up))
-                    continue
-                port = self.name_cfg[up].get("port")
-                if port and not self._port_wait(port):
-                    self.log("%s: dependency %s port %s unreachable, deferring" % (n, up, port))
-                    continue
-            my_port = self.name_cfg[n].get("port")
-            if my_port and self._port_wait(my_port, timeout=0.5):
-                p.state = "external"
-                self.log("%s: port %s already listening (external instance?), not spawning"
-                         % (n, my_port))
-                self.on_status(n, "external", None)
-                continue
+    def _bring_up(self, n):
+        """start one proxy (dependency + external-port gated); call under lock"""
+        p = self.proxies.get(n)
+        if p is None or p.stopping:
+            return
+        if not self.name_cfg[n].get("autostart", True):
+            return
+        up = upstream_of(self.name_cfg[n])
+        if up is not None:
+            up_p = self.proxies.get(up)
+            if up_p is None or up_p.proc is None or up_p.proc.poll() is not None:
+                self.log("%s: dependency %s not up, deferring" % (n, up))
+                return
+            port = self.name_cfg[up].get("port")
+            if port and not self._port_wait(port):
+                self.log("%s: dependency %s port %s unreachable, deferring" % (n, up, port))
+                return
+        my_port = self.name_cfg[n].get("port")
+        if my_port and self._port_wait(my_port, timeout=0.5):
+            p.state = "external"
+            self.log("%s: port %s already listening (external instance?), not spawning"
+                     % (n, my_port))
+            self.on_status(n, "external", None)
+            return
+        try:
             p.start_once()
             self.on_status(n, p.state, p.proc.pid)
+        except OSError as e:
+            self.log("%s: spawn failed: %s" % (n, e))
+
+    def launch(self):
+        with self._lock:
+            for n in self.order:
+                self._bring_up(n)
+
+    # -- incremental reconfiguration / restart-all -------------------------
+    def _build_proxies(self, proxy_cfgs, order):
+        built, uids = {}, {}
+        for n in order:
+            c = proxy_cfgs[n]
+            if not is_managed(c):
+                continue
+            uid = None
+            try:
+                uid = get_uid(c, n)
+            except ValueError as e:
+                self.log("uid error: %s" % e)
+            uids[n] = uid
+            try:
+                argv = build_cmd(n, c)
+            except ValueError as e:
+                self.log("%s: bad spec: %s (keeping previous instance if any)" % (n, e))
+                if n in self.proxies:
+                    built[n] = self.proxies[n]   # config error -> do NOT disturb running proxy
+                    continue
+                raise
+            spawn = self._spawn or make_uid_spawner(uid)
+            built[n] = ManagedProxy(n, c, argv, uid, spawn=spawn,
+                                    sleeper=self._sleep, timer=self._now)
+        return built, uids
+
+    def reconfigure(self, proxy_cfgs, restart_all=False):
+        """USR1 diff path (or USR2 with restart_all=True).
+        - removed / now-unmanaged proxies            -> stopped
+        - new ones                                   -> started (gated)
+        - existing w/ changed argv                   -> stopped + started
+        - existing unchanged                         -> kept running (proc moved over),
+                                                        unless restart_all
+        Raises ValueError (caller keeps everything) if the new config has a
+        chain cycle / invalid reference; bad-spec on an already-running
+        instance keeps the old process untouched instead of failing."""
+        order = validate_chain(proxy_cfgs)              # raises -> nothing touched
+        with self._lock:
+            if self._stop_evt.is_set():
+                raise ValueError("supervisor was stopped; create a new one")
+            old = self.proxies
+            built, uids = self._build_proxies(proxy_cfgs, order)
+            for n in list(old):                          # removed from config
+                if n not in built:
+                    old[n].stop()
+                    self.log("%s: removed from config, process stopped" % n)
+                    self.on_status(n, "removed", None)
+            for n, np in built.items():
+                o = old.get(n)
+                if o is None:
+                    continue                             # brand new: bring-up below
+                same = (np.argv == o.argv)
+                if same and not restart_all:
+                    np.restart_history = list(o.restart_history)
+                    if o.proc is not None and o.proc.poll() is None:
+                        np.proc, np.state = o.proc, "running"   # adopt running process
+                        continue
+                o.stop()                                 # changed / restart-all / dead-but-old
+                self.log("%s: %s" % (n, "restart requested" if same else "config changed, restarting"))
+            self.proxies, self.uid_cache = built, uids
+            self.name_cfg, self.order = proxy_cfgs, order
+            for n in self.order:
+                p = self.proxies.get(n)
+                if p is not None and p.proc is None and p.state not in ("external",):
+                    self._bring_up(n)
+
+    def restart_all(self):
+        """USR2: stop + start every managed proxy (fresh rate-limit state)."""
+        self.reconfigure(self.name_cfg, restart_all=True)
 
     def _monitor_loop(self, stop_evt):
         while not stop_evt.is_set():
-            for n, p in self.proxies.items():
-                if p.stopping:
-                    continue
-                if p.proc is None:
-                    # deferred earlier (dependency down / not ready): retry now
-                    if p.state in ("gaveup", "stopped", "external"):
+            retry_wait = None
+            for n, p in list(self.proxies.items()):
+                with self._lock:
+                    if self.proxies.get(n) is not p:
+                        continue                     # replaced by reconfigure
+                    if p.stopping:
                         continue
-                    up = upstream_of(self.name_cfg[n])
+                    if p.proc is None:
+                        # deferred earlier (dependency down / not ready): retry now
+                        if p.state in ("gaveup", "stopped", "external"):
+                            continue
+                        up = upstream_of(self.name_cfg[n])
+                        if up is not None:
+                            up_p = self.proxies.get(up)
+                            if up_p is None or not up_p.proc or up_p.proc.poll() is not None:
+                                continue
+                        try:
+                            p.start_once()
+                            self.on_status(n, p.state, p.proc.pid)
+                        except OSError as e:
+                            self.log("%s: spawn failed: %s" % (n, e))
+                        continue
+                    rc = p.proc.poll()
+                    if rc is None or p.stopping:
+                        continue
+                    wait = p.note_death()
+                    if wait is None:
+                        self.log("%s: gave up after restart limit (last rc=%s)" % (n, rc))
+                        self.on_status(n, "gaveup", None)
+                        continue
+                    self.log("%s: exited rc=%s, restart in %ss" % (n, rc, wait))
+                    self.on_status(n, "backoff", None)
+                    retry_wait = (n, p, wait)
+                    break                            # sleep outside the lock
+                # end with lock
+                if retry_wait:
+                    break
+            if retry_wait:
+                n, p, wait = retry_wait
+                if stop_evt.wait(wait):
+                    return
+                with self._lock:
+                    if self.proxies.get(n) is p and not p.stopping and p.proc is not None \
+                            and p.proc.poll() is None:
+                        continue                     # already healthy again
+                    up = upstream_of(self.name_cfg.get(n, {}))
                     if up is not None:
                         up_p = self.proxies.get(up)
                         if up_p is None or not up_p.proc or up_p.proc.poll() is not None:
-                            continue
+                            continue                 # dependency down: retried next round
                     try:
-                        p.start_once()
-                        self.on_status(n, p.state, p.proc.pid)
+                        if self.proxies.get(n) is p:
+                            p.start_once()
+                            self.on_status(n, p.state, p.proc.pid)
                     except OSError as e:
                         self.log("%s: spawn failed: %s" % (n, e))
-                    continue
-                rc = p.proc.poll()
-                if rc is None:
-                    continue
-                if p.stopping:
-                    continue
-                wait = p.note_death()
-                if wait is None:
-                    self.log("%s: gave up after restart limit (last rc=%s)" % (n, rc))
-                    self.on_status(n, "gaveup", None)
-                    continue
-                self.log("%s: exited rc=%s, restart in %ss" % (n, rc, wait))
-                self.on_status(n, "backoff", None)
-                if stop_evt.wait(wait):
-                    return
-                up = upstream_of(self.name_cfg[n])
-                if up is not None:
-                    up_p = self.proxies.get(up)
-                    if up_p is None or not up_p.proc or up_p.proc.poll() is not None:
-                        continue   # dependency down: skip this round, retried next
-                try:
-                    p.start_once()
-                    self.on_status(n, p.state, p.proc.pid)
-                except OSError as e:
-                    self.log("%s: spawn failed: %s" % (n, e))
 
     def run(self):
         stop = self._stop_evt

@@ -98,7 +98,8 @@ g_dead_proxy_ipv4 = {}
 g_dead_proxy_ipv6 = {}
 g_runner = []
 g_proxy_sup = None            # ProxySupervisor instance (master only)
-g_proxy_pending = Value('b', False)   # reload -> rebuild chain rules in main loop
+g_proxy_pending = Value('b', False)   # SIGUSR1 -> incremental reconfigure in main loop
+g_proxy_restart_all = Value('b', False)  # SIGUSR2 -> restart ALL managed proxies
 is_master = True
 worker_id = 0  # Modified by Process
 process_term = False  # Modified by Process
@@ -644,15 +645,21 @@ def install_proxy_chain_rules():
             else:
                 n_ok += 1
     print("[+] proxy-chain skuid rules: %d installed" % n_ok)
-    if g_proxy_sup:
-        print("[*] restarting proxy supervisor (config changed)")
-        g_proxy_sup.stop_all()
 
     def on_status(name, state, pid):
         msg = "proxy %s: %s%s" % (name, state, (" pid=%s" % pid) if pid else "")
         print("    " + msg)
         syslog.syslog(syslog.LOG_NOTICE, msg)
 
+    if g_proxy_sup is not None:
+        # SIGUSR1 reload path: diff start/stop only (unchanged processes stay up)
+        try:
+            g_proxy_sup.reconfigure(config["proxy"])
+            print("[*] proxy supervisor reconfigured (incremental)")
+        except ValueError as e:
+            print(tf.format("{msg:s,bg_red,black}", msg="[-] proxy reconfigure failed, running set kept: %s" % e))
+            syslog.syslog(syslog.LOG_CRIT, "proxy reconfigure failed, running set kept: %s" % e)
+        return
     try:
         g_proxy_sup = pmm.ProxySupervisor(config["proxy"], on_status=on_status,
                                           log=lambda m: syslog.syslog(syslog.LOG_NOTICE, "proxyd: %s" % m))
@@ -1272,6 +1279,13 @@ def quit(signum, sigframe):
         raise KeyboardInterrupt
 
 
+def restart_all_proxies(signum, sigframe):
+    """SIGUSR2: restart every managed proxy process (config unchanged,
+    rate-limit/gaveup state cleared). Handled in the main loop."""
+    if is_master:
+        g_proxy_restart_all.value = True
+
+
 def load_executor():
     global g_runner
 
@@ -1300,8 +1314,9 @@ def reload_queue(signum, sigframe):
     # nfqueue.unbind()
     load_config()
     test_thread.last_check = 0
-    # rebuild proxy chain rules + supervisor from the MAIN loop (spawns fork
-    # must not happen inside signal handler context)
+    # SIGUSR1: reconcile chain rules + managed proxies INCREMENTALLY from the
+    # MAIN loop (new->start, removed->stop, changed->restart, same->keep alive;
+    # spawn/fork must not happen inside signal handler context)
     g_proxy_pending.value = True
 
     # re-apply egress mark rules on reload (non-interactive; new unbound
@@ -1769,6 +1784,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGQUIT, quit)
     signal.signal(signal.SIGHUP, quit)
     signal.signal(signal.SIGUSR1, reload_queue)
+    signal.signal(signal.SIGUSR2, restart_all_proxies)
 
     load_executor()
 
@@ -1845,6 +1861,18 @@ if __name__ == "__main__":
             if g_proxy_pending.value:
                 g_proxy_pending.value = False
                 install_proxy_chain_rules()
+
+            if g_proxy_restart_all.value:
+                g_proxy_restart_all.value = False
+                if g_proxy_sup is not None:
+                    print("[*] SIGUSR2: restarting all managed proxies")
+                    try:
+                        g_proxy_sup.restart_all()
+                    except Exception as e:
+                        print(tf.format("{msg:s,bg_red,black}", msg="[-] proxy restart_all failed: %s" % e))
+                        syslog.syslog(syslog.LOG_CRIT, "proxy restart_all failed: %s" % e)
+                else:
+                    print("[*] SIGUSR2: no managed proxies (no 'daemon' fields in config)")
 
             if time.time() - t_dns_clean > 15:
                 t_dns_clean = time.time()
