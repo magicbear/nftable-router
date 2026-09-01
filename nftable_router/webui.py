@@ -40,6 +40,9 @@ td.ell{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap
 td.ell.wrap{white-space:normal;word-break:break-all;text-overflow:clip}
 #colsbox{margin:0 0 8px}#colsbox label{display:inline-block;margin:2px 12px 2px 0;color:var(--fg);cursor:pointer;user-select:none}
 #colsbox label input{vertical-align:-2px}#colsbox button{margin-left:10px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;display:flex;align-items:flex-start;justify-content:center;overflow:auto}
+.modalcard{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:5vh auto;max-width:1000px;width:92vw}
+.modalcard .bar{margin:0}
 #toast{position:fixed;right:14px;bottom:14px;max-width:420px}
 #toast div{margin-top:6px;padding:8px 12px;border-radius:8px;background:#20283a;border:1px solid var(--line)}
 label{color:var(--dim)}
@@ -89,7 +92,6 @@ label{color:var(--dim)}
   <label><input type=checkbox id=p-autoreload checked> 保存后重载主进程</label>
   <span class=dim>托管线路(daemon)与 ip-rule 线路统一在此管理；unknown 字段在高级 JSON 中保留</span></div>
  <div id=ptable></div>
- <div id=pedit class=card style="display:none"></div>
 </section>
 
 <section id=s-rules>
@@ -340,80 +342,98 @@ function renderProxy(){
   var bd=el("button"," bad"," 删");bd.onclick=function(){delProxy(name)};td.appendChild(bd);
   tr.appendChild(td);tb.appendChild(tr)});
  t.appendChild(tb);box.appendChild(t)}
-function fieldRow(label,val,type,ph){
- var wrap=el("label","",label+" ");wrap.style.cssText="display:inline-block;margin:3px 10px 3px 0;color:var(--dim);min-width:120px";
- var inp=document.createElement("input");inp.dataset.k="";inp.value=val==null?"":(type=="bool"?(val?"1":""):String(val));
- if(type=="bool"){var sel=document.createElement("select");[["","(未设置)"],["1","true"],["0","false"]].forEach(function(o){
-  var op=el("option","",o[1]);op.value=o[0];if(String(val)===o[0]||(val==null&&o[0]===""))op.selected=true;sel.appendChild(op)});
-  sel.dataset.k="1";wrap.appendChild(sel);wrap.appendChild(inp);inp.style.display="none";return wrap}
- inp.placeholder=ph||"";inp.dataset.k="1";wrap.appendChild(inp);return wrap}
-function editProxy(name){
- var isNew=!name;var src=(CFG.proxy||{})[name]||{"mark":nextMark(),"weight":1,"ipv4":true,"ipv6":false};
- var c=JSON.parse(JSON.stringify(src));
- var box=$("pedit");box.style.display="block";box.innerHTML="";
- box.appendChild(el("b","",(isNew?"新增线路":"编辑线路: ")+name));
- var form=el("div");form.id="pform";box.appendChild(form);
- var names=["name","mark","weight","port","upstream","daemon","uid","server","server_port","cipher","password","password_file","mode","bind","proxy_ip","test_url","restart_max","restart_window"];
- var F={name:{l:"线路名",v:isNew?"":name},mark:{l:"fwmark",v:c.mark},weight:{l:"权重",v:c.weight},
-  port:{l:"透明端口(空=ip-rule线路)",v:c.port},upstream:{l:"上游线路(chaining)",v:c.upstream,sel:Object.keys(CFG.proxy||{}).filter(function(x){return x!=name})},
-  daemon:{l:"托管进程",v:c.daemon,sel:["","ss-redir","v2ray","sing-box","custom"]},
-  uid:{l:"运行用户",v:c.uid},server:{l:"服务器",v:c.server||c.proxy_ip},server_port:{l:"服务器端口",v:c.server_port},
-  cipher:{l:"加密",v:c.cipher},password:{l:"密码(内联,慎用)",v:c.password},password_file:{l:"密码文件",v:c.password_file},
-  mode:{l:"模式",v:c.mode,sel:["","tcp","tcp_and_udp"]},bind:{l:"bind ip:port",v:c.bind},
-  proxy_ip:{l:"proxy_ip",v:c.proxy_ip},test_url:{l:"test_url",v:c.test_url},
-  restart_max:{l:"重启窗口上限",v:(c.restart||{}).max},restart_window:{l:"窗口(秒)",v:(c.restart||{}).window}};
- for(var fk in F){var meta=F[fk];
-  var row=el("div");row.style.cssText="display:inline-block;margin:2px 12px 2px 0";
-  row.appendChild(el("label","",meta.l+" "));
+// ---------- modal infra ----------
+function closeModal(){var o=$("modal_ov");if(o)o.remove()}
+function openModal(title,buildFn,okLabel,onSave){
+ closeModal();
+ var ov=el("div","modal");ov.id="modal_ov";
+ var card=el("div","modalcard");
+ var h=el("div","bar");h.appendChild(el("b","",title));
+ var x=el("button","dim","✕");x.style.marginLeft="auto";x.onclick=closeModal;h.appendChild(x);
+ card.appendChild(h);
+ var body=el("div");card.appendChild(body);
+ var bar=el("div","bar");bar.style.marginTop="12px";
+ var ok=el("button","good",okLabel||"保存");ok.onclick=function(){onSave(body)};
+ var cancel=el("button","dim","取消");cancel.onclick=closeModal;
+ bar.appendChild(ok);bar.appendChild(cancel);card.appendChild(bar);
+ ov.appendChild(card);
+ ov.onclick=function(e){if(e.target===ov)closeModal()};
+ document.body.appendChild(ov);
+ document.onkeydown=function(e){if(e.key==="Escape")closeModal()};
+ if(buildFn)buildFn(body);
+ return body}
+function mfields(body,defs,cur){
+ defs.forEach(function(d){
+  var k=d[0];var row=el("div");row.style.cssText="display:inline-block;margin:3px 14px 3px 0";
+  row.appendChild(el("label","dim",(d[1]||k)+" "));
   var inp;
-  if(meta.sel){inp=document.createElement("select");
-   var empty=el("option","","(无)");empty.value="";inp.appendChild(empty);
-   meta.sel.forEach(function(o){var op=el("option","",String(o));op.value=String(o);if(String(meta.v)===String(o))op.selected=true;inp.appendChild(op)});
-   if(meta.sel.indexOf(meta.v)<0&&meta.v!=null&&meta.v!==""){var extra=el("option","",String(meta.v));extra.value=String(meta.v);extra.selected=true;inp.appendChild(extra)}}
-  else{inp=document.createElement("input");inp.value=meta.v==null?"":String(meta.v);inp.dataset.fk=fk;
-   if(fk=="mark"||fk=="weight"||fk=="port"||fk=="server_port")inp.type="number"}
-  inp.dataset.fk=fk;row.appendChild(inp);form.appendChild(row)}
- var capsRow=el("div");form.appendChild(capsRow);
- ["ipv4","ipv6","udp_v4","udp_v6","fullcone","autostart"].forEach(function(k){
-  var lb=el("label");lb.style.cssText="margin-right:14px";
-  var cb=document.createElement("input");cb.type="checkbox";cb.dataset.fk=k;
-  if(k=="autostart"){if(c[k]!==false)cb.checked=true}
-  else cb.checked=!!c[k];
-  lb.appendChild(cb);lb.appendChild(document.createTextNode(" "+k));capsRow.appendChild(lb)});
- var rest=knownOnly(c,PROXY_COLS);
- var adv=document.createElement("details");
- adv.appendChild(el("summary","dim","高级字段 (其他键保留 / 原始JSON编辑)"));
- var ta=document.createElement("textarea");ta.id="padv";ta.value=JSON.stringify(rest,null,2);ta.style.height="160px";
- adv.appendChild(ta);box.appendChild(adv);
- var bar=el("div","bar");
- var save=el("button","good","保存线路");
- save.onclick=function(){
-  var out={};var nn=$("pform");var vals={};
-  nn.querySelectorAll("input,select").forEach(function(x){vals[x.dataset.fk]=x});
-  function num(f){var x=vals[f];var v=x.value.trim();if(v==="")return null;return parseInt(v,10)}
-  if(vals.name.value.trim())nn.name_=1;
-  var newName=(nn.querySelector("[data-fk=name]")||{value:name}).value.trim()||name;
-  out.mark=num("mark");out.weight=num("weight");
-  var p=num("port");if(p!=null)out.port=p;
-  var up=vals.upstream.value;if(up)out.upstream=up;
-  var dn=vals.daemon.value;if(dn)out.daemon=dn;
-  ["uid","server","cipher","password","password_file","mode","bind","proxy_ip","test_url"].forEach(function(f){
-   var v=(vals[f].value||"").trim();if(v)out[f]=v;
-   if(f=="server"&&v)out.proxy_ip=out.proxy_ip||v});
-  var sp=num("server_port");if(sp!=null)out.server_port=sp;
-  ["ipv4","ipv6","udp_v4","udp_v6","fullcone"].forEach(function(f){out[f]=!!vals[f].checked});
-  out.autostart=!!vals.autostart.checked;
-  var rmx=num("restart_max"),rmw=num("restart_window");
+  if(d[2]=="select"){inp=document.createElement("select");
+   var e0=el("option","","(无)");e0.value="";inp.appendChild(e0);
+   (d[3]||[]).forEach(function(o){var op=el("option","",String(o));op.value=String(o);
+    if(String(cur[k])===String(o))op.selected=true;inp.appendChild(op)});
+   if(cur[k]!=null&&String(cur[k])!==""&&(d[3]||[]).map(String).indexOf(String(cur[k]))<0){
+    var ex=el("option","",String(cur[k]));ex.value=String(cur[k]);ex.selected=true;inp.appendChild(ex)}}
+  else{inp=document.createElement("input");inp.type=d[2]=="num"?"number":"text";
+   inp.value=cur[k]==null?"":String(cur[k]);if(d[4])inp.placeholder=d[4]}
+  inp.dataset.fk=k;row.appendChild(inp);body.appendChild(row)})}
+function mbools(body,keys,cur){
+ var row=el("div");row.style.marginTop="6px";
+ keys.forEach(function(k){var lb=el("label");lb.style.marginRight="14px";
+  var cb=document.createElement("input");cb.type="checkbox";cb.dataset.fk=k;cb.checked=!!cur[k];
+  lb.appendChild(cb);lb.appendChild(document.createTextNode(" "+k));row.appendChild(lb)});
+ body.appendChild(row)}
+function editProxy(name){
+ var isNew=!name;
+ var src=(CFG.proxy||{})[name]||{mark:nextMark(),weight:1,ipv4:true,ipv6:false};
+ var c=JSON.parse(JSON.stringify(src));
+ var cur={name:name||"",mark:c.mark,weight:c.weight,port:c.port,upstream:c.upstream,daemon:c.daemon,
+  uid:c.uid,server:c.server||c.proxy_ip,server_port:c.server_port,cipher:c.cipher,password:c.password,
+  password_file:c.password_file,mode:c.mode,bind:c.bind,test_url:c.test_url,
+  restart_max:(c.restart||{}).max,restart_window:(c.restart||{}).window};
+ var lines=Object.keys(CFG.proxy||{}).filter(function(x){return x!=name});
+ openModal(isNew?"新增线路":"编辑线路: "+name,function(body){
+  mfields(body,[
+   ["name","线路名","text"],["mark","fwmark","num"],["weight","权重","num"],
+   ["port","透明端口(空=ip-rule)","num"],
+   ["upstream","上游线路(chaining)","select",lines],
+   ["daemon","托管进程","select",["ss-redir","v2ray","sing-box","custom"]],
+   ["uid","运行用户","text"],["server","服务器地址","text"],["server_port","服务器端口","num"],
+   ["cipher","加密算法","text"],["password","密码(内联,ps可见慎用)","text"],
+   ["password_file","密码文件","text"],["mode","模式","select",["tcp","tcp_and_udp"]],
+   ["bind","bind ip:port","text"],["test_url","test_url","text"],
+   ["restart_max","重启上限","num"],["restart_window","重启窗口(秒)","num"]],cur);
+  mbools(body,["ipv4","ipv6","udp_v4","udp_v6","fullcone"],c);
+  mfields(body,[["autostart_x","托管自动启动","select",["true","false"]]],{autostart_x:String(c.autostart!==false)});
+  var adv=document.createElement("details");adv.style.marginTop="8px";
+  adv.appendChild(el("summary","dim","高级字段(其余键保留，可直接编辑JSON)"));
+  var ta=document.createElement("textarea");ta.className="padv";
+  ta.value=JSON.stringify(knownOnly(c,PROXY_COLS),null,2);ta.style.height="150px";
+  adv.appendChild(ta);body.appendChild(adv)},
+ isNew?"创建":"保存线路",function(body){
+  function g(k){var x=body.querySelector('[data-fk="'+k+'"]');return x?(x.value||"").trim():""}
+  function gi(k){var v=g(k);return v===""?null:parseInt(v,10)}
+  var out={};
+  out.mark=gi("mark");out.weight=gi("weight");
+  var p=gi("port");if(p!=null)out.port=p;
+  if(g("upstream"))out.upstream=g("upstream");
+  if(g("daemon"))out.daemon=g("daemon");
+  ["uid","cipher","password","password_file","mode","bind","test_url"].forEach(function(f){if(g(f))out[f]=g(f)});
+  if(g("server")){out.server=g("server");out.proxy_ip=out.proxy_ip||g("server")}
+  var sp=gi("server_port");if(sp!=null)out.server_port=sp;
+  ["ipv4","ipv6","udp_v4","udp_v6","fullcone"].forEach(function(f){out[f]=!!body.querySelector('[data-fk="'+f+'"]').checked});
+  out.autostart=g("autostart_x")==="true";
+  var rmx=gi("restart_max"),rmw=gi("restart_window");
   if(rmx!=null||rmw!=null)out.restart={max:rmx==null?5:rmx,window:rmw==null?300:rmw};
-  var adv;try{adv=JSON.parse($("padv").value||"{}")}catch(e){return toast("高级字段不是合法 JSON","bad")}
+  var adv;try{adv=JSON.parse(body.querySelector(".padv").value||"{}")}catch(e){return toast("高级字段不是合法JSON","bad")}
   for(var ak in adv)out[ak]=adv[ak];
   if(out.mark==null)return toast("mark 必填","bad");
-  if(!isNew&&newName!=name){ if((CFG.proxy||{})[newName])return toast("线路名已存在","bad"); delete CFG.proxy[name]}
+  var newName=g("name")||name;
+  if(!newName)return toast("线路名必填","bad");
+  if(newName!=name&&CFG.proxy[newName])return toast("线路名已存在","bad");
+  if(newName!=name)delete CFG.proxy[name];
   CFG.proxy=CFG.proxy||{};CFG.proxy[newName]=out;
-  pushCfg($("p-autoreload").checked,function(){$("pedit").style.display="none";renderProxy();renderRules()})};
- var cancel=el("button","dim","取消");cancel.onclick=function(){$("pedit").style.display="none"};
- bar.appendChild(save);bar.appendChild(cancel);box.appendChild(bar);
- box.scrollIntoView()}
+  closeModal();
+  pushCfg($("p-autoreload").checked,function(){renderProxy();renderRules()})})}
 function nextMark(){var used={};Object.keys(CFG.proxy||{}).forEach(function(k){used[(CFG.proxy[k]||{}).mark]=1});
  var m=1;while(used[m]||m===0x99||m===0x100)m++;return m}
 function delProxy(name){
@@ -471,43 +491,34 @@ function renderRules(){
 function editCond(pi,line){
  var prio=CFG.rules[pi];var cur=prio[line];
  if(cur===true)cur={any:true};
- if(typeof cur!="object")cur={};
- var box=$("pedit");box.style.display="block";box.innerHTML="";
- box.appendChild(el("b","","条件编辑: 优先级 "+pi+" · "+line));
- var form=el("div");form.id="cform";box.appendChild(form);
- function condRow(key,vals){
-  var row=el("div");row.style.cssText="display:flex;gap:8px;margin:3px 0;align-items:center";
-  row.appendChild(el("label","",key));
-  var inp=document.createElement("input");inp.style.minWidth="420px";inp.dataset.key=key;
-  if(key=="any"){var sel=document.createElement("select");
-   [["","不启用"],["1","any = true"]].forEach(function(o){var op=el("option","",o[1]||"(无)");op.value=o[0];
-    if((o[0]=="1")==!!cur.any)op.selected=true;sel.appendChild(op)});
-   sel.dataset.key="any";row.appendChild(sel)}
-  else if(VAL_KEYS[key]){var sel2=document.createElement("select");
-   [["","不启用"],["1",VAL_KEYS[key][1]||"ANYCAST"]].forEach(function(o){
-    var op=el("option","",o[0]?("匹配 "+o[1]):"(无)");op.value=o[0];
-    if((cur[key]&&cur[key].length)>0==!!o[0])op.selected=true;sel2.appendChild(op)});
-   sel2.dataset.key=key;row.appendChild(sel2)}
-  else{inp.value=(cur[key]||[]).join(", ");row.appendChild(inp)}
-  form.appendChild(row)}
- condRow("any");["from","cidr","resolve","country_code","country_name","region_name","city_name","owner_domain","isp_domain"].forEach(function(k){condRow(k)});
- condRow("anycast");condRow("idc");condRow("base_station");
- var bar=el("div","bar");
- var save=el("button","good","保存条件");
- save.onclick=function(){
+ if(typeof cur!="object"||!cur)cur={};
+ var LIST=["from","cidr","resolve","country_code","country_name","region_name","city_name","owner_domain","isp_domain"];
+ var curf={any:cur.any?"true":""};
+ LIST.forEach(function(k){curf[k]=(cur[k]||[]).join(", ")});
+ openModal("条件编辑: 优先级 "+pi+" · "+line,function(body){
+  mfields(body,[["any","any(匹配全部)","select",["true"]]].concat(
+   LIST.map(function(k){return [k,k,"text",null,"逗号分隔多值"]})), curf);
+  var trow=el("div");trow.style.marginTop="8px";
+  [["anycast","ANYCAST"],["idc","IDC"],["base_station","基站"]].forEach(function(t){
+   var lb=el("label");lb.style.marginRight="16px";
+   var cb=document.createElement("input");cb.type="checkbox";cb.dataset.key=t[0];
+   cb.checked=!!(cur[t[0]]&&cur[t[0]].length);
+   lb.appendChild(cb);lb.appendChild(document.createTextNode(" "+t[0]+" ("+t[1]+")"));trow.appendChild(lb)});
+  body.appendChild(trow)},
+ "保存条件",function(body){
+  function g(k){var x=body.querySelector('[data-fk="'+k+'"]');return x?(x.value||"").trim():""}
   var out={};
-  form.querySelectorAll("input,select").forEach(function(x){
-   var k=x.dataset.key,v=x.value;
-   if(k=="any"){if(v=="1")out.any=true;return}
-   if(VAL_KEYS[k]){if(v=="1")out[k]=[VAL_KEYS[k][1]];return}
-   var arr=String(v).split(/[,，\s]+/).filter(function(s){return s.length>0});
+  if(g("any")==="true")out.any=true;
+  LIST.forEach(function(k){
+   var arr=g(k).split(/[,，\s]+/).filter(function(s){return s.length>0});
    if(arr.length)out[k]=arr});
+  body.querySelectorAll("input[data-key]").forEach(function(cb){
+   if(cb.checked)out[cb.dataset.key]=[VAL_KEYS[cb.dataset.key][1]]});
   if(!Object.keys(out).length)return toast("至少设置一个条件","bad");
-  if(out.any&&Object.keys(out).length>1)delete out.any; // any+specific -> drop any
+  if(out.any&&Object.keys(out).length>1)delete out.any;
   prio[line]=out;
-  pushCfg($("r-autoreload").checked,function(){renderRules();$("pedit").style.display="none"})};
- var cancel=el("button","dim","取消");cancel.onclick=function(){$("pedit").style.display="none"};
- bar.appendChild(save);bar.appendChild(cancel);box.appendChild(bar)}
+  closeModal();
+  pushCfg($("r-autoreload").checked,function(){renderRules()})})}
 $("r-refresh").onclick=function(){loadCfg(renderRules)};
 $("r-add").onclick=function(){if(!Object.keys(CFG.proxy||{}).length)return toast("先创建线路","bad");
  CFG.rules.push({});pushCfg($("r-autoreload").checked,renderRules)};
