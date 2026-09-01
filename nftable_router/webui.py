@@ -66,6 +66,7 @@ label{color:var(--dim)}
   <button data-t=bind>出口绑定</button>
   <button data-t=proxy>线路管理</button>
   <button data-t=rules>路由规则</button>
+  <button data-t=mtr>链路MTR</button>
   <button data-t=cfg>配置JSON</button>
   <button data-t=info>状态</button>
  </nav></header>
@@ -108,6 +109,21 @@ label{color:var(--dim)}
   <label><input type=checkbox id=r-autoreload checked> 保存后重载主进程</label>
   <span class=dim>规则自上而下匹配；每优先级可映射多条线路；条件键同 nft_route.json rules 语义</span></div>
  <div id=rtable></div>
+</section>
+<section id=s-mtr>
+ <div class=bar>
+  <select id="m-line" style="min-width:230px"></select>
+  <input id="m-target" placeholder="目标 IP / 域名" style="width:240px">
+  <label>发包</label><input id="m-cycles" type="number" value="10" style="width:60px">
+  <label>TTL</label><input id="m-ttl" type="number" value="18" style="width:60px">
+  <label>间隔s</label><input id="m-int" value="0.2" style="width:60px">
+  <label>IP族</label><select id="m-fam"><option value="auto">自动</option><option value="4">IPv4</option><option value="6">IPv6</option></select>
+  <button id="m-run" class="good">▶ 开始MTR</button>
+  <button id="m-refresh">刷新</button>
+  <span id="m-err" class="bad"></span>
+ </div>
+ <div class=card id="m-result"><span class=dim>选择线路与目标，回车开测。指定线路通过 SO_MARK 命中 `ip rule fwmark → 表`，与真实业务同路径。</span></div>
+ <div class=card><b>历史任务</b><table id="m-history"></table></div>
 </section>
 <section id=s-cfg>
  <div class=bar>
@@ -262,7 +278,8 @@ tabs.forEach(function(b){b.onclick=function(){
  if(b.dataset.t=="bind")loadBind();
  if(b.dataset.t=="proxy"){if(!CFG)loadCfg(renderProxy);else renderProxy()}
  if(b.dataset.t=="rules"){if(!CFG)loadCfg(renderRules);else renderRules()}
- if(b.dataset.t=="info")loadInfo();}});
+ if(b.dataset.t=="info")loadInfo();
+ if(b.dataset.t=="mtr"){loadMtrLines();loadJobs()}}});
 
 // ---------- bind tab ----------
 var ifData=null;
@@ -586,6 +603,60 @@ $("c-save").onclick=function(){var cfg;try{cfg=JSON.parse($("c-box").value)}catc
   if(r.ok){toast("已保存"+(r.reload&&r.reload.ok?" · 主进程已重载(pid "+r.reload.pid+")":" · 未发送信号"), "good");loadCfg()}
   else{var msg=(r.errors||[r.error||JSON.stringify(r)]).join("\\n");toast("拒绝保存:\\n"+msg,"bad");$("c-msg").innerHTML="<span class=bad>"+msg.replace(/\\n/g,"<br>")+"</span>"}})};
 loadCfg();
+
+// ---------- mtr tab ----------
+var mtrLines={}, mtrTimer=null;
+function loadMtrLines(){api("/api/mtr/lines").then(function(d){
+ mtrLines=d.lines||{};
+ var sel=$("m-line");sel.innerHTML="";
+ var o=el("option","","default (主路由/默认表)");o.value="default";sel.appendChild(o);
+ Object.keys(mtrLines).sort().forEach(function(k){
+  var L=mtrLines[k];
+  var op=el("option","",(k.split(":")[1])+"  ["+L.kind+" · 0x"+L.mark.toString(16)+(L.via?(" · "+L.via):"")+"]");
+  op.value=k;sel.appendChild(op)});
+ if(!d.mtr_bin||!d.mtr_bin.length)$("m-err").textContent="mtr 未安装";
+ $("m-err").textContent=d.ok===false?("加载失败: "+d.error):"";
+}).catch(function(e){$("m-err").textContent="lines: "+e})}
+function renderJob(j){
+ var box=$("m-result");box.innerHTML="";
+ var h1=el("div");h1.appendChild(el("b","",(j.line||"")+"  →  "+(j.target||"")+"  "));
+ h1.appendChild(el("span","dim","status="+(j.status||"")+(j.ms?(" · "+j.ms+"ms"):"")+(j.mark?(" · mark 0x"+j.mark.toString(16)):"")));
+ box.appendChild(h1);
+ if(j.error)box.appendChild(el("div","bad",String(j.error)));
+ if(j.status==="running"){box.appendChild(el("div","warn","探测运行中..."));return}
+ if(j.hops&&j.hops.length){
+  var rows=j.hops.map(function(h){var loss=parseFloat(h.loss)||0;
+   return [h.hop,el("span",loss>=100?"bad":(loss>0?"warn":"good"),h.host),h.loss,h.snt,h.last,h.avg,h.best,h.wrst,h.stdev]});
+  var t=el("table");t.style.marginTop="6px";
+  putRows(t,["跳","主机","丢包","发","最近","平均","最佳","最差","σ"],rows);
+  box.appendChild(t)}
+ if(j.raw){var det=el("details");det.style.marginTop="8px";
+  det.appendChild(el("summary","dim","原始输出"));
+  det.appendChild(el("pre","dim",j.raw));box.appendChild(det)}}
+$("m-run").onclick=function(){
+ var tgt=$("m-target").value.trim();
+ if(!tgt)return toast("填写目标 IP / 域名","warn");
+ api("/api/mtr",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({target:tgt,line:$("m-line").value,
+   cycles:parseInt($("m-cycles").value,10)||10,max_ttl:parseInt($("m-ttl").value,10)||18,
+   interval:parseFloat($("m-int").value)||0.2,family:$("m-fam").value})}).then(function(r){
+    if(!r.ok)return toast(String(r.error),"bad");
+    toast("MTR任务 #"+r.id+" 已启动","good");
+    if(mtrTimer)clearInterval(mtrTimer);
+    mtrTimer=setInterval(function(){
+     api("/api/mtr/job/"+r.id).then(function(j){renderJob(j);
+      if(j.status!=="running"){clearInterval(mtrTimer);mtrTimer=null;loadJobs()}}).catch(function(){})},900)
+   }).catch(function(e){toast("请求失败 "+e,"bad")})};
+function loadJobs(){api("/api/mtr/jobs").then(function(list){
+ var t=$("m-history");t.innerHTML="";
+ var rows=list.map(function(j){return [String(j.id),j.line,j.target,
+  el("span",j.status==="done"?"good":(j.status==="running"?"warn":"bad"),j.status),
+  j.ms||"",j.mark?("0x"+j.mark.toString(16)):"",new Date(j.started*1000).toLocaleTimeString()]});
+ putRows(t,["#","线路","目标","状态","ms","mark","时间"],rows);
+ t.querySelectorAll("tbody tr").forEach(function(tr,i){tr.style.cursor="pointer";
+  tr.onclick=function(){api("/api/mtr/job/"+rows[i][0]).then(renderJob)}})})}
+$("m-refresh").onclick=function(){loadMtrLines();loadJobs()};
+$("m-target").addEventListener("keydown",function(e){if(e.key==="Enter")$("m-run").click()});
 
 // ---------- status ----------
 function lvl(v){if(v==null||isNaN(v))return"⚫";if(v<0)return"🔴";if(v<=0)return"⚫";

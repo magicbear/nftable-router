@@ -26,10 +26,12 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import select
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -461,6 +463,144 @@ def health_snapshot(app):
     return res
 
 
+
+
+# ---------------------------------------------------------------------------
+# mtr per-line path test (SO_MARK via markexec LD_PRELOAD; async jobs)
+# ---------------------------------------------------------------------------
+import itertools
+
+MTR_BIN = None
+MARKSO = os.path.join(module_dir, "markexec.so")
+MARKSRC = os.path.join(module_dir, "markexec.c")
+mtr_jobs = {}
+mtr_seq = itertools.count(1)
+mtr_running = [0]
+MTR_LOCK = threading.Lock()
+TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,253}$")
+
+
+def mtr_find_bin():
+    global MTR_BIN
+    if MTR_BIN is None:
+        MTR_BIN = shutil.which("mtr") or "/usr/sbin/mtr"
+    return MTR_BIN
+
+
+def ensure_markso():
+    """compile markexec.so on demand; returns path or (None, error)"""
+    if os.path.exists(MARKSO) and os.path.getmtime(MARKSO) >= os.path.getmtime(MARKSRC):
+        return MARKSO, None
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if not cc:
+        return None, "no cc/gcc to build markexec.so"
+    try:
+        p = subprocess.run([cc, "-shared", "-fPIC", "-O2", "-o", MARKSO, MARKSRC],
+                           capture_output=True, timeout=20, text=True)
+        if p.returncode != 0:
+            return None, "compile failed: " + p.stderr[-200:]
+        return MARKSO, None
+    except Exception as e:
+        return None, str(e)
+
+
+def mtr_line_marks(cfg):
+    """candidate lines -> mark: proxy lines + egress bindings (deduped)."""
+    out = {}
+    for name, c in cfg.get("proxy", {}).items():
+        m = c.get("mark")
+        if isinstance(m, int) and m > 0 and m not in (0x99, 0x100):
+            out["line:" + name] = {"mark": m, "name": name,
+                                   "kind": "proxy" + (" (managed)" if c.get("daemon") else ""),
+                                   "via": c.get("server") or c.get("proxy_ip") or ""}
+    for b in cfg.get("egress_marks", []):
+        if isinstance(b.get("mark"), int):
+            key = "egress:" + (b.get("iface") or b.get("ip", ""))
+            out.setdefault(key, {"mark": b["mark"], "name": b.get("iface") or b.get("ip"),
+                                 "kind": "egress", "via": b.get("ip") or "(dynamic)"})
+    return out
+
+
+def _mtr_parse(text):
+    hops = []
+    for ln in text.splitlines():
+        if ".|--" not in ln:
+            continue
+        idx, _, rest = ln.partition(".|--")
+        toks = rest.split()
+        if len(toks) < 5:
+            continue
+        nums = toks[-7:] if len(toks) > 1 else toks
+        host = " ".join(toks[:len(toks) - len(nums)]) or "?"
+        hops.append({"hop": idx.strip(), "host": host, "loss": nums[0], "snt": nums[1],
+                     "last": nums[2], "avg": nums[3], "best": nums[4], "wrst": nums[5],
+                     "stdev": nums[6] if len(nums) > 6 else ""})
+    return hops
+
+
+def mtr_job_run(jid, argv, env, hard_to):
+    j = mtr_jobs[jid]
+    try:
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           env=env, timeout=hard_to)
+        text = p.stdout.decode("utf-8", "replace")
+        j.update({"status": "done", "rc": p.returncode, "raw": text,
+                  "hops": _mtr_parse(text), "ms": int((time.time() - j["started"]) * 1000)})
+    except subprocess.TimeoutExpired:
+        j.update({"status": "timeout", "raw": j.get("raw", "") + "\n[hard timeout]", "hops": []})
+    except Exception as e:
+        j.update({"status": "error", "error": str(e), "hops": []})
+    finally:
+        with MTR_LOCK:
+            mtr_running[0] -= 1
+
+
+def mtr_start(body, cfg):
+    tgt = str(body.get("target", "")).strip().strip("[]")
+    if not tgt or tgt.startswith("-") or not TARGET_RE.match(tgt):
+        return {"ok": False, "error": "非法目标地址/域名"}
+    line = str(body.get("line", ""))
+    cycles = min(50, max(1, int(body.get("cycles", 10))))
+    maxttl = min(30, max(2, int(body.get("max_ttl", 18))))
+    interval = min(2.0, max(0.1, float(body.get("interval", 0.2))))
+    lines = mtr_line_marks(cfg)
+    mark = 0
+    if line and line != "default":
+        if line not in lines:
+            return {"ok": False, "error": "未知线路 %r" % line}
+        mark = lines[line]["mark"]
+    binm = mtr_find_bin()
+    env = dict(os.environ)
+    argv = [binm, "-n", "--report", "--report-cycles", str(cycles),
+            "-m", str(maxttl), "-i", str(interval), tgt]
+    fam = str(body.get("family", "auto"))
+    if fam == "4" or (fam == "auto" and ":" not in tgt):
+        if fam == "4":
+            argv.insert(1, "-4")
+    if fam == "6" or (fam == "auto" and ":" in tgt):
+        argv.insert(1, "-6")
+    if mark:
+        so, err = ensure_markso()
+        if not so:
+            return {"ok": False, "error": "markexec.so: %s (线路测试需要它; default线路不受影响)" % err}
+        env["LD_PRELOAD"] = so
+        env["MARK"] = str(mark)
+    with MTR_LOCK:
+        if mtr_running[0] >= 2:
+            return {"ok": False, "error": "并发MTR已满(2),稍后再试"}
+        mtr_running[0] += 1
+        jid = str(next(mtr_seq))
+        mtr_jobs[jid] = {"id": jid, "status": "running", "target": tgt, "line": line or "default",
+                         "mark": mark, "cycles": cycles, "started": time.time()}
+        if len(mtr_jobs) > 50:
+            for k in sorted(mtr_jobs, key=lambda x: mtr_jobs[x]["started"])[:len(mtr_jobs) - 50]:
+                if mtr_jobs[k]["status"] != "running":
+                    del mtr_jobs[k]
+    hard_to = cycles * interval + maxttl * 3 + 15
+    threading.Thread(target=mtr_job_run, args=(jid, argv, env, hard_to), daemon=True).start()
+    return {"ok": True, "id": jid}
+
+
 # ---------------------------------------------------------------------------
 # HTTP + WS handler
 # ---------------------------------------------------------------------------
@@ -548,6 +688,18 @@ class Handler(BaseHTTPRequestHandler):
                                      "proxy_lines": {k: v.get("mark") for k, v in cfg.get("proxy", {}).items()}})
             except Exception as e:
                 self.send_json(500, {"error": "%s" % e})
+        elif path == "/api/mtr/lines":
+            try:
+                cfg = ib.load_config(self.cfg_path())
+                self.send_json(200, {"ok": True, "mtr_bin": mtr_find_bin(),
+                                     "lines": mtr_line_marks(cfg)})
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": str(e)})
+        elif path.startswith("/api/mtr/job/"):
+            jid = path.rsplit("/", 1)[-1]
+            self.send_json(200 if jid in mtr_jobs else 404, mtr_jobs.get(jid, {"status": "gone"}))
+        elif path == "/api/mtr/jobs":
+            self.send_json(200, sorted(mtr_jobs.values(), key=lambda j: -j["started"])[:20])
         elif path == "/api/health":
             try:
                 self.send_json(200, health_snapshot(self.app))
@@ -636,6 +788,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True, "entry": entry, "reload": rc})
         elif path == "/api/reload":
             self.send_json(200, signal_master())
+        elif path == "/api/mtr":
+            try:
+                cfg = ib.load_config(self.cfg_path())
+                self.send_json(200, mtr_start(body, cfg))
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
         elif path == "/api/test_now":
             try:
                 r = redis.Redis(host=self.app.args.redis_host, port=self.app.args.redis_port,
