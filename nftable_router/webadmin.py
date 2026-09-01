@@ -1036,6 +1036,17 @@ class Handler(BaseHTTPRequestHandler):
             if errors:
                 self.send_json(422, {"ok": False, "errors": errors})
                 return
+            # optimistic lock: refuse silent overwrite of externally-changed file
+            base_mtime = body.get("base_mtime")
+            try:
+                cur_mtime = os.stat(self.cfg_path()).st_mtime
+            except OSError:
+                cur_mtime = None
+            if (base_mtime is not None and cur_mtime is not None
+                    and abs(cur_mtime - float(base_mtime)) > 0.001 and not body.get("force")):
+                self.send_json(409, {"ok": False, "stale": True, "server_mtime": cur_mtime,
+                                     "error": "配置文件在本页面加载之后被外部修改过，已阻止覆盖"})
+                return
             try:
                 ib.save_config(self.cfg_path(), cfg)          # atomic + .bak
             except Exception as e:

@@ -355,16 +355,25 @@ $("b-add").onclick=function(){
   else toast("拒绝: "+(r.error||JSON.stringify(r.errors||r)),"bad")}).catch(function(e){toast("请求失败 "+e,"bad")})};
 
 // ---------- shared config state ----------
-var CFG=null;
+var CFG=null, CFG_MTIME=null;
 function knownOnly(o,keys){var r={};for(var k in o){if(keys.indexOf(k)<0)r[k]=o[k]}return r}
 function markDirty(){localStorage.setItem("nft_dirty","1");updateDirtyUI()}
 function updateDirtyUI(){
  var d=localStorage.getItem("nft_dirty")==="1";
  var dot=document.getElementById("nav-dirty");if(dot)dot.style.display=d?"inline":"none"}
 function pushCfg(cb){
- api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({config:CFG,reload:false})}).then(function(r){
+ var payload={config:CFG,reload:false,base_mtime:CFG_MTIME};
+ var force=(cb===true); if(force)payload.force=true; else if(typeof cb!=="function")cb=null;
+ return api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify(payload)}).then(function(r){
+   if(r.stale){
+    if(confirm("检测到配置文件在本页面加载后被外部修改过（例如直接在服务器上改/修复）。\\n\\n直接保存会覆盖那些修改。\\n\\n『确定』= 重新加载最新配置，请再改一次再保存\\n『取消』= 仍要以本页内容强制覆盖保存")){loadCfg()}
+    else pushCfg(true);
+    return}
+   if(r.errors){var em=(r.errors||[]).join("\\n");toast("拒绝保存:\\n"+em,"bad");
+    $("c-msg")&&($("c-msg").innerHTML="<span class=bad>"+em.replace(/\\n/g,"<br>")+"</span>");return}
    if(r.ok){toast("已写入配置文件(未重载) — 到 状态 页点『重载主进程』生效","good");markDirty();if(cb)cb()}
+   else if(!r.stale&&!r.errors){toast("保存失败: "+(r.error||JSON.stringify(r)),"bad")}
    else{var msg=(r.errors||[r.error||JSON.stringify(r)]).join("\\n");
     toast("拒绝保存:\\n"+msg,"bad");$("c-msg")&&($("c-msg").innerHTML="<span class=bad>"+msg.replace(/\\n/g,"<br>")+"</span>")}})}
 
@@ -693,7 +702,7 @@ $("r-add").onclick=function(){if(!Object.keys(CFG.proxy||{}).length)return toast
 
 // ---------- config tab ----------
 function loadCfg(cb){api("/api/config").then(function(d){
- CFG=d.config;$("c-box").value=JSON.stringify(d.config,null,3);$("c-path").textContent=d.path||"";
+ CFG=d.config;CFG_MTIME=d.mtime||null;$("c-box").value=JSON.stringify(d.config,null,3);$("c-path").textContent=d.path||"";
  $("c-msg").innerHTML="<span class=dim>已加载 "+(d.path||"")+"</span>";
  if(cb)cb();renderProxy();renderRules()}).catch(function(e){toast("读取失败 "+e,"bad")})}
 $("c-reload").onclick=loadCfg;
@@ -703,7 +712,8 @@ $("c-check").onclick=function(){var cfg;try{cfg=JSON.parse($("c-box").value)}cat
   $("c-msg").innerHTML=r.ok?"<span class=good>校验通过</span>":("<span class=bad>错误:</span><br>"+r.errors.map(function(x){return "· "+x}).join("<br>"))})};
 $("c-save").onclick=function(){var cfg;try{cfg=JSON.parse($("c-box").value)}catch(e){return toast("JSON 错误: "+e,"bad")}
  if(!confirm("保存整份配置到 nft_route.json？(仅写文件，不通知主进程)"))return;
- api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg,reload:false})}).then(function(r){
+ api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg,reload:false,base_mtime:CFG_MTIME})}).then(function(r){
+  if(r.stale){toast("配置已被外部修改，请先点『读取配置』重新加载","bad");return}
   if(r.ok){toast("已保存(未重载) — 到 状态 页点『重载主进程』生效","good");markDirty();loadCfg()}
   else{var msg=(r.errors||[r.error||JSON.stringify(r)]).join("\\n");toast("拒绝保存:\\n"+msg,"bad");$("c-msg").innerHTML="<span class=bad>"+msg.replace(/\\n/g,"<br>")+"</span>"}})};
 loadCfg();
