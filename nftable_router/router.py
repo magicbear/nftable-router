@@ -679,13 +679,15 @@ def apply_egress_rules(nfu, ip_family):
         syslog.syslog(syslog.LOG_WARNING, "egress ruleset inspect failed: %s" % e)
         restore_exists = False
     if not restore_exists:
-        # force-recreate our named RESTORE chain with the CURRENT spec: a
-        # transient buggy build registered it as 'type route @ -150'; RESTORE
-        # is connmark restore and MUST be a plain 'type filter @ -120' chain
-        # (steering egress is the SEPARATE CHAIN_ROUTE's job). Delete-then-add
-        # (deleting a non-existent chain is a harmless no-op).
-        nfu.nft.json_cmd({"nftables": [{"delete": {"chain": {
-            "family": ip_family, "table": "policy_route", "name": ib.CHAIN_RESTORE}}}]})
+        # heal stale chains from earlier buggy builds: an intermediate version
+        # registered CHAIN_RESTORE as 'type route @ -150' (connmark restore must
+        # be a plain 'type filter @ -120' chain) and created a separate
+        # 'mangle_EGRESS_ROUTE' type-route chain before it SIGSEGV'd libnftables
+        # 0.9.8. Delete both by name (blind delete of a missing chain is a
+        # harmless no-op on this build) then re-plan the correct filter chain.
+        for stale in (ib.CHAIN_RESTORE, "mangle_EGRESS_ROUTE"):
+            nfu.nft.json_cmd({"nftables": [{"delete": {"chain": {
+                "family": ip_family, "table": "policy_route", "name": stale}}}]})
     chains, rules = ib.plan_rules(config, ip_family, restore_exists=restore_exists)
     for ch in chains:
         nfu.add_chain(ch)
@@ -892,61 +894,18 @@ def install_proxy_chain_rules():
                 print("      [!] %s: inline password visible in /proc cmdline; prefer 'password_file'" % label)
     n_ok = 0
     for ip_family in ("ip", "ip6"):
-        planned = pmm.plan_proxy_chain_rules(config["proxy"], uid_cache, ip_family)
-        stamps = [r for r in planned if r["chain"] == ib.CHAIN_ROUTE]
-        verdicts = [r for r in planned if r["chain"] != ib.CHAIN_ROUTE]
-        if stamps:
-            # guarantee the DEDICATED type-route chain (skuid marks only live
-            # here so they actually re-trigger the FIB lookup). It is separate
-            # from the connmark RESTORE filter chain. Spec-match check avoids
-            # churning; a stale/foreign chain of the same name is rebuilt.
-            spec = ib.route_chain_spec(ip_family)
-            try:
-                rq, ro, _ = nfu.nft.json_cmd({"nftables": [
-                    {"list": {"chain": {"family": ip_family, "table": "policy_route",
-                                        "name": ib.CHAIN_ROUTE}}}]})
-            except Exception:
-                rq, ro = 1, None
-            cur = None
-            if rq == 0 and isinstance(ro, dict):
-                for it in ro.get("nftables", []):
-                    if isinstance(it, dict) and isinstance(it.get("chain"), dict):
-                        cur = it["chain"]
-                        break
-            if cur is None:
-                nfu.add_chain(spec)
-            else:
-                hk = cur.get("hook") if isinstance(cur.get("hook"), dict) else {}
-                prio_val = cur.get("prio", hk.get("priority"))
-                if cur.get("type") not in (None, "route") or (
-                        prio_val is not None and prio_val != ib.ROUTE_PRIO):
-                    nfu.nft.json_cmd({"nftables": [{"delete": {"chain": {
-                        "family": ip_family, "table": "policy_route",
-                        "name": ib.CHAIN_ROUTE}}}]})
-                    nfu.add_chain(spec)
-                    syslog.syslog(syslog.LOG_NOTICE,
-                                  "route chain %s/%s recreated (type/prio mismatch)"
-                                  % (ip_family, ib.CHAIN_ROUTE))
         # INSERT at the head of nat_OUTPUT: the policy queue rule verdicts
         # (queue) before appended rules would ever run, so appended skuid
         # rules are dead code exactly when the policy engine marks a proxy's
         # own upstream flow. Insert in reverse to preserve planned order.
-        for r in reversed(verdicts):
+        # (NOTE: 'type route' OUTPUT chains were tried for skuid stamps and
+        # SIGSEGV libnftables 0.9.8 json parsing -- do not reintroduce without
+        # verifying every command form interactively on the box first.)
+        for r in reversed(pmm.plan_proxy_chain_rules(config["proxy"], uid_cache, ip_family)):
             rc = nfu.insert_rule(dict(r))
             if rc[0] != 0:
                 print(tf.format("{msg:s,bg_red,black}", msg="[-] insert proxy-chain rule failed (%s): %s" % (ip_family, rc)))
                 syslog.syslog(syslog.LOG_CRIT, "insert proxy-chain rule failed %s: %s" % (ip_family, rc))
-            else:
-                n_ok += 1
-        # identity stamps APPEND into the type-route output chain (only a
-        # route-type chain reroutes after a mark change; iface_bind owns the
-        # chain itself -- it exists whenever any egress binding is planned,
-        # and we ensured it above otherwise)
-        for r in stamps:
-            rc = nfu.add_rule(dict(r))
-            if rc[0] != 0:
-                print(tf.format("{msg:s,bg_red,black}", msg="[-] add skuid stamp rule failed (%s): %s" % (ip_family, rc)))
-                syslog.syslog(syslog.LOG_CRIT, "add skuid stamp rule failed %s: %s" % (ip_family, rc))
             else:
                 n_ok += 1
     print("[+] proxy-chain skuid rules: %d installed" % n_ok)

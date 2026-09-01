@@ -389,11 +389,17 @@ def validate_chain(proxy_cfgs):
 # loop-guard / chain nft rules (pure dicts; committed by router.py via nfu)
 # ---------------------------------------------------------------------------
 
-# iface_bind's DEDICATED type-route OUTPUT chain (CHAIN_ROUTE) -- skuid->mark
-# stamps live here because only a route-type chain re-triggers the FIB lookup
-# after a mark change. NOT the connmark RESTORE chain (that is type filter and
-# must stay so). test asserts ROUTE_OUT_CHAIN == iface_bind.CHAIN_ROUTE.
-ROUTE_OUT_CHAIN = "mangle_EGRESS_ROUTE"
+# skuid->mark identity stamps. IMPORTANT: these live in nat_OUTPUT (inserted
+# at the head, before the policy NFQUEUE) -- NOT a dedicated 'type route'
+# output chain. A 'type route' chain was attempted and SIGSEGVs libnftables
+# 0.9.8's JSON command parsing (cmd->obj NULL deref inside
+# nft_run_cmd_from_buffer, before any netlink). Do not reintroduce one without
+# first verifying the exact add-chain/add-rule JSON interactively on the box.
+# NOTE this means skuid stamps decorate conntrack/meta at the NAT stage; they
+# do NOT re-run the FIB lookup for already-routed locally-generated packets
+# (that needs the socket's sk_mark, e.g. ss-redir '--mark', which is a
+# separate concern from this chain).
+ROUTE_OUT_CHAIN = "nat_OUTPUT"
 
 
 def _stamp_rule(family, uid, mark):

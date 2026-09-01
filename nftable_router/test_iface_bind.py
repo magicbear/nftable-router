@@ -229,12 +229,11 @@ def test_rules_safety_and_shape():
           res4["type"] == "filter" and res4["hook"] == "output")
     check("restore prio after conntrack(-200) before policy queue(-90)",
           -200 < res4["prio"] < -90)
-    check("restore prio back at -120 (not the route chain's -150)", res4["prio"] == -120)
-    # the skuid->mark STAMP chain is a SEPARATE type-route chain
-    rspec = ib.route_chain_spec("ip")
-    check("route chain is its OWN chain (name != restore)", rspec["name"] == ib.CHAIN_ROUTE != ib.CHAIN_RESTORE)
-    check("route chain: type route, hook output", rspec["type"] == "route" and rspec["hook"] == "output")
-    check("route chain: mangle prio -150", rspec["prio"] == -150 == ib.ROUTE_PRIO)
+    check("restore prio back at -120", res4["prio"] == -120)
+    # NO dedicated type-route chain: 'add chain type route' SIGSEGVs libnftables
+    # 0.9.8 json parsing, so skuid stamps go into nat_OUTPUT (see proxy_mgr).
+    check("no type-route chain is planned",
+          not any(c.get("type") == "route" for c in chains4 + chains6))
     check("ip rules safe", ib.rules_are_safe(rules4))
     check("ip6 rules safe", ib.rules_are_safe(rules6))
 

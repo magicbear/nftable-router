@@ -60,22 +60,16 @@ EGRESS_MARKS_KEY = "egress_marks"
 #            already contains an equivalent (manually maintained ones survive
 #            clearRules because of a different comment tag).
 #            This is CONNMARK restore for already-tracked flows -- its natural
-#            home is a FILTER output chain (it must NOT be a route chain).
-#   ROUTE    output (type ROUTE, prio -150 mangle class): holds ONLY the
-#            skuid->meta-mark identity STAMP rules built by proxy_mgr. A mark
-#            set here actually re-triggers the FIB lookup (a filter OUTPUT
-#            chain runs AFTER the routing decision, so marks set there never
-#            steer egress -- the production bug this split fixes). It is a
-#            SEPARATE chain from RESTORE because a single chain cannot be both
-#            filter and route.
+#            home is a FILTER output chain.
+# NOTE there is intentionally NO 'type route' chain here: proxy skuid stamps are
+# inserted into nat_OUTPUT instead, because 'add chain type route' SIGSEGVs the
+# libnftables 0.9.8 JSON command parser (cmd->obj NULL deref inside
+# nft_run_cmd_from_buffer). Do not add a route chain without testing the exact
+# JSON on the target's nftables build first.
 CHAIN_SET = "nat_EGRESS_SET"
 CHAIN_RESTORE = "mangle_EGRESS_RESTORE"
-CHAIN_ROUTE = "mangle_EGRESS_ROUTE"
 SET_PRIO = -95
 RESTORE_PRIO = -120
-# the type-route output chain MUST run at mangle class, before the routing
-# decision, for skuid marks to steer local egress.
-ROUTE_PRIO = -150
 DANGEROUS_VERDICTS = {"accept", "drop", "queue", "redirect", "tproxy", "reject"}
 RESTORE_SIGNATURE = "meta mark set ct mark"
 
@@ -403,7 +397,7 @@ def restore_in_ruleset(ruleset, family="ip"):
     """Detect a generic `ct mark -> meta mark` OUTPUT restore already deployed
     (e.g. the manual 'Src-Route Policy'), so we do not add a duplicate. The
     RESTORE lives in an OUTPUT chain of ANY type (it is connmark restore for
-    tracked flows -- egress steering is NOT its job; see CHAIN_ROUTE for that),
+    tracked flows -- egress steering is NOT its job; see proxy_mgr nat_OUTPUT
     so match on the expression regardless of filter/route. Accepts the nft JSON
     ruleset dict/list or raw text (substring fallback)."""
     if isinstance(ruleset, str):
@@ -444,16 +438,6 @@ def restore_in_ruleset(ruleset, family="ip"):
                 if m.get("key") == {"meta": {"key": "mark"}} and m.get("value") == {"ct": {"key": "mark"}}:
                     return True
     return False
-
-
-def route_chain_spec(family):
-    """The type-route OUTPUT chain that hosts skuid->mark identity stamps.
-    Created ONLY when such stamps exist (proxy_mgr.plan_proxy_chain_rules);
-    a mark set in a plain FILTER output chain never re-triggers the FIB lookup,
-    which is exactly the 'marked but egressed via default route' bug this
-    dedicated chain fixes."""
-    return {"family": family, "table": "policy_route", "name": CHAIN_ROUTE,
-            "type": "route", "hook": "output", "prio": ROUTE_PRIO, "policy": "accept"}
 
 
 def rules_are_safe(rules):
