@@ -23,6 +23,7 @@ run:  python3 -m nftable_router.webadmin --config /etc/network/nft_route.json \
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -725,6 +726,152 @@ def geo_lookup(cfg_path, ips):
     return {"ok": True, "geo": out}
 
 
+
+# ---------------------------------------------------------------------------
+# routing tables viewer / editor (iproute2 via argv, strict validation)
+# ---------------------------------------------------------------------------
+RT_TABLE_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,32}$")
+RT_DEV_RE = re.compile(r"^[A-Za-z0-9_.:\-]{1,15}$")
+RT_TYPE_WORDS = {"default", "unreachable", "prohibit", "blackhole", "nat", "throw"}
+RT_KNOWN_KEYS = {"via", "dev", "src", "scope", "proto", "metric", "table", "mtu",
+                 "advmss", "onlink", "weight", "pref", "expires", "linkdown", "error"}
+
+
+def _ip(args, timeout=8):
+    p = subprocess.run(["ip"] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       timeout=timeout, text=True)
+    return p.returncode, p.stdout
+
+
+def rt_parse_line(line):
+    toks = line.split()
+    if not toks:
+        return None
+    out = {"raw": line, "type": "", "dst": "", "opts": {}, "bare": []}
+    i = 0
+    if toks[0] in RT_TYPE_WORDS:
+        if toks[0] == "default":
+            out["dst"] = "default"
+            i = 1
+        else:
+            out["type"] = toks[0]
+            out["dst"] = toks[1] if len(toks) > 1 else ""
+            i = 2
+    else:
+        out["dst"] = toks[0]
+        i = 1
+    while i < len(toks):
+        tk = toks[i]
+        if tk in RT_KNOWN_KEYS and i + 1 < len(toks) and toks[i + 1] not in RT_KNOWN_KEYS:
+            out["opts"][tk] = toks[i + 1]
+            i += 2
+        elif tk in RT_KNOWN_KEYS:
+            out["opts"][tk] = True
+            i += 1
+        else:
+            out["bare"].append(tk)
+            i += 1
+    return out
+
+
+def rt_tables_list():
+    """named + numeric tables seen in rt_tables / ip rule / routes."""
+    tables = []
+    try:
+        for ln in open("/etc/iproute2/rt_tables"):
+            ln = ln.split("#")[0].strip()
+            if not ln:
+                continue
+            parts = ln.split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                tables.append({"id": int(parts[0]), "name": parts[1].strip(), "src": "rt_tables"})
+    except OSError:
+        pass
+    rc, out = _ip(["-o", "rule", "show"])
+    rules = []
+    if rc == 0:
+        for ln in out.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            m = re.match(r"^(\d+):\s+(.*)$", ln)
+            if not m:
+                continue
+            prio, sel = int(m.group(1)), m.group(2)
+            tm = re.search(r"lookup\s+(\S+)", sel) or re.search(r"table\s+(\S+)", sel)
+            rules.append({"prio": prio, "sel": sel, "table": tm.group(1) if tm else ""})
+            if tm and tm.group(1).isdigit() and not any(t["name"] == tm.group(1) for t in tables):
+                tables.append({"id": int(tm.group(1)), "name": tm.group(1), "src": "rule"})
+    return {"tables": tables, "rules": rules}
+
+
+def rt_show(table):
+    fam4 = _ip(["-o", "-4", "route", "show", "table", table])
+    fam6 = _ip(["-o", "-6", "route", "show", "table", table])
+    lines = []
+    for rc, out in (fam4, fam6):
+        if rc != 0:
+            continue
+        for ln in out.splitlines():
+            r = rt_parse_line(ln.strip())
+            if r:
+                r["family"] = 6 if ":" in r["dst"] else 4
+                lines.append(r)
+    err = None
+    if fam4[0] != 0 and fam6[0] != 0:
+        err = (fam4[1] or fam6[1]).strip()[:200]
+    return {"ok": err is None, "count": len(lines), "lines": lines, "error": err}
+
+
+def rt_edit(body):
+    op = str(body.get("op", "replace"))
+    table = str(body.get("table", "")).strip()
+    dst = str(body.get("dst", "")).strip()
+    if not RT_TABLE_RE.match(table):
+        return {"ok": False, "error": "非法表名"}
+    if table == "local":
+        return {"ok": False, "error": "local 表禁止编辑"}
+    if op not in ("replace", "del") or not dst:
+        return {"ok": False, "error": "op/dst 参数"}
+    if dst != "default":
+        try:
+            net = ipaddress.ip_network(dst, strict=False)
+            fam = ["-6"] if net.version == 6 else ["-4"]
+        except ValueError:
+            return {"ok": False, "error": "目标必须是 CIDR/IP/default，收到: %s" % dst}
+    else:
+        fam = ["-4"] if not (":" in str(body.get("via", ""))) else ["-6"]
+    args = fam + ["route", "replace" if op == "replace" else "del", dst, "table", table]
+    if op == "replace":
+        for key in ("via", "dev", "src", "scope", "proto", "mtu", "advmss", "weight", "pref"):
+            v = body.get(key)
+            if v in (None, "", False):
+                continue
+            v = str(v).strip()
+            if key in ("via", "src"):
+                try:
+                    ipaddress.ip_address(v)
+                except ValueError:
+                    return {"ok": False, "error": "%s 不是合法IP" % key}
+            elif key == "dev":
+                if not RT_DEV_RE.match(v):
+                    return {"ok": False, "error": "非法设备名"}
+            elif key in ("scope", "proto", "pref"):
+                if not re.match(r"^[A-Za-z0-9._\-]{1,16}$", v):
+                    return {"ok": False, "error": "%s 非法" % key}
+            else:
+                if not v.isdigit():
+                    return {"ok": False, "error": "%s 需为数字" % key}
+            args += [key, v]
+        if body.get("onlink"):
+            args.append("onlink")
+    try:
+        rc, out = _ip(args, timeout=10)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "ip命令超时"}
+    return {"ok": rc == 0, "rc": rc, "cmd": " ".join(["ip"] + args), "out": out.strip()[:400]}
+
+
 # ---------------------------------------------------------------------------
 # HTTP + WS handler
 # ---------------------------------------------------------------------------
@@ -824,6 +971,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200 if jid in mtr_jobs else 404, mtr_jobs.get(jid, {"status": "gone"}))
         elif path == "/api/mtr/jobs":
             self.send_json(200, sorted(mtr_jobs.values(), key=lambda j: -j["started"])[:20])
+        elif path == "/api/routes/tables":
+            try:
+                self.send_json(200, dict({"ok": True}, **rt_tables_list()))
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": str(e)})
+        elif path == "/api/routes":
+            q = parse_qs(urlparse(self.path).query)
+            tbl = (q.get("table", ["main"])[0] or "main").strip()
+            self.send_json(200, rt_show(tbl))
         elif path == "/api/geo":
             q = parse_qs(urlparse(self.path).query)
             ips = (q.get("ips", [""])[0] or "").replace(",", " ").split()
@@ -914,6 +1070,8 @@ class Handler(BaseHTTPRequestHandler):
             ib.save_config(self.cfg_path(), cfg)
             rc = signal_master() if body.get("reload", True) else {}
             self.send_json(200, {"ok": True, "entry": entry, "reload": rc})
+        elif path == "/api/routes":
+            self.send_json(200, rt_edit(body))
         elif path == "/api/reload":
             self.send_json(200, signal_master())
         elif path == "/api/mtr":
