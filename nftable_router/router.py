@@ -2128,19 +2128,46 @@ if __name__ == "__main__":
 
     # managed proxy processes + skuid anti-loop/chain rules (after all families installed)
     install_proxy_chain_rules()
-    nfqueue = netfilterqueue.NetfilterQueue()
-    nfqueue.bind(4, ip_mark, mode=netfilterqueue.COPY_PACKET)
+    # bootstrap guard: by this point the FULL policy_route ruleset is already in
+    # the kernel. If nfqueue bind / executor / webadmin bring-up fails below, we
+    # MUST roll the install back before exiting -- otherwise the process dies
+    # with a stale ruleset attached (bypass keeps traffic flowing, so no
+    # black-hole, but policy is unenforced and the box is left half-configured
+    # with a confusingly non-zero exit). The rules' queue uses flags ['bypass'].
+    try:
+        nfqueue = netfilterqueue.NetfilterQueue()
+        nfqueue.bind(4, ip_mark, mode=netfilterqueue.COPY_PACKET)
 
-    signal.signal(signal.SIGTERM, quit)
-    signal.signal(signal.SIGQUIT, quit)
-    signal.signal(signal.SIGHUP, quit)
-    signal.signal(signal.SIGUSR1, reload_queue)
-    signal.signal(signal.SIGUSR2, restart_all_proxies)
+        signal.signal(signal.SIGTERM, quit)
+        signal.signal(signal.SIGQUIT, quit)
+        signal.signal(signal.SIGHUP, quit)
+        signal.signal(signal.SIGUSR1, reload_queue)
+        signal.signal(signal.SIGUSR2, restart_all_proxies)
 
-    load_executor()
+        load_executor()
 
-    # web admin as a supervised child process (config: nft_route.json 'webadmin' section)
-    sync_webadmin()
+        # web admin as a supervised child process (config: nft_route.json 'webadmin' section)
+        sync_webadmin()
+    except Exception as boot_err:
+        syslog.syslog(syslog.LOG_CRIT,
+                      "bootstrap failed after ruleset install: %r -- rolling back rules" % boot_err)
+        print(tf.format("{msg:s,bg_red,black}",
+                        msg="[-] startup failed (%r); clearing installed ruleset before exit" % boot_err))
+        try:
+            if g_proxy_sup is not None:
+                g_proxy_sup.stop_all()
+                g_proxy_sup = None
+        except Exception as e:
+            print("[-] rollback: stop proxies: %r" % e)
+        try:
+            stop_all_executors()
+        except Exception as e:
+            print("[-] rollback: stop executors: %r" % e)
+        try:
+            clearRules()
+        except Exception as e:
+            print("[-] rollback: clearRules: %r" % e)
+        raise
 
     fcnat_listner = None
     fcnat_cleaner = None
