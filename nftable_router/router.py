@@ -504,13 +504,20 @@ def egress_wizard_boot():
         print("[*] egress: %s %s -> mark %s (bound)" % (
             "iface" if cand["dynamic"] else "ip  ",
             cand["ifname"] + (" / " + cand["ip"] if not cand["dynamic"] else ""), b["mark"]))
-    if not needs:
+    missing_gw = [b for b in ib.get_bindings(config)
+                  if not (b.get("iprule") or {}).get("gateway")]
+    if not needs and not missing_gw:
         return
     interactive = sys.stdin.isatty() and is_master
     if not interactive:
         for cand in needs:
             msg = "unbound public egress: %s %s (%s)" % (
                 cand["ifname"], cand["ip"], "dynamic" if cand["dynamic"] else "static")
+            print(tf.format("{msg:s,bg_yellow,black}", msg="[-] egress: %s" % msg))
+            syslog.syslog(syslog.LOG_WARNING, msg)
+        for b in missing_gw:
+            msg = "egress binding %s (mark %s) has no iprule gateway" % (
+                b.get("iface") or b.get("ip"), b["mark"])
             print(tf.format("{msg:s,bg_yellow,black}", msg="[-] egress: %s" % msg))
             syslog.syslog(syslog.LOG_WARNING, msg)
         return
@@ -536,11 +543,30 @@ def egress_wizard_boot():
             print("    [-] invalid input, skipped")
             return None
 
-    created = ib.run_wizard(config, needs, chooser)
-    if created:
+    def gateway_prompt(cand, entry):
+        dyn = bool(cand.get("dynamic"))
+        hint = "回车=auto(跟随接口默认路由)" if dyn else "回车=稍后在配置里手填"
+        ans = input("    gateway for %s (mark %s)  [%s]: " % (
+            cand["ifname"], entry["mark"], hint)).strip()
+        entry.setdefault("iprule", {})["gateway"] = ans if ans else ("auto" if dyn else "")
+
+    changed = []
+    created = ib.run_wizard(config, needs, chooser, post_bind=gateway_prompt if interactive else None)
+    # existing bindings still missing a gateway -> ask interactively as well
+    if interactive:
+        for b in ib.get_bindings(config):
+            if not (b.get("iprule") or {}).get("gateway"):
+                dyn = bool(b.get("dynamic"))
+                hint = "回车=auto(跟随接口默认路由)" if dyn else "回车=稍后在配置里手填"
+                ans = input("    gateway for %s (mark %s, already bound) [%s]: " % (
+                    b.get("iface") or b.get("ip"), b["mark"], hint)).strip()
+                b.setdefault("iprule", {})["gateway"] = ans if ans else ("auto" if dyn else "")
+                changed.append(b)
+    if created or changed:
         try:
             ib.save_config(config_path, config)
-            print("[+] egress_marks updated in %s (%d new, backup: %s.bak)" % (config_path, len(created), config_path))
+            print("[+] egress_marks updated in %s (%d new, %d gateway-filled, backup: %s.bak)" % (
+                config_path, len(created), len(changed), config_path))
             syslog.syslog(syslog.LOG_NOTICE, "egress_marks updated: %s" % json.dumps(created))
         except Exception as e:
             print(tf.format("{msg:s,bg_red,black}", msg="[-] egress_marks save FAILED (rules will use in-memory cfg): %s" % e))
@@ -581,6 +607,53 @@ def apply_egress_rules(nfu, ip_family):
             syslog.syslog(syslog.LOG_CRIT, "add egress rule failed %s: %s" % (ip_family, rc))
     print("[+] egress marks (%s): %d/%d rules, restore %s" % (
         ip_family, n_ok, len(rules), "already deployed" if restore_exists else "auto-added"))
+
+
+_g_iprule_last_pending = None
+
+
+def sync_iprules(reason=""):
+    """Idempotent reconcile of 'ip rule fwmark -> route table' for every
+    egress_marks binding (closed loop). Owns ONLY priority band 29000+;
+    manual rules with the same fwmark are respected and reported."""
+    global _g_iprule_last_pending
+    try:
+        from pyroute2 import IPRoute
+    except ImportError:
+        return
+    dirty = False
+    pending_note = []
+    try:
+        ipr = IPRoute()
+    except Exception as e:
+        syslog.syslog(syslog.LOG_WARNING, "sync_iprules: IPRoute open failed: %s" % e)
+        return
+    try:
+        for fam in (4, 6):
+            plans = ib.iprule_plan(config, fam)
+            if not plans:
+                continue
+            res = ib.iprule_apply(ipr, plans,
+                                  log=lambda m: syslog.syslog(syslog.LOG_NOTICE, "iprule: %s" % m))
+            for p, why in res["pending"]:
+                pending_note.append("%d:%s" % (p, why))
+            if res["added"] or res["removed"] or res["errors"] or res["external"]:
+                dirty = True
+                msg = ("iprules(%s%s): +%s -%s ext=%s err=%s" % (
+                    ("v%d" % fam), ("/" + reason) if reason else "",
+                    res["added"] or "-", res["removed"] or "-",
+                    res["external"] or "-", res["errors"] or "-"))
+                print("[*] %s" % msg)
+                syslog.syslog(syslog.LOG_NOTICE, msg)
+    finally:
+        ipr.close()
+    note = ",".join(sorted(pending_note))
+    if note != (_g_iprule_last_pending or ""):
+        _g_iprule_last_pending = note
+        if note:
+            print(tf.format("{msg:s,bg_yellow,black}", msg="[-] iprule waiting: %s" % note))
+            syslog.syslog(syslog.LOG_WARNING, "iprule waiting: %s" % note)
+    return dirty
 
 
 def install_proxy_chain_rules():
@@ -1477,6 +1550,8 @@ if __name__ == "__main__":
 
     # scan interfaces -> wizard-bind public egress IP/interface to fwmark -> save config
     egress_wizard_boot()
+    # closed-loop ip rule / route table reconcile (gateways from config)
+    sync_iprules("boot")
 
     for ip_version, ip_family in [(4, "ip"), (6, "ip6")]:
         # nfu.delete_set(family=ip_family, table="nat", name="local")
@@ -1792,7 +1867,7 @@ if __name__ == "__main__":
     fcnat_cleaner = None
 
     t_dns_clean = 0
-    t_print = 0
+    t_iprule = 0
     queue_stdin = []
     mouse_offset = 0
     old_settings = termios.tcgetattr(sys.stdin.fileno())
@@ -1860,7 +1935,12 @@ if __name__ == "__main__":
 
             if g_proxy_pending.value:
                 g_proxy_pending.value = False
+                sync_iprules("reload")
                 install_proxy_chain_rules()
+
+            if time.time() - t_iprule > 60:
+                t_iprule = time.time()
+                sync_iprules()
 
             if g_proxy_restart_all.value:
                 g_proxy_restart_all.value = False

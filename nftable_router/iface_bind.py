@@ -39,6 +39,7 @@ import copy
 import ipaddress
 import json
 import os
+import socket
 import tempfile
 
 RESERVED_MARKS = {0, 0x99, 0x100}
@@ -258,11 +259,12 @@ def add_binding(cfg, cand, mark):
 # wizard
 # ---------------------------------------------------------------------------
 
-def run_wizard(cfg, needs, chooser, log=print):
+def run_wizard(cfg, needs, chooser, log=print, post_bind=None):
     """For each unbound candidate ask `chooser(cand, suggested_mark)` for a mark.
 
-    chooser returns int mark or None to skip. Entries added in-memory; caller
-    decides when to save_config(). Returns list of created entries.
+    chooser returns int mark or None to skip. post_bind(cand, entry) runs right
+    after a successful add (interactive gateways etc.). Entries added in-memory;
+    caller decides when to save_config(). Returns list of created entries.
     """
     created = []
     for cand in needs:
@@ -278,6 +280,11 @@ def run_wizard(cfg, needs, chooser, log=print):
             continue
         log("[wizard] bound %s %s -> mark %d" % (
             "iface" if cand["dynamic"] else "ip", cand["ifname"] + "/" + cand["ip"], mark))
+        if post_bind is not None:
+            try:
+                post_bind(cand, entry)
+            except Exception as e:
+                log("[wizard] post-bind prompt aborted for %s: %s" % (cand.get("ifname", "?"), e))
         created.append(entry)
     return created
 
@@ -418,3 +425,238 @@ def plan_bindings(cfg, candidates):
         else:
             bound.append((cand, b))
     return bound, needs
+
+
+# ===========================================================================
+# ip rule / route table closed loop (auto management)
+# ===========================================================================
+# Owned namespace: every rule we create lives in priority band
+# [IPRULE_PRIO_BASE, IPRULE_PRIO_BASE+IPRULE_PRIO_SPAN). Anything with the same
+# fwmark OUTSIDE that band (or pointing to a foreign table) is treated as an
+# external/manual rule: reported, never modified or deleted.
+#
+# Binding entries gain an optional "iprule" object:
+#   {"gateway": "93.184.216.35" | "auto" | "", "table": 1005?, "priority": 29005?,
+#    "dev": "bond0.2000"?}
+# Defaults: table = mark, priority = IPRULE_PRIO_BASE + table % SPAN,
+# dev = binding iface; static bindings also emit 'src <ip>' on the route.
+# dynamic bindings accept gateway "auto" => follow the interface's current
+# default route (refreshed by the caller's periodic sync).
+
+IPRULE_PRIO_BASE = 29000
+IPRULE_PRIO_SPAN = 900
+
+
+def iprule_plan(cfg, family=4):
+    """Normalize config into desired ip-rule state (list of plans)."""
+    plans = []
+    for b in get_bindings(cfg):
+        mark = int(b["mark"])
+        ip = b.get("ip")
+        dynamic = bool(b.get("dynamic"))
+        if ip is not None:
+            ver = ipaddress.ip_address(ip).version
+            if ver != family:
+                continue
+        elif not dynamic:
+            continue
+        ir = dict(b.get("iprule") or {})
+        table = int(ir.get("table", mark))
+        priority = int(ir.get("priority", IPRULE_PRIO_BASE + table % IPRULE_PRIO_SPAN))
+        gw = ir.get("gateway")
+        gw = None if gw in (None, "", "auto") else str(gw)
+        plans.append({
+            "mark": mark,
+            "table": table,
+            "priority": priority,
+            "family": family,
+            "dev": ir.get("dev") or b.get("iface"),
+            "gateway": gw,
+            "gateway_auto": (ir.get("gateway") in ("auto", "", None)) and dynamic,
+            "src": None if dynamic else ip,
+            "ip": ip,
+            "dynamic": dynamic,
+        })
+    return plans
+
+
+def _our_priority(prio):
+    return IPRULE_PRIO_BASE <= prio < IPRULE_PRIO_BASE + IPRULE_PRIO_SPAN
+
+
+def iprule_apply(ipr, plans, log=None, auto_gateway=None):
+    """Idempotent reconcile of ip rules + route tables using a pyroute2
+    IPRoute-like object. Returns summary dict of lists:
+      added / kept / external / removed / pending (waiting gateway) / errors.
+    auto_gateway(dev, family) -> gw|None resolver is injectable for tests."""
+    res = {"added": [], "kept": [], "external": [], "removed": [], "pending": [], "errors": []}
+    logf = log or (lambda m: None)
+    af = {4: socket.AF_INET, 6: socket.AF_INET6}
+    want_marks = {(p["mark"], p["family"]) for p in plans}
+
+    def norm_fwmark(r):
+        fw = r.get("fwmark", 0)
+        if isinstance(fw, str):
+            fw = int(fw, 0)
+        return fw & 0xffffffff
+
+    # current rules for this family
+    cur = {}
+    for fam in (4, 6):
+        try:
+            rules = ipr.get_rules(family=af[fam])
+        except Exception as e:
+            res["errors"].append("get_rules(%d): %s" % (fam, e))
+            rules = []
+        for r in rules:
+            m = norm_fwmark(r)
+            if m:
+                cur.setdefault((m, fam), []).append(r)
+
+    # ---- remove stale (ours, no longer in config)
+    active_tables = {(p["table"], p["family"]) for p in plans}
+    for (m, fam), rl in cur.items():
+        if (m, fam) in want_marks:
+            continue
+        for r in rl:
+            if _our_priority(r.get("priority", 0)) and (r.get("table") or 0) == m:
+                try:
+                    ipr.rule("del", priority=r.get("priority"), fwmark=m,
+                             table=r.get("table"), family=af[fam])
+                    logf("ip rule del fwmark %d (stale binding)" % m)
+                    res["removed"].append(m)
+                    tbl = r.get("table") or m
+                    if (tbl, fam) not in active_tables:
+                        try:      # flush the default route we owned in that table
+                            ipr.route("del", dst="default", table=tbl, family=af[fam])
+                            logf("route table %d flushed (binding removed)" % tbl)
+                        except Exception:
+                            pass  # table already empty / no default -> nothing to do
+                except Exception as e:
+                    res["errors"].append("rule del fwmark %d: %s" % (m, e))
+
+    def link_index(dev):
+        try:
+            idx = ipr.link_lookup(ifname=dev)
+            return idx[0] if idx else None
+        except Exception:
+            return None
+
+    def current_default(ipr_obj, table, fam):
+        """existing default-route attrs dict for a table, or None"""
+        try:
+            for rt in ipr_obj.get_routes(table=table, dst="default", family=af[fam]):
+                attrs = {"gateway": None, "src": None, "oif": None}
+                for a, v in (rt.get("attrs") or []):
+                    if a in ("RTA_GATEWAY", "RTA_SRC", "RTA_OIF"):
+                        attrs[{"RTA_GATEWAY": "gateway", "RTA_SRC": "src",
+                                "RTA_OIF": "oif"}[a]] = v
+                o = rt.get("_object", rt)
+                attrs["gateway"] = o.get("gateway", attrs["gateway"])
+                return attrs
+            return None
+        except Exception:
+            return None
+
+    # ---- ensure desired
+    for p in plans:
+        fam = p["family"]
+        key = (p["mark"], fam)
+        tag = "fwmark %d -> table %s via %s dev %s" % (
+            p["mark"], p["table"], p["gateway"] or "auto", p["dev"])
+        ours = [r for r in cur.get(key, []) if _our_priority(r.get("priority", 0))
+                and (r.get("table") or 0) == p["table"]]
+        foreign = [r for r in cur.get(key, []) if r not in ours]
+        if foreign and not ours:
+            res["external"].append(p["mark"])
+            logf("ip rule %s: manual/external rule exists -> untouched" % tag)
+            continue
+        # 1) rule
+        if not ours:
+            try:
+                ipr.rule("add", priority=p["priority"], fwmark=p["mark"],
+                         table=p["table"], family=af[fam])
+                logf("ip rule add prio %d fwmark %d lookup %d" % (
+                    p["priority"], p["mark"], p["table"]))
+                res["added"].append(p["mark"])
+            except Exception as e:
+                res["errors"].append("rule add %s: %s" % (tag, e))
+                continue
+        else:
+            res["kept"].append(p["mark"])
+        # 2) route inside the table
+        dev = p["dev"]
+        idx = link_index(dev) if dev else None
+        if dev and idx is None:
+            res["pending"].append((p["mark"], "interface %s missing" % dev))
+            continue
+        gw = p["gateway"]
+        if p["gateway_auto"]:
+            resolver = auto_gateway or _main_default_gateway
+            gw = resolver(dev, fam)
+            if gw is None:
+                res["pending"].append((p["mark"], "auto gateway: no default on %s yet" % dev))
+                continue
+        if gw is None:
+            res["pending"].append((p["mark"], "gateway not set"))
+            continue
+        try:
+            existing = current_default(ipr, p["table"], fam)
+            want = {"dst": "default", "gateway": gw, "table": p["table"], "family": af[fam]}
+            if idx is not None:
+                want["oif"] = idx
+            if p["src"]:
+                want["src"] = p["src"]
+            same = (existing is not None
+                    and existing.get("gateway") == gw
+                    and (p["src"] is None or existing.get("src") == p["src"])
+                    and (idx is None or existing.get("oif") in (idx, None)))
+            if same:
+                continue
+            if existing is not None:
+                try:
+                    ipr.route("del", dst="default", table=p["table"], family=af[fam])
+                except Exception:
+                    pass
+            ipr.route("add", **want)
+            logf("route table %d: default via %s dev %s%s" % (
+                p["table"], gw, dev or "?", (" src " + p["src"]) if p["src"] else ""))
+        except Exception as e:
+            res["errors"].append("route table %d: %s" % (p["table"], e))
+    return res
+
+
+def _main_default_gateway(dev, family=4):
+    """gateway of the current default route on <dev> (main table); None if absent."""
+    try:
+        from pyroute2 import IPRoute
+    except ImportError:
+        return None
+    af = socket.AF_INET if family == 4 else socket.AF_INET6
+    ipr = IPRoute()
+    try:
+        want_idx = None
+        for l in ipr.get_links():
+            if l.get_attr("IFLA_IFNAME") == dev:
+                want_idx = l["index"]
+                break
+        if want_idx is None:
+            return None
+        for rt in ipr.get_routes(family=af):
+            o = rt.get("_object", rt)
+            if o.get("dst_len", 0) != 0 or o.get("table", 254) != 254:
+                continue
+            gw = None
+            oif = None
+            for a, v in (rt.get("attrs") or []):
+                if a == "RTA_GATEWAY":
+                    gw = v
+                elif a == "RTA_OIF":
+                    oif = v
+            if gw and oif == want_idx:
+                return gw
+    except Exception:
+        return None
+    finally:
+        ipr.close()
+    return None

@@ -402,12 +402,157 @@ def test_restore_json_detection():
     check("garbage -> False", not ib.restore_in_ruleset("no restore here", "ip"))
 
 
+
+
+# ---------------------------------------------------------------------------
+# iprule closed loop (mock IPRoute)
+# ---------------------------------------------------------------------------
+
+import socket as _sock
+
+class MockIPRoute:
+    def __init__(self, links=None, rules=None, routes=None):
+        self.links = links if links is not None else {"ppp0": 33, "bond0.2000": 13}
+        self.rules = list(rules or [])      # {priority, fwmark, table, family}
+        self.routes = list(routes or [])    # {table, family, attrs:[(RTA_*,v)..]}
+        self.calls = []
+    def get_links(self):
+        return [{"index": i, "attrs": [("IFLA_IFNAME", n)]} for n, i in self.links.items()]
+    def link_lookup(self, ifname=None):
+        return [self.links[ifname]] if ifname in self.links else []
+    def get_rules(self, family=None):
+        return [r for r in self.rules if r.get("family") in (family, None)]
+    def rule(self, cmd, **kw):
+        self.calls.append(("rule", cmd, kw))
+        if cmd == "add":
+            self.rules.append(dict(kw))
+        elif cmd == "del":
+            self.rules = [r for r in self.rules
+                          if not (r.get("priority") == kw.get("priority")
+                                  and r.get("fwmark") == kw.get("fwmark"))]
+    def get_routes(self, table=None, dst=None, family=None):
+        out = []
+        for r in self.routes:
+            if r.get("table") == table and r.get("family") in (family, None):
+                out.append(r)
+        return out
+    def route(self, cmd, **kw):
+        self.calls.append(("route", cmd, kw))
+        if cmd == "add":
+            self.routes.append({"table": kw.get("table"), "family": kw.get("family"),
+                                "attrs": [("RTA_GATEWAY", kw.get("gateway")),
+                                          ("RTA_OIF", kw.get("oif"))]
+                                 + ([("RTA_SRC", kw.get("src"))] if kw.get("src") else [])})
+        elif cmd == "del":
+            self.routes = [r for r in self.routes if r.get("table") != kw.get("table")]
+
+
+def _cfg_with_bindings(binds):
+    cfg = copy.deepcopy(BASE_CFG)
+    cfg["egress_marks"] = binds
+    return cfg
+
+
+def test_iprule_plan():
+    print("[15] iprule plan defaults")
+    cfg = _cfg_with_bindings([
+        {"ip": "93.184.216.34", "iface": "bond0.2000", "mark": 1005,
+         "iprule": {"gateway": "93.184.216.35"}},
+        {"iface": "ppp0", "mark": 51, "dynamic": True, "iprule": {"gateway": "auto"}},
+        {"ip": "240e::1", "iface": "bond0.254", "mark": 1006, "iprule": {"gateway": "fe80::1"}},
+    ])
+    p4 = ib.iprule_plan(cfg, 4)
+    check("2 ipv4 plans", len(p4) == 2)
+    sp = p4[0]
+    check("table defaults to mark", sp["table"] == 1005)
+    check("priority in owned band", ib.IPRULE_PRIO_BASE <= sp["priority"] < ib.IPRULE_PRIO_BASE + ib.IPRULE_PRIO_SPAN)
+    check("static keeps src ip", sp["src"] == "93.184.216.34" and sp["gateway"] == "93.184.216.35")
+    dp = [x for x in p4 if x["dynamic"]][0]
+    check("dynamic gateway=auto -> gateway_auto", dp["gateway"] is None and dp["gateway_auto"])
+    p6 = ib.iprule_plan(cfg, 6)
+    check("v6 plan: v6 static + dynamic (both families)",
+          len(p6) == 2 and any(x["ip"] == "240e::1" for x in p6) and not any(
+              x["ip"] == "93.184.216.34" for x in p6))
+
+
+def test_iprule_apply_lifecycle():
+    print("[16] iprule apply: add -> idempotent -> drift -> stale-remove -> external")
+    binds = [{"ip": "93.184.216.34", "iface": "bond0.2000", "mark": 1005,
+              "iprule": {"gateway": "93.184.216.35"}}]
+    cfg = _cfg_with_bindings(binds)
+    plans = ib.iprule_plan(cfg, 4)
+    ipr = MockIPRoute()
+    r1 = ib.iprule_apply(ipr, plans)
+    check("rule+route added", len(r1["added"]) == 1 and any(c[0] == "route" and c[1] == "add" for c in ipr.calls))
+    radd = [c for c in ipr.calls if c == ("rule", "add", {**c[2]})]
+    kw = [c[2] for c in ipr.calls if c[0] == "rule" and c[1] == "add"][0]
+    check("rule fields", kw["fwmark"] == 1005 and kw["table"] == 1005)
+    rkw = [c[2] for c in ipr.calls if c[0] == "route" and c[1] == "add"][0]
+    check("route has gateway/oif/src", rkw["gateway"] == "93.184.216.35" and rkw["oif"] == 13
+          and rkw["src"] == "93.184.216.34")
+    # idempotency
+    ipr.calls = []
+    r2 = ib.iprule_apply(ipr, plans)
+    check("second apply no writes", ipr.calls == [] and r2["kept"] == [1005])
+    # gateway drift -> replace route
+    ipr.routes = [{"table": 1005, "family": _sock.AF_INET,
+                   "attrs": [("RTA_GATEWAY", "1.1.1.1"), ("RTA_OIF", 13), ("RTA_SRC", "93.184.216.34")]}]
+    r3 = ib.iprule_apply(ipr, plans)
+    check("gateway drift -> del+add route",
+          ("route", "del", {**[c for c in ipr.calls if c[1] == 'del'][0][2]}) and
+          any(c[0] == "route" and c[1] == "add" for c in ipr.calls))
+    # stale ours (mark no longer configured) -> rule removed
+    ipr2 = MockIPRoute(rules=[{"priority": 29105, "fwmark": 777, "table": 777, "family": _sock.AF_INET}])
+    r4 = ib.iprule_apply(ipr2, plans)
+    check("stale own rule deleted", 777 in r4["removed"] and not any(
+        rr["fwmark"] == 777 for rr in ipr2.rules))
+    # external manual rule same fwmark -> untouched
+    ipr3 = MockIPRoute(rules=[{"priority": 30000, "fwmark": 1005, "table": 200, "family": _sock.AF_INET}])
+    r5 = ib.iprule_apply(ipr3, plans)
+    check("external fwmark respected (kept untouched, no duplicate add)",
+          r5["external"] == [1005] and
+          any(rr["fwmark"] == 1005 and rr["priority"] == 30000 for rr in ipr3.rules) and
+          not any(c[0] == "rule" and c[1] == "add" and c[2].get("fwmark") == 1005
+                  for c in ipr3.calls))
+    # missing interface -> pending, rule still there
+    ipr4 = MockIPRoute()
+    plans_nodev = [dict(plans[0], dev="ghost0")]
+    r6 = ib.iprule_apply(ipr4, plans_nodev)
+    check("dev missing -> pending", r6["pending"] and not any(c[0] == "route" for c in ipr4.calls))
+    # auto gateway via injected resolver
+    ipr5 = MockIPRoute()
+    dyn_plan = dict(ib.iprule_plan(_cfg_with_bindings(
+        [{"iface": "ppp0", "mark": 51, "dynamic": True, "iprule": {"gateway": "auto"}}]), 4)[0])
+    r7 = ib.iprule_apply(ipr5, [dyn_plan], auto_gateway=lambda dev, fam: "10.0.0.1")
+    check("auto gateway resolved into route",
+          any(c[1] == "add" and c[0] == "route" and c[2]["gateway"] == "10.0.0.1" for c in ipr5.calls))
+    ipr6 = MockIPRoute()
+    r8 = ib.iprule_apply(ipr6, [dyn_plan], auto_gateway=lambda dev, fam: None)
+    check("auto gw unavailable -> pending", r8["pending"] and not any(
+        c[0] == "route" and c[1] == "add" for c in ipr6.calls))
+
+
+def test_wizard_post_bind():
+    print("[17] run_wizard post_bind hook (gateway prompt)")
+    cfg = copy.deepcopy(BASE_CFG)
+    cand = {"ifname": "ppp0", "version": 4, "ip": "1.2.3.4", "prefixlen": 32,
+            "dynamic": True, "method": "ppp"}
+    seen = []
+    def pb(c, entry):
+        seen.append((c["ifname"], entry["mark"]))
+        entry.setdefault("iprule", {})["gateway"] = "auto"
+    created = ib.run_wizard(cfg, [cand], lambda c, s: s, log=lambda *a: None, post_bind=pb)
+    check("post_bind saw entry", seen == [("ppp0", created[0]["mark"])])
+    check("entry got iprule.gateway", created[0].get("iprule", {}).get("gateway") == "auto")
+
+
 if __name__ == "__main__":
     for t in [test_classify_and_scan, test_plan_bound_vs_needs, test_dynamic_identity_by_iface,
               test_next_free_mark, test_duplicate_and_collision_rejected, test_validate_bindings,
               test_wizard_flow, test_rules_safety_and_shape, test_guard_never_clobbers_policy_mark,
               test_atomic_save_and_backup, test_bad_input_no_partial_write, test_json_roundtrip_via_add_binding,
-              test_clear_egress_rules, test_restore_json_detection]:
+              test_clear_egress_rules, test_restore_json_detection,
+              test_iprule_plan, test_iprule_apply_lifecycle, test_wizard_post_bind]:
         t()
     print("\n==== %d passed, %d failed ====" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)
