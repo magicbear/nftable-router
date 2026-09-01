@@ -100,6 +100,26 @@ def test_validate_config():
     bad2u["proxy"]["B"].update({"daemon": "custom", "port": 102, "uid": "nobody", "cmd": ["/x"]})
     check("duplicate run-user across lines caught",
           any("run-user" in e for e in wa.validate_config(bad2u)), str(wa.validate_config(bad2u)))
+    # run-user is OPTIONAL now (empty = current user, no skuid): direct managed
+    # or mark-upstream chains without uid must SAVE cleanly (prod regression:
+    # a stale hard requirement blocked the whole page edit)
+    noud = json.loads(json.dumps(good))
+    noud["proxy"]["A"].update({"daemon": "custom", "port": 101, "cmd": ["/x"], "upstream": "B"})
+    noud["proxy"]["B"]["uid"] = "nobody"  # B stays a PURE mark line, now carrying the identity
+    check("daemon WITHOUT uid accepted (mark-upstream inherits identity)",
+          wa.validate_config(noud) == [], str(wa.validate_config(noud)))
+    noud_direct = json.loads(json.dumps(good))
+    noud_direct["proxy"]["A"].update({"daemon": "custom", "port": 101, "cmd": ["/x"]})
+    check("direct daemon without uid accepted", wa.validate_config(noud_direct) == [],
+          str(wa.validate_config(noud_direct)))
+    # ...but a PORT-type chain consumer without own uid stays rejected
+    pchain = json.loads(json.dumps(good))
+    pchain["proxy"]["A"].update({"daemon": "custom", "port": 101, "cmd": ["/x"], "upstream": "B"})
+    pchain["proxy"]["B"].update({"daemon": "custom", "port": 102, "cmd": ["/x"], "uid": "nobody"})
+    pchain["proxy"]["A"]["upstream"] = "B"  # B HAS a port => port-chain needs own uid
+    check("port-chain consumer without uid rejected",
+          any("端口" in e or "port" in e for e in wa.validate_config(pchain)),
+          str(wa.validate_config(pchain)))
     bad2b = json.loads(json.dumps(good))
     bad2b["proxy"]["A"]["upstream"] = "GHOST"
     check("chain: unknown upstream caught",

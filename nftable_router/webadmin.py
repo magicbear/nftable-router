@@ -298,7 +298,18 @@ def validate_config(cfg):
         else:
             marks.setdefault(m, []).append(name)
         if line.get("daemon") and not line.get("uid"):
-            errors.append("proxy %s: 设置了 daemon 但缺少 uid（托管进程必须指定运行用户）" % name)
+            # run-user is an OPTIONAL line identity: empty = the process runs
+            # as the current user and gets no skuid rules (mark-type upstream
+            # chains inherit the UPSTREAM line's user instead). The one
+            # structural exception: a PORT-type upstream chain builds its
+            # redirect loop-guard keyed on THIS line's skuid -- impossible
+            # without a run-user (router fail-closes the line; reject early).
+            up = line.get("upstream")
+            upl = (cfg.get("proxy") or {}).get(up) if up else None
+            if isinstance(upl, dict) and upl.get("port"):
+                errors.append("proxy %s: 上游 %s 是透明端口(port)线路，端口链必须由本线路指定"
+                              "运行用户(skuid)才能生成 redirect 防环规则 -- 请设置运行用户或改用 mark 型上游"
+                              % (name, up))
         if "ipv4" not in line and "ipv6" not in line:
             errors.append("proxy %s: 缺少 ipv4/ipv6 标记（若你并未编辑过该线路，多半是页面快照过旧：先点 刷新/读取配置 再试）" % name)
         p = line.get("port")
