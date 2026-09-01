@@ -367,6 +367,67 @@ def make_uid_spawner(uid, popen=None):
     return spawn
 
 
+PROXY_BINARIES = ("ss-redir", "ss-local", "ss-server", "v2ray", "sing-box")
+
+
+def orphan_proxy_pids(port, binary_hint, master_pid):
+    """processes whose argv[0] looks like a proxy daemon, that listen on
+    -l <port>, and are NOT children of master_pid (orphans from a previous
+    router run, supervisord copies, manual launches)."""
+    out = []
+    me = os.getpid()
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        pid = int(d)
+        if pid == me:
+            continue
+        try:
+            raw = open("/proc/%d/cmdline" % pid, "rb").read()
+            cl = [c.decode("utf-8", "replace") for c in raw.split(b"\0") if c]
+            ppid = int(re.search(r"^PPid:\s*(\d+)",
+                                 open("/proc/%d/status" % pid).read(), re.M).group(1))
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not cl or ppid == master_pid:
+            continue
+        base = os.path.basename(cl[0])
+        names = set(PROXY_BINARIES) | ({os.path.basename(str(binary_hint))} if binary_hint else set())
+        if base not in names:
+            continue
+        try:
+            i = cl.index("-l") + 1
+            if i >= len(cl) or cl[i] != str(port):
+                continue
+        except ValueError:
+            continue
+        out.append({"pid": pid, "ppid": ppid, "cmd": " ".join(cl)[:120]})
+    return out
+
+
+def kill_orphan(pid, grace=1.5):
+    """SIGTERM -> SIGKILL for a NON-child process (init reaps it)."""
+    import time as _t
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    end = _t.time() + grace
+    while _t.time() < end:
+        try:
+            st = open("/proc/%d/status" % pid).read()
+        except OSError:
+            return True
+        if re.search(r"^State:\s*Z", st, re.M):
+            return True
+        _t.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except OSError:
+        return True
+
+
 class ManagedProxy:
     def __init__(self, name, cfg, argv, uid, spawn=None, sleeper=None, timer=None, line=None):
         self.name, self.cfg, self.argv, self.uid = name, cfg, argv, uid
@@ -507,9 +568,28 @@ class ProxySupervisor(threading.Thread):
         sib_alive = any(self.proxies.get(k2) and self.proxies[k2].proc
                         and self.proxies[k2].proc.poll() is None for k2 in siblings)
         if my_port and not sib_alive and self._port_wait(my_port, timeout=0.5):
+            # port busy by a foreign listener -> try TAKEOVER of stale proxies
+            # (orphans of previous router runs / supervisor copies of the SAME
+            # managed line). Only when the line allows it (takeover!=false).
+            if cfg.get("takeover", False):
+                for o in orphan_proxy_pids(my_port, cfg.get("binary"), os.getpid()):
+                    self.log("%s: takeover killing stale proxy pid=%d ppid=%d [%s]"
+                             % (key, o["pid"], o["ppid"], o["cmd"]))
+                    kill_orphan(o["pid"])
+                if not self._port_wait(my_port, timeout=0.8):
+                    self.on_status(key, "takeover", None)
+                    try:
+                        p.start_once()
+                        self.on_status(key, p.state, p.proc.pid)
+                        return
+                    except OSError as e:
+                        p.state = "deferred"
+                        self.log("%s: spawn failed after takeover: %s" % (key, e))
+                        return
             p.state = "external"
-            self.log("%s: port %s already listening (external instance?), not spawning"
-                     % (key, my_port))
+            self.log("%s: port %s held by a live non-orphan listener (managed by "
+                     "supervisor/another tool?) - not spawning; stop it there or set "
+                     "'takeover': false" % (key, my_port))
             self.on_status(key, "external", None)
             return
         try:

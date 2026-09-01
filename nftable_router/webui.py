@@ -3,13 +3,13 @@
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260901-2230"
+UI_VERSION = "20260901-2300"
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nft-route 管理台</title>
-<script>var UI_VER="20260901-2230";</script>
+<script>var UI_VER="20260901-2300";</script>
 <style>
 :root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
 --green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
@@ -897,6 +897,7 @@ function ago(t){if(t==null)return"-";var s=Math.max(0,Date.now()/1000-t);
  return s<90?Math.round(s)+"s前":s<5400?Math.round(s/60)+"m前":Math.round(s/3600)+"h前"}
 function tdTb(tbl,rows){var t=$(tbl);t.innerHTML="";if(t.tHead)t.tHead.remove();return t}
 function putRows(t,cols,rows){
+ t.innerHTML="";   // self-clearing: repeated refreshes must not accumulate rows
  var th=document.createElement("thead");var tr=document.createElement("tr");
  cols.forEach(function(c){tr.appendChild(el("th","",c))});th.appendChild(tr);t.appendChild(th);
  var tb=document.createElement("tbody");
@@ -964,7 +965,9 @@ function loadInfo(){api("/api/health").then(function(d){
       w.rss_mb||"",w.uptime!=null?Math.round(w.uptime/60):"",w.name]})));
  var ext=(d.proxies&&d.proxies.external)||[];
  $("i-extwrap").style.display=ext.length?"block":"none";
- if(ext.length)putRows($("i-ext"),["pid","ppid","user","cmd"],ext.map(function(e){return[e.pid,e.ppid,e.user,e.cmd]}));
+ if(ext.length)putRows($("i-ext"),["pid","父进程","user","cmd"],
+  ext.map(function(e){return[e.pid,(e.ppid!=null?("ppid "+e.ppid+(e.ppname?" ("+e.ppname+")":"")):""),e.user,e.cmd]}));
+ else $("i-ext").innerHTML="";
  if(d.error){var er=el("div","bad","health: "+d.error);$("i-master").appendChild(er)}
  }).catch(function(e){$("i-round").textContent="health 加载失败: "+e})}
 $("i-refresh").onclick=loadInfo;

@@ -437,7 +437,13 @@ def health_snapshot(app):
                 cl = p.info.get("cmdline") or []
                 if cl and os.path.basename(cl[0]) in ("ss-redir", "ss-local", "v2ray", "sing-box") \
                         and p.info["pid"] not in procs:
+                    ppname = ""
+                    try:
+                        ppname = psutil.Process(p.info["ppid"]).name()
+                    except Exception:
+                        pass
                     res["proxies"]["external"].append({"pid": p.info["pid"], "ppid": p.info["ppid"],
+                                                       "ppname": ppname,
                                                        "user": p.info.get("username"),
                                                        "cmd": " ".join(cl)[:100]})
         except Exception:
