@@ -831,6 +831,18 @@ def install_proxy_chain_rules():
                 chain_disabled.add(name)
             else:
                 syslog.syslog(syslog.LOG_WARNING, "line %s: %s -- no skuid rules for it" % (name, e))
+    # duplicate run-users poison ONLY the lines involved: quarantine each
+    # holder (drop its identity -> no stamp rules, no autostart) and carry on
+    # with the rest. (webadmin refuses to SAVE such a config; this path exists
+    # so a hand-edited/leftover dup cannot disable all proxy management.)
+    dup_names, dup_msgs = pmm.duplicate_users(config["proxy"])
+    for msg in dup_msgs:
+        print(tf.format("{msg:s,bg_red,black}", msg="[-] %s (both lines UNMANAGED until fixed)" % msg))
+        syslog.syslog(syslog.LOG_CRIT, "duplicate run-user: %s" % msg)
+    for name in sorted(dup_names):
+        uid_cache[name] = None
+        managed.pop(name, None)
+        chain_disabled.add(name)
     # PORT-chain consumers: their OWN line skuid is the only anchor of the
     # redirect rule; with an empty run-user the egress would silently leak
     # direct instead of chaining -> fail closed (mark-type upstreams are fine

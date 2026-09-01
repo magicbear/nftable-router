@@ -326,6 +326,9 @@ def validate_config(cfg):
             pmm.validate_chain(proxy)
         except Exception as e:
             errors.append("proxy chain: %s" % e)
+        _dup_names, dup_msgs = pmm.duplicate_users(proxy)
+        for m in dup_msgs:
+            errors.append("proxy chain: %s" % m)
     return errors
 
 

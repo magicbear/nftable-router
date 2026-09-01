@@ -314,21 +314,37 @@ def instances_of(name, cfg):
     return out
 
 
-def validate_chain(proxy_cfgs):
-    """Returns ordered list [deepest dependency first]. Raises ValueError
-    describing the first problem found (unknown/unmanaged/self/cycle).
-    Also enforces GLOBAL skuid uniqueness: one run-user == one line."""
-    seen_users = {}
+def duplicate_users(proxy_cfgs):
+    """GLOBAL skuid uniqueness: one run-user identifies exactly ONE line.
+    Returns (offending_names:set, messages:list[str]). Deliberately NOT part
+    of validate_chain: a collision poisons ONLY the lines involved, so the
+    router quarantines exactly those (webadmin blocks saving new collisions
+    up-front); a leftover dup in a hand-edited config must never take all
+    proxy management down with it."""
+    by_identity = {}
     for name, cfg in proxy_cfgs.items():
         u = cfg.get("uid")
         if u is None or (isinstance(u, str) and not u.strip()):
             continue
-        key = uid_identity(u)
-        if key in seen_users:
-            raise ValueError("lines %s and %s bind the same run-user (%s) -- "
-                             "a skuid may identify exactly ONE line"
-                             % (seen_users[key], name, u))
-        seen_users[key] = name
+        by_identity.setdefault(uid_identity(u), []).append((name, u))
+    names, msgs = set(), []
+    for ident in sorted(by_identity, key=str):
+        holders = by_identity[ident]
+        if len(holders) < 2:
+            continue
+        for n, _ in holders:
+            names.add(n)
+        msgs.append("lines %s bind the same run-user (%s) -- a skuid may identify exactly ONE line"
+                    % (" and ".join(sorted(n for n, _ in holders)), holders[0][1]))
+    return names, msgs
+
+
+def validate_chain(proxy_cfgs):
+    """Returns ordered list [deepest dependency first]. Raises ValueError
+    describing the first problem found (unknown/unmanaged/self/cycle).
+    NOTE: run-user uniqueness is checked by duplicate_users() separately so a
+    collision can quarantine just the involved lines instead of disabling
+    every managed proxy at once."""
     for name, cfg in proxy_cfgs.items():
         up = upstream_of(cfg)
         if up is None:

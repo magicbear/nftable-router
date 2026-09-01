@@ -145,26 +145,23 @@ def test_chain_validation():
 
 
 def test_uid_uniqueness():
-    print("[2b] two lines must not bind one run-user (skuid uniqueness)")
+    print("[2b] duplicate run-user -> per-line quarantine (NOT global fail)")
     dup = {
         "A": _cfg(port=10506, uid=1200, upstream=None),
         "B": _cfg(port=10507, uid=1200, upstream=None),  # same numeric uid
+        "C": _cfg(port=10508, uid=1201, upstream=None),  # innocent
     }
-    try:
-        pm.validate_chain(dup)
-        check("duplicate uid rejected", False)
-    except ValueError as e:
-        check("duplicate uid rejected", True)
-        check("names both lines", "A" in str(e) and "B" in str(e), str(e))
-    # name vs its numeric uid resolve to the same identity -> also rejected
+    names, msgs = pm.duplicate_users(dup)
+    check("A and B flagged, C untouched", names == {"A", "B"}, str(names))
+    check("message names both lines", msgs and "A" in msgs[0] and "B" in msgs[0] and "1200" in msgs[0], str(msgs))
+    # validate_chain no longer explodes -> a hand-edited dup must NOT disable
+    # every managed proxy, only the involved lines get quarantined upstream
+    check("validate_chain tolerates dup (quarantine handles it)", not _raises(pm.validate_chain, dup))
+    # name vs numeric uid resolving to same account also caught
     dup2 = {"A": _cfg(uid=1200), "B": _cfg(port=10507, uid="1200")}
-    check("int vs str same uid rejected", _raises(pm.validate_chain, dup2))
-    # distinct uids pass
-    dup3 = {"A": _cfg(uid=1200), "B": _cfg(port=10507, uid=1201)}
-    check("distinct uids pass", not _raises(pm.validate_chain, dup3))
-    # blank uids are not identities -> duplicates of blank are fine
-    dup4 = {"A": _cfg(uid=""), "B": _cfg(port=10507, uid=None)}
-    check("blank uids not counted", not _raises(pm.validate_chain, dup4))
+    check("int vs str same uid flagged", pm.duplicate_users(dup2)[0] == {"A", "B"})
+    check("distinct uids pass", pm.duplicate_users({"A": _cfg(uid=1200), "B": _cfg(uid=1201)})[0] == set())
+    check("blank uids are not identities", pm.duplicate_users({"A": _cfg(uid=""), "B": _cfg(uid=None)})[0] == set())
 
 
 def test_chain_rules():
