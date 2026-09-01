@@ -52,7 +52,9 @@ label{color:var(--dim)}
  <nav>
   <button data-t=flow class=sel>实时流量</button>
   <button data-t=bind>出口绑定</button>
-  <button data-t=cfg>配置编辑</button>
+  <button data-t=proxy>线路管理</button>
+  <button data-t=rules>路由规则</button>
+  <button data-t=cfg>配置JSON</button>
   <button data-t=info>状态</button>
  </nav></header>
 <main>
@@ -82,6 +84,20 @@ label{color:var(--dim)}
  </div></div>
 </section>
 
+<section id=s-proxy>
+ <div class=bar><button id=p-refresh>刷新</button><button id=p-add>+ 新增线路</button>
+  <label><input type=checkbox id=p-autoreload checked> 保存后重载主进程</label>
+  <span class=dim>托管线路(daemon)与 ip-rule 线路统一在此管理；unknown 字段在高级 JSON 中保留</span></div>
+ <div id=ptable></div>
+ <div id=pedit class=card style="display:none"></div>
+</section>
+
+<section id=s-rules>
+ <div class=bar><button id=r-refresh>刷新</button><button id=r-add>+ 新增优先级</button>
+  <label><input type=checkbox id=r-autoreload checked> 保存后重载主进程</label>
+  <span class=dim>规则自上而下匹配；每优先级可映射多条线路；条件键同 nft_route.json rules 语义</span></div>
+ <div id=rtable></div>
+</section>
 <section id=s-cfg>
  <div class=bar>
   <button id=c-reload>读取配置</button><button id=c-fmt>格式化</button>
@@ -224,6 +240,8 @@ tabs.forEach(function(b){b.onclick=function(){
  document.querySelectorAll("main>section").forEach(function(s){s.classList.remove("sel")});
  $("s-"+b.dataset.t).classList.add("sel");
  if(b.dataset.t=="bind")loadBind();
+ if(b.dataset.t=="proxy"){if(!CFG)loadCfg(renderProxy);else renderProxy()}
+ if(b.dataset.t=="rules"){if(!CFG)loadCfg(renderRules);else renderRules()}
  if(b.dataset.t=="info")loadInfo();}});
 
 // ---------- bind tab ----------
@@ -281,10 +299,224 @@ $("b-add").onclick=function(){
   if(r.ok){toast("已绑定: "+body.ifname+" mark 0x"+mark.toString(16)+" · 主进程已收到重载","good");loadBind()}
   else toast("拒绝: "+(r.error||JSON.stringify(r.errors||r)),"bad")}).catch(function(e){toast("请求失败 "+e,"bad")})};
 
+// ---------- shared config state ----------
+var CFG=null;
+function knownOnly(o,keys){var r={};for(var k in o){if(keys.indexOf(k)<0)r[k]=o[k]}return r}
+function pushCfg(reload,cb){
+ api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({config:CFG,reload:!!reload})}).then(function(r){
+   if(r.ok){toast("已保存"+(reload&&r.reload&&r.reload.ok?" 并通知主进程重载(pid "+r.reload.pid+")":" · 未重载"),"good");if(cb)cb()}
+   else{var msg=(r.errors||[r.error||JSON.stringify(r)]).join("\\n");
+    toast("拒绝保存:\\n"+msg,"bad");$("c-msg")&&($("c-msg").innerHTML="<span class=bad>"+msg.replace(/\\n/g,"<br>")+"</span>")}})}
+
+// ---------- proxy lines ----------
+var PROXY_COLS=["mark","weight","port","upstream","daemon","uid","server","server_port","cipher",
+ "password","password_file","obfs","obfs_param","protocol","protocol_param","mode","binary","config",
+ "bind","proxy_ip","test_dns","test_url","ipv4","ipv6","udp_v4","udp_v6","fullcone","autostart","restart"];
+function proxyReferrers(name){
+ var refs=[];
+ Object.keys(CFG.proxy||{}).forEach(function(k){if(CFG.proxy[k]&&CFG.proxy[k].upstream==name)refs.push("proxy:"+k)});
+ (CFG.rules||[]).forEach(function(rr,i){if(rr&&Object.prototype.hasOwnProperty.call(rr,name))refs.push("rules#"+i)});
+ return refs}
+function renderProxy(){
+ var box=$("ptable");box.innerHTML="";if(!CFG)return;
+ var t=el("table");t.innerHTML="<thead><tr><th>线路</th><th>mark</th><th>端口/ip-rule</th><th>托管</th><th>上游链</th><th>能力</th><th>bind</th><th>测试</th><th>引用</th><th></th></tr></thead>";
+ var tb=document.createElement("tbody");
+ Object.keys(CFG.proxy||{}).forEach(function(name){
+  var c=CFG.proxy[name]||{};var tr=el("tr");
+  tr.appendChild(el("td","good",name));
+  tr.appendChild(el("td","",c.mark!=null?("0x"+(c.mark>>>0).toString(16)+" ("+c.mark+")"):"-"));
+  tr.appendChild(el("td","",c.port?("tproxy :"+c.port):"ip-rule"));
+  tr.appendChild(el("td",c.daemon?"line":"dim",c.daemon||"-"));
+  tr.appendChild(el("td","dim",c.upstream?("→ "+c.upstream):""));
+  var caps=[];["ipv4","ipv6","udp_v4","udp_v6","fullcone"].forEach(function(k){if(c[k])caps.push(k.replace("_"," "))});
+  tr.appendChild(el("td","dim",caps.join(" ")));
+  tr.appendChild(el("td","dim",c.bind||""));
+  tr.appendChild(el("td","dim",c.test_url?"ok":"-"));
+  var refs=proxyReferrers(name);
+  tr.appendChild(el("td","dim",refs.length+"" ));
+  var td=el("td");
+  var be=el("button","","编辑");be.onclick=function(){editProxy(name)};td.appendChild(be);
+  var bd=el("button"," bad"," 删");bd.onclick=function(){delProxy(name)};td.appendChild(bd);
+  tr.appendChild(td);tb.appendChild(tr)});
+ t.appendChild(tb);box.appendChild(t)}
+function fieldRow(label,val,type,ph){
+ var wrap=el("label","",label+" ");wrap.style.cssText="display:inline-block;margin:3px 10px 3px 0;color:var(--dim);min-width:120px";
+ var inp=document.createElement("input");inp.dataset.k="";inp.value=val==null?"":(type=="bool"?(val?"1":""):String(val));
+ if(type=="bool"){var sel=document.createElement("select");[["","(未设置)"],["1","true"],["0","false"]].forEach(function(o){
+  var op=el("option","",o[1]);op.value=o[0];if(String(val)===o[0]||(val==null&&o[0]===""))op.selected=true;sel.appendChild(op)});
+  sel.dataset.k="1";wrap.appendChild(sel);wrap.appendChild(inp);inp.style.display="none";return wrap}
+ inp.placeholder=ph||"";inp.dataset.k="1";wrap.appendChild(inp);return wrap}
+function editProxy(name){
+ var isNew=!name;var src=(CFG.proxy||{})[name]||{"mark":nextMark(),"weight":1,"ipv4":true,"ipv6":false};
+ var c=JSON.parse(JSON.stringify(src));
+ var box=$("pedit");box.style.display="block";box.innerHTML="";
+ box.appendChild(el("b","",(isNew?"新增线路":"编辑线路: ")+name));
+ var form=el("div");form.id="pform";box.appendChild(form);
+ var names=["name","mark","weight","port","upstream","daemon","uid","server","server_port","cipher","password","password_file","mode","bind","proxy_ip","test_url","restart_max","restart_window"];
+ var F={name:{l:"线路名",v:isNew?"":name},mark:{l:"fwmark",v:c.mark},weight:{l:"权重",v:c.weight},
+  port:{l:"透明端口(空=ip-rule线路)",v:c.port},upstream:{l:"上游线路(chaining)",v:c.upstream,sel:Object.keys(CFG.proxy||{}).filter(function(x){return x!=name})},
+  daemon:{l:"托管进程",v:c.daemon,sel:["","ss-redir","v2ray","sing-box","custom"]},
+  uid:{l:"运行用户",v:c.uid},server:{l:"服务器",v:c.server||c.proxy_ip},server_port:{l:"服务器端口",v:c.server_port},
+  cipher:{l:"加密",v:c.cipher},password:{l:"密码(内联,慎用)",v:c.password},password_file:{l:"密码文件",v:c.password_file},
+  mode:{l:"模式",v:c.mode,sel:["","tcp","tcp_and_udp"]},bind:{l:"bind ip:port",v:c.bind},
+  proxy_ip:{l:"proxy_ip",v:c.proxy_ip},test_url:{l:"test_url",v:c.test_url},
+  restart_max:{l:"重启窗口上限",v:(c.restart||{}).max},restart_window:{l:"窗口(秒)",v:(c.restart||{}).window}};
+ for(var fk in F){var meta=F[fk];
+  var row=el("div");row.style.cssText="display:inline-block;margin:2px 12px 2px 0";
+  row.appendChild(el("label","",meta.l+" "));
+  var inp;
+  if(meta.sel){inp=document.createElement("select");
+   var empty=el("option","","(无)");empty.value="";inp.appendChild(empty);
+   meta.sel.forEach(function(o){var op=el("option","",String(o));op.value=String(o);if(String(meta.v)===String(o))op.selected=true;inp.appendChild(op)});
+   if(meta.sel.indexOf(meta.v)<0&&meta.v!=null&&meta.v!==""){var extra=el("option","",String(meta.v));extra.value=String(meta.v);extra.selected=true;inp.appendChild(extra)}}
+  else{inp=document.createElement("input");inp.value=meta.v==null?"":String(meta.v);inp.dataset.fk=fk;
+   if(fk=="mark"||fk=="weight"||fk=="port"||fk=="server_port")inp.type="number"}
+  inp.dataset.fk=fk;row.appendChild(inp);form.appendChild(row)}
+ var capsRow=el("div");form.appendChild(capsRow);
+ ["ipv4","ipv6","udp_v4","udp_v6","fullcone","autostart"].forEach(function(k){
+  var lb=el("label");lb.style.cssText="margin-right:14px";
+  var cb=document.createElement("input");cb.type="checkbox";cb.dataset.fk=k;
+  if(k=="autostart"){if(c[k]!==false)cb.checked=true}
+  else cb.checked=!!c[k];
+  lb.appendChild(cb);lb.appendChild(document.createTextNode(" "+k));capsRow.appendChild(lb)});
+ var rest=knownOnly(c,PROXY_COLS);
+ var adv=document.createElement("details");
+ adv.appendChild(el("summary","dim","高级字段 (其他键保留 / 原始JSON编辑)"));
+ var ta=document.createElement("textarea");ta.id="padv";ta.value=JSON.stringify(rest,null,2);ta.style.height="160px";
+ adv.appendChild(ta);box.appendChild(adv);
+ var bar=el("div","bar");
+ var save=el("button","good","保存线路");
+ save.onclick=function(){
+  var out={};var nn=$("pform");var vals={};
+  nn.querySelectorAll("input,select").forEach(function(x){vals[x.dataset.fk]=x});
+  function num(f){var x=vals[f];var v=x.value.trim();if(v==="")return null;return parseInt(v,10)}
+  if(vals.name.value.trim())nn.name_=1;
+  var newName=(nn.querySelector("[data-fk=name]")||{value:name}).value.trim()||name;
+  out.mark=num("mark");out.weight=num("weight");
+  var p=num("port");if(p!=null)out.port=p;
+  var up=vals.upstream.value;if(up)out.upstream=up;
+  var dn=vals.daemon.value;if(dn)out.daemon=dn;
+  ["uid","server","cipher","password","password_file","mode","bind","proxy_ip","test_url"].forEach(function(f){
+   var v=(vals[f].value||"").trim();if(v)out[f]=v;
+   if(f=="server"&&v)out.proxy_ip=out.proxy_ip||v});
+  var sp=num("server_port");if(sp!=null)out.server_port=sp;
+  ["ipv4","ipv6","udp_v4","udp_v6","fullcone"].forEach(function(f){out[f]=!!vals[f].checked});
+  out.autostart=!!vals.autostart.checked;
+  var rmx=num("restart_max"),rmw=num("restart_window");
+  if(rmx!=null||rmw!=null)out.restart={max:rmx==null?5:rmx,window:rmw==null?300:rmw};
+  var adv;try{adv=JSON.parse($("padv").value||"{}")}catch(e){return toast("高级字段不是合法 JSON","bad")}
+  for(var ak in adv)out[ak]=adv[ak];
+  if(out.mark==null)return toast("mark 必填","bad");
+  if(!isNew&&newName!=name){ if((CFG.proxy||{})[newName])return toast("线路名已存在","bad"); delete CFG.proxy[name]}
+  CFG.proxy=CFG.proxy||{};CFG.proxy[newName]=out;
+  pushCfg($("p-autoreload").checked,function(){$("pedit").style.display="none";renderProxy();renderRules()})};
+ var cancel=el("button","dim","取消");cancel.onclick=function(){$("pedit").style.display="none"};
+ bar.appendChild(save);bar.appendChild(cancel);box.appendChild(bar);
+ box.scrollIntoView()}
+function nextMark(){var used={};Object.keys(CFG.proxy||{}).forEach(function(k){used[(CFG.proxy[k]||{}).mark]=1});
+ var m=1;while(used[m]||m===0x99||m===0x100)m++;return m}
+function delProxy(name){
+ var refs=proxyReferrers(name);
+ if(refs.length)return toast("无法删除: 被 "+refs.join(", ")+" 引用（先改上游/规则）","bad");
+ if(!confirm("删除线路 "+name+" 并重载?"))return;
+ delete CFG.proxy[name];
+ pushCfg($("p-autoreload").checked,function(){renderProxy();renderRules()})}
+$("p-refresh").onclick=function(){loadCfg(renderProxy)};
+$("p-add").onclick=function(){editProxy(null)};
+
+// ---------- rules ----------
+var GEO_KEYS=["any","from","resolve","cidr","country_name","region_name","city_name","owner_domain",
+ "isp_domain","country_code","anycast","idc","base_station"];
+var VAL_KEYS={anycast:["","ANYCAST"],idc:["","IDC"],base_station:["","基站"]};
+function ruleLabel(cond){
+ if(cond===true)return "any";
+ if(typeof cond!="object")return "?";
+ var parts=[];Object.keys(cond).forEach(function(k){
+  var v=cond[k];
+  if(k=="any"&&v){parts.push("any");return}
+  if(v instanceof Array)parts.push(k+"="+v.length+"项");
+  else parts.push(k+"="+String(v))});
+ return parts.join(" · ")}
+function renderRules(){
+ var box=$("rtable");box.innerHTML="";if(!CFG)return;
+ CFG.rules=CFG.rules||[];
+ CFG.rules.forEach(function(prio,pi){
+  var card=el("div","card");
+  var head=el("div","bar");
+  head.appendChild(el("b","","优先级 "+pi));
+  var up=el("button","dim","↑");up.onclick=function(){if(pi>0){var a=CFG.rules;var x=a.splice(pi,1)[0];a.splice(pi-1,0,x);pushCfg($("r-autoreload").checked,renderRules)}};
+  var dn=el("button","dim","↓");dn.onclick=function(){if(pi<CFG.rules.length-1){var a=CFG.rules;var x=a.splice(pi,1)[0];a.splice(pi+1,0,x);pushCfg($("r-autoreload").checked,renderRules)}};
+  var rm=el("button"," bad","删除优先级");rm.onclick=function(){if(!confirm("删除优先级 "+pi+"?"))return;CFG.rules.splice(pi,1);pushCfg($("r-autoreload").checked,renderRules)};
+  head.appendChild(up);head.appendChild(dn);head.appendChild(rm);card.appendChild(head);
+  Object.keys(prio||{}).forEach(function(line){
+   var row=el("div");row.style.cssText="display:flex;gap:8px;align-items:center;margin:4px 0";
+   var sel=document.createElement("select");
+   Object.keys(CFG.proxy||{}).forEach(function(pn){var op=el("option","",pn);op.value=pn;if(pn==line)op.selected=true;sel.appendChild(op)});
+   sel.onchange=function(){var v=prio[line];delete prio[line];prio[sel.value]=v;pushCfg($("r-autoreload").checked,renderRules)};
+   row.appendChild(sel);
+   var cond=prio[line];
+   var txt=el("span","dim",ruleLabel(cond));row.appendChild(txt);
+   var ed=el("button","dim","编辑条件");ed.onclick=function(){editCond(pi,line)};row.appendChild(ed);
+   var dl=el("button"," bad","移除");dl.onclick=function(){if(!confirm("从优先级 "+pi+" 移除 "+line+"?"))return;delete prio[line];pushCfg($("r-autoreload").checked,renderRules)};
+   row.appendChild(dl);card.appendChild(row)});
+  var addl=el("button","dim","+ 本优先级加线路");
+  addl.onclick=function(){
+   var name=prompt("线路名 (必须已在线路管理中存在)","");
+   if(!name)return;if(!CFG.proxy[name])return toast("线路不存在: "+name,"bad");
+   if(prio[name])return toast("已存在","warn");
+   prio[name]={any:true};pushCfg($("r-autoreload").checked,renderRules)};
+  card.appendChild(addl);
+  box.appendChild(card)})}
+function editCond(pi,line){
+ var prio=CFG.rules[pi];var cur=prio[line];
+ if(cur===true)cur={any:true};
+ if(typeof cur!="object")cur={};
+ var box=$("pedit");box.style.display="block";box.innerHTML="";
+ box.appendChild(el("b","","条件编辑: 优先级 "+pi+" · "+line));
+ var form=el("div");form.id="cform";box.appendChild(form);
+ function condRow(key,vals){
+  var row=el("div");row.style.cssText="display:flex;gap:8px;margin:3px 0;align-items:center";
+  row.appendChild(el("label","",key));
+  var inp=document.createElement("input");inp.style.minWidth="420px";inp.dataset.key=key;
+  if(key=="any"){var sel=document.createElement("select");
+   [["","不启用"],["1","any = true"]].forEach(function(o){var op=el("option","",o[1]||"(无)");op.value=o[0];
+    if((o[0]=="1")==!!cur.any)op.selected=true;sel.appendChild(op)});
+   sel.dataset.key="any";row.appendChild(sel)}
+  else if(VAL_KEYS[key]){var sel2=document.createElement("select");
+   [["","不启用"],["1",VAL_KEYS[key][1]||"ANYCAST"]].forEach(function(o){
+    var op=el("option","",o[0]?("匹配 "+o[1]):"(无)");op.value=o[0];
+    if((cur[key]&&cur[key].length)>0==!!o[0])op.selected=true;sel2.appendChild(op)});
+   sel2.dataset.key=key;row.appendChild(sel2)}
+  else{inp.value=(cur[key]||[]).join(", ");row.appendChild(inp)}
+  form.appendChild(row)}
+ condRow("any");["from","cidr","resolve","country_code","country_name","region_name","city_name","owner_domain","isp_domain"].forEach(function(k){condRow(k)});
+ condRow("anycast");condRow("idc");condRow("base_station");
+ var bar=el("div","bar");
+ var save=el("button","good","保存条件");
+ save.onclick=function(){
+  var out={};
+  form.querySelectorAll("input,select").forEach(function(x){
+   var k=x.dataset.key,v=x.value;
+   if(k=="any"){if(v=="1")out.any=true;return}
+   if(VAL_KEYS[k]){if(v=="1")out[k]=[VAL_KEYS[k][1]];return}
+   var arr=String(v).split(/[,，\s]+/).filter(function(s){return s.length>0});
+   if(arr.length)out[k]=arr});
+  if(!Object.keys(out).length)return toast("至少设置一个条件","bad");
+  if(out.any&&Object.keys(out).length>1)delete out.any; // any+specific -> drop any
+  prio[line]=out;
+  pushCfg($("r-autoreload").checked,function(){renderRules();$("pedit").style.display="none"})};
+ var cancel=el("button","dim","取消");cancel.onclick=function(){$("pedit").style.display="none"};
+ bar.appendChild(save);bar.appendChild(cancel);box.appendChild(bar)}
+$("r-refresh").onclick=function(){loadCfg(renderRules)};
+$("r-add").onclick=function(){if(!Object.keys(CFG.proxy||{}).length)return toast("先创建线路","bad");
+ CFG.rules.push({});pushCfg($("r-autoreload").checked,renderRules)};
+
 // ---------- config tab ----------
-function loadCfg(){api("/api/config").then(function(d){
- $("c-box").value=JSON.stringify(d.config,null,3);$("c-path").textContent=d.path||"";
- $("c-msg").innerHTML="<span class=dim>已加载 "+(d.path||"")+"</span>"}).catch(function(e){toast("读取失败 "+e,"bad")})}
+function loadCfg(cb){api("/api/config").then(function(d){
+ CFG=d.config;$("c-box").value=JSON.stringify(d.config,null,3);$("c-path").textContent=d.path||"";
+ $("c-msg").innerHTML="<span class=dim>已加载 "+(d.path||"")+"</span>";
+ if(cb)cb();renderProxy();renderRules()}).catch(function(e){toast("读取失败 "+e,"bad")})}
 $("c-reload").onclick=loadCfg;
 $("c-fmt").onclick=function(){try{$("c-box").value=JSON.stringify(JSON.parse($("c-box").value),null,3);$("c-msg").innerHTML="<span class=good>已格式化</span>"}catch(e){$("c-msg").innerHTML="<span class=bad>"+e+"</span>"}};
 $("c-check").onclick=function(){var cfg;try{cfg=JSON.parse($("c-box").value)}catch(e){return $("c-msg").innerHTML="<span class=bad>JSON 错误: "+e+"</span>"}
