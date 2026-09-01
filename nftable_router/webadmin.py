@@ -329,6 +329,34 @@ def validate_config(cfg):
     return errors
 
 
+PROXY_STATE_FILE = "/run/nft_route_proxies.json"
+
+
+def proxy_states():
+    try:
+        with open(PROXY_STATE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def proxy_log_tail(key, tail=16384):
+    safe = re.sub(r"[^A-Za-z0-9._#\-]", "", str(key))
+    if not safe:
+        return {"ok": False, "error": "bad key"}
+    path = os.path.join("/var/log/nft-route", safe.replace("/", "_") + ".log")
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > tail:
+                f.seek(size - tail)
+            data = f.read(tail)
+        return {"ok": True, "path": path, "size": size, "text": data.decode("utf-8", "replace")}
+    except OSError as e:
+        return {"ok": False, "path": path, "error": str(e)}
+
+
 def health_snapshot(app):
     """read-only process + line-test state; never raises (errors -> fields)"""
     res = {"ts": round(time.time(), 1), "master": None, "workers": [], "dns": None,
@@ -389,6 +417,7 @@ def health_snapshot(app):
                 res["workers"].append(ent)
     # --- managed proxies expected from config
     if cfg and psutil is not None and pmm is not None:
+        proxy_state = proxy_states()
         managed = {k: v for k, v in cfg.get("proxy", {}).items() if pmm.is_managed(v)}
         claimed = set()
         for name, c in managed.items():
@@ -427,6 +456,13 @@ def health_snapshot(app):
                         except Exception as e:
                             ent["state"] = "error %s" % e
                         break
+                key = name if (ent["tag"] in ("default", None, "")) else "%s#%s" % (name, ent["tag"])
+                st0 = (proxy_state or {}).get(key) or (proxy_state or {}).get(name)
+                if st0:
+                    ent["sup"] = st0
+                    if st0.get("state") in ("deferred", "gaveup", "backoff", "external", "error") and ent["state"] != "running":
+                        ent["state"] = st0.get("state")
+                        ent["why"] = "查看日志 (%s)" % key
                 want["instances"].append(ent)
             run_n = sum(1 for e in want["instances"] if e["state"] == "running")
             want["running"] = "%d/%d" % (run_n, len(want["instances"]))
@@ -1134,6 +1170,13 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(urlparse(self.path).query)
             ips = (q.get("ips", [""])[0] or "").replace(",", " ").split()
             self.send_json(200, geo_lookup(self.cfg_path(), ips))
+        elif path == "/api/proxy_log":
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                tl = max(1024, min(200000, int(q.get("tail", ["16384"])[0])))
+            except ValueError:
+                tl = 16384
+            self.send_json(200, proxy_log_tail(q.get("line", [""])[0], tl))
         elif path == "/api/health":
             try:
                 self.send_json(200, health_snapshot(self.app))

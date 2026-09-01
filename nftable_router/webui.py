@@ -3,13 +3,13 @@
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260902-0130"
+UI_VERSION = "20260902-0240"
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nft-route 管理台</title>
-<script>var UI_VER="20260902-0130";</script>
+<script>var UI_VER="20260902-0240";</script>
 <style>
 :root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
 --green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
@@ -992,11 +992,15 @@ function loadInfo(){api("/api/health").then(function(d){
   var its=(p.instances&&p.instances.length)?p.instances:[{tag:"default",state:p.state,pid:p.pid,uptime:p.uptime,cpu:p.cpu,port:p.port}];
   its.forEach(function(e){var st=e.state||"-";
    var stTxt=st+(p.instances?(" ("+ (p.running||"?") +")"):"");
-   prows.push([(e.tag==="default"?p.managed:p.managed+"#"+e.tag),p.daemon||"",
+   var key=(e.tag==="default")?p.managed:(p.managed+"#"+e.tag);
+   var op=el("td");
+   var lb=el("button","dim","日志");lb.style.padding="0 8px";lb.onclick=function(){logView(key)};op.appendChild(lb);
+   if(e.why)op.appendChild(el("span","bad"," "+e.why));
+   prows.push([key,p.daemon||"",
     (e.port?(":"+e.port):"ip-rule"),p.upstream?("→ "+p.upstream):"",
     el("span",st.indexOf("running")>=0?"good":(st==="not running"?"bad":"dim"),stTxt),
-    e.pid||"",e.uptime!=null?Math.round(e.uptime/60)+"m":"",e.cpu!=null?e.cpu+"%":""]);});});
- if(prows.length)putRows(pr,["线路","daemon","端口","上游","状态","pid","运行","cpu"],prows);
+    e.pid||"",e.uptime!=null?Math.round(e.uptime/60)+"m":"",e.cpu!=null?e.cpu+"%":"",op]);});});
+ if(prows.length)putRows(pr,["线路","daemon","端口","上游","状态","pid","运行","cpu","操作"],prows);
  else pr.appendChild(el("div","dim","无托管代理(配置加 daemon 字段后接管)"));
  // workers tree
  var wks=d.workers||[];var pt=$("i-procs");pt.innerHTML="";
@@ -1024,6 +1028,25 @@ function testLine(name,proto,family,btn){
    if(r.error)toast(name+" "+proto+" ✗ "+r.error,"bad");
    else toast((r.ok?"✓ ":"✗ ")+name+" v"+family+" "+proto.toUpperCase()+": "+det+(r.note?("　"+r.note):""),r.ok?"good":"bad");
    loadInfo()})).catch(done(function(e){toast(name+" 请求失败 "+e,"bad")})); }
+var logTimer=null;
+function logView(key){
+ openModal("日志: "+key,function(body){
+  var bar=el("div","bar");
+  var en=document.createElement("label");var cb=document.createElement("input");cb.type="checkbox";cb.id="lg_auto";cb.checked=true;
+  en.appendChild(cb);en.appendChild(document.createTextNode(" 自动刷新(2s)"));bar.appendChild(en);body.appendChild(bar);
+  var pre=el("pre","dim");pre.style.cssText="max-height:60vh;overflow:auto;white-space:pre-wrap;margin:6px 0;font-size:12px";pre.id="lg_pre";body.appendChild(pre);
+  function fetchLog(){
+   api("/api/proxy_log?line="+encodeURIComponent(key)+"&tail=32768").then(function(r){
+    var box=document.getElementById("lg_pre");if(!box)return;
+    box.textContent=r.ok?((r.size>r.text.length?("...(截断,全文件 "+r.size+" 字节)\n"):"")+r.text):("(无日志文件: "+(r.error||"")+")");
+    box.scrollTop=box.scrollHeight;
+    var a=document.getElementById("lg_auto");
+    if(logTimer&&(!a||!a.checked)){clearInterval(logTimer);logTimer=null}})}}
+  fetchLog();
+  if(logTimer)clearInterval(logTimer);
+  logTimer=setInterval(function(){var a=document.getElementById("lg_auto");
+   if(!a){clearInterval(logTimer);logTimer=null;return}if(a.checked)fetchLog();},2000);
+ },"关闭",function(){if(logTimer){clearInterval(logTimer);logTimer=null}});}
 $("i-refresh").onclick=loadInfo;
 $("i-reload").onclick=function(){
  if(!confirm("向主进程发送 SIGUSR1 执行完整重载？\\n(重读配置:egress/链/规则/worker全部重启)"))return;

@@ -907,6 +907,36 @@ def install_proxy_chain_rules():
         msg = "proxy %s: %s%s" % (name, state, (" pid=%s" % pid) if pid else "")
         print("    " + msg)
         syslog.syslog(syslog.LOG_NOTICE, msg)
+        proxy_state_update(name, state, pid)
+
+
+PROXY_STATE_FILE = "/run/nft_route_proxies.json"
+
+
+def proxy_state_update(key, state, pid=None):
+    """small cross-process state board for webadmin (spawn errors / states
+    live in the ROUTER memory otherwise invisible to the web child)"""
+    try:
+        d = {}
+        try:
+            with open(PROXY_STATE_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            if not isinstance(d, dict):
+                d = {}
+        except (OSError, ValueError):
+            d = {}
+        d[key] = {"state": state, "pid": pid, "ts": round(time.time(), 3),
+                  "log": pmm.instance_logfile(key) if pmm else None}
+        tmp = PROXY_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(d, ensure_ascii=False))
+        os.replace(tmp, PROXY_STATE_FILE)
+        try:
+            os.chmod(PROXY_STATE_FILE, 0o644)
+        except OSError:
+            pass
+    except OSError:
+        pass
 
     # chained proxies whose uid could not be resolved must not run (their
     # traffic would silently bypass the chain) -> supervise but never start

@@ -392,16 +392,61 @@ def wait_port(port, host="127.0.0.1", timeout=10.0):
     return False
 
 
-def make_uid_spawner(uid, popen=None):
+PROXY_LOG_DIR = "/var/log/nft-route"
+PROXY_LOG_MAX = 512 * 1024
+
+
+def instance_logfile(key):
+    """/var/log/nft-route/<line#tag>.log -- one per managed instance"""
+    try:
+        os.makedirs(PROXY_LOG_DIR, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(PROXY_LOG_DIR, key.replace("/", "_") + ".log")
+
+
+def make_uid_spawner(uid, popen=None, logfile=None):
     """default spawn: drop privileges to the proxy's uid before exec, so the
-    skuid-based chain/loop rules actually identify this traffic."""
+    skuid-based chain/loop rules actually identify this traffic. Child
+    stdout/stderr goes to the instance logfile (that's where -v verbosity
+    and crash reasons land); spawn failures are recorded there too."""
     def spawn(argv):
         def _pre():
             if uid is not None:
                 os.setgroups([])
                 os.setgid(int(uid))
                 os.setuid(int(uid))
-        return (popen or subprocess.Popen)(argv, preexec_fn=_pre if uid is not None else None)
+        f = subprocess.DEVNULL
+        fh = None
+        if logfile:
+            try:
+                if os.path.exists(logfile) and os.path.getsize(logfile) > PROXY_LOG_MAX:
+                    with open(logfile, "wb"):
+                        pass  # cheap rotate: truncate before each fresh spawn
+                fh = open(logfile, "ab")
+                f = fh
+            except OSError:
+                f = subprocess.DEVNULL
+        try:
+            return (popen or subprocess.Popen)(argv, stdout=f, stderr=subprocess.STDOUT,
+                                               stdin=subprocess.DEVNULL,
+                                               preexec_fn=_pre if uid is not None else None)
+        except OSError as e:
+            if logfile:
+                try:
+                    with open(logfile, "ab") as _w:
+                        _w.write(("%s spawn error: %s: %s | argv=%s\n"
+                                  % (time.strftime("%H:%M:%S"), type(e).__name__, e,
+                                     " ".join(str(a) for a in argv))).encode())
+                except OSError:
+                    pass
+            raise
+        finally:
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
     return spawn
 
 
@@ -557,7 +602,8 @@ class ProxySupervisor(threading.Thread):
                     self.log("%s: spec error, SKIPPED: %s" % (key, e))
                     self.spec_errors[key] = str(e)
                     continue
-                spawn = self._spawn or make_uid_spawner(uid_cache.get(n))
+                spawn = self._spawn or make_uid_spawner(uid_cache.get(n),
+                                                        logfile=instance_logfile(key))
                 p = ManagedProxy(key, icfg, argv, uid_cache.get(n), line=n,
                                  spawn=spawn, sleeper=self._sleep, timer=self._now)
                 self.proxies[key] = p
@@ -677,7 +723,7 @@ class ProxySupervisor(threading.Thread):
                         built[key] = self.proxies[key]   # keep running old instance
                         keys.append(key)
                     continue
-                spawn = self._spawn or make_uid_spawner(uid)
+                spawn = self._spawn or make_uid_spawner(uid, logfile=instance_logfile(key))
                 built[key] = ManagedProxy(key, icfg, argv, uid, line=n,
                                           spawn=spawn, sleeper=self._sleep, timer=self._now)
                 keys.append(key)
