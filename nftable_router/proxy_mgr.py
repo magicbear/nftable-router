@@ -110,8 +110,11 @@ def build_cmd(name, cfg):
             argv += ["--plugin", str(cfg["plugin"])]
         if cfg.get("plugin_opts"):
             argv += ["--plugin-opts", str(cfg["plugin_opts"])]
-        if str(cfg.get("mode", "tcp")).lower() in ("tcp_and_udp", "udp", "both"):
+        mode = str(cfg.get("mode", "tcp")).lower()
+        if mode in ("tcp_and_udp", "both"):
             argv.append("-u")
+        elif mode == "udp":
+            argv.append("-U")
         return argv + extra
 
     if daemon in ("v2ray", "sing-box"):
@@ -174,6 +177,24 @@ def upstream_kind(proxy_cfgs, up_name):
     if isinstance(up.get("mark"), int) and up.get("mark") > 0:
         return "mark"
     return None
+
+
+def instances_of(name, cfg):
+    """[(tag, merged_cfg)...]; a line without 'instances' yields one tag='' entry.
+    Each instance inherits the line config and may override port/mode/plugin/..."""
+    inst = cfg.get("instances")
+    if not inst:
+        return [("", cfg)]
+    out = []
+    for i, item in enumerate(inst):
+        if not isinstance(item, dict):
+            raise ValueError("%s: instances[%d] must be object" % (name, i))
+        tag = str(item.get("name") or i)
+        merged = dict(cfg)
+        merged.pop("instances", None)
+        merged.update({k: v for k, v in item.items() if k != "name"})
+        out.append((tag, merged))
+    return out
 
 
 def validate_chain(proxy_cfgs):
@@ -316,8 +337,9 @@ def make_uid_spawner(uid, popen=None):
 
 
 class ManagedProxy:
-    def __init__(self, name, cfg, argv, uid, spawn=None, sleeper=None, timer=None):
+    def __init__(self, name, cfg, argv, uid, spawn=None, sleeper=None, timer=None, line=None):
         self.name, self.cfg, self.argv, self.uid = name, cfg, argv, uid
+        self.line = line or name   # owning proxy-line name (instances share uid/chain rules)
         self._spawn = spawn or (lambda a: subprocess.Popen(a))
         self._sleep = sleeper or time.sleep
         self._time = timer or time.time
@@ -388,15 +410,21 @@ class ProxySupervisor(threading.Thread):
         self._lock = threading.RLock()   # guards self.proxies/order vs monitor thread
         self.order = validate_chain(proxy_cfgs)          # raises on cycle/bad upstream
         self.proxies = {}
+        self.lines = {}                                  # line name -> [instance keys]
         for n in self.order:
             c = proxy_cfgs[n]
             if not is_managed(c):
                 continue
-            argv = build_cmd(n, c)                       # raises on bad spec
-            spawn = self._spawn or make_uid_spawner(uid_cache.get(n))
-            p = ManagedProxy(n, c, argv, uid_cache.get(n),
-                             spawn=spawn, sleeper=self._sleep, timer=self._now)
-            self.proxies[n] = p
+            keys = []
+            for tag, icfg in instances_of(n, c):
+                key = n if not tag else "%s#%s" % (n, tag)
+                argv = build_cmd(key, icfg)              # raises on bad spec
+                spawn = self._spawn or make_uid_spawner(uid_cache.get(n))
+                p = ManagedProxy(key, icfg, argv, uid_cache.get(n), line=n,
+                                 spawn=spawn, sleeper=self._sleep, timer=self._now)
+                self.proxies[key] = p
+                keys.append(key)
+            self.lines[n] = keys
 
     def get(self, name):
         return self.proxies.get(name)
@@ -407,52 +435,63 @@ class ProxySupervisor(threading.Thread):
                 for n, p in self.proxies.items()}
 
     # -- launch with dependency gating -------------------------------------
-    def _bring_up(self, n):
-        """start one proxy (dependency + external-port gated); call under lock.
-        Waits are SHORT (the lock blocks reconfigure/monitor): on any gate
-        failure the proxy is left in state 'deferred' and the monitor loop
-        retries it every pacing tick."""
-        p = self.proxies.get(n)
+    def _bring_up(self, key):
+        """start one instance (dependency + external-port gated); call under
+        lock. Waits are SHORT (the lock blocks reconfigure/monitor); on gate
+        failure the instance stays state 'deferred' and the monitor retries."""
+        p = self.proxies.get(key)
         if p is None or p.stopping:
             return
-        if not self.name_cfg[n].get("autostart", True):
+        cfg = p.cfg
+        if not cfg.get("autostart", True):
             return
-        up = upstream_of(self.name_cfg[n])
-        if up is not None and up in self.proxies:   # mark-type upstreams are not processes: nothing to wait for
-            up_p = self.proxies.get(up)
-            if up_p.proc is None or up_p.proc.poll() is not None:
-                p.state = "deferred"
-                self.log("%s: dependency %s not up, deferring" % (n, up))
-                return
-            port = self.name_cfg[up].get("port")
-            # timeout=1.0: short (this runs under self._lock, long waits stall
-            # reconfigure/monitor) but distinct from the 0.5 own-port probe
-            # below so injected test stubs can tell the two probes apart
-            if port and not self._port_wait(port, timeout=1.0):
-                p.state = "deferred"
-                self.log("%s: dependency %s port %s not ready, deferring" % (n, up, port))
-                return
-        my_port = self.name_cfg[n].get("port")
-        if my_port and self._port_wait(my_port, timeout=0.5):
+        up = upstream_of(cfg)
+        if up is not None and self.lines.get(up):        # mark-type upstream: no processes to wait for
+            for k2 in self.lines[up]:
+                q = self.proxies.get(k2)
+                if q is None or q.proc is None or q.proc.poll() is not None:
+                    p.state = "deferred"
+                    self.log("%s: dependency %s not up, deferring" % (key, up))
+                    return
+            for k2 in self.lines[up]:
+                q = self.proxies.get(k2)
+                uport = (q.cfg if q else {}).get("port")
+                if uport and not self._port_wait(uport, timeout=1.0):
+                    p.state = "deferred"
+                    self.log("%s: dependency %s port %s not ready, deferring" % (key, up, uport))
+                    return
+        my_port = cfg.get("port")
+        # external-instance probe: TCP connect sees only TCP listeners, so run
+        # it only when NO sibling instance of this line is alive yet (a running
+        # TCP plugin instance must not make the UDP-only instance look external)
+        siblings = [k2 for k2 in self.lines.get(p.line, []) if k2 != key]
+        sib_alive = any(self.proxies.get(k2) and self.proxies[k2].proc
+                        and self.proxies[k2].proc.poll() is None for k2 in siblings)
+        if my_port and not sib_alive and self._port_wait(my_port, timeout=0.5):
             p.state = "external"
             self.log("%s: port %s already listening (external instance?), not spawning"
-                     % (n, my_port))
-            self.on_status(n, "external", None)
+                     % (key, my_port))
+            self.on_status(key, "external", None)
             return
         try:
             p.start_once()
-            self.on_status(n, p.state, p.proc.pid)
+            self.on_status(key, p.state, p.proc.pid)
         except OSError as e:
-            self.log("%s: spawn failed: %s" % (n, e))
+            p.state = "deferred"
+            self.log("%s: spawn failed: %s" % (key, e))
 
     def launch(self):
         with self._lock:
             for n in self.order:
-                self._bring_up(n)
+                for key in self.lines.get(n, []):
+                    self._bring_up(key)
 
     # -- incremental reconfiguration / restart-all -------------------------
     def _build_proxies(self, proxy_cfgs, order):
-        built, uids = {}, {}
+        """-> (built_instances_by_key, uid_cache, lines_map). A line with
+        'instances' yields one ManagedProxy per instance (key 'line#tag');
+        they share the line uid, so one skuid anti-loop/chain rule covers all."""
+        built, uids, lines = {}, {}, {}
         for n in order:
             c = proxy_cfgs[n]
             if not is_managed(c):
@@ -463,18 +502,30 @@ class ProxySupervisor(threading.Thread):
             except ValueError as e:
                 self.log("uid error: %s" % e)
             uids[n] = uid
+            keys = []
             try:
-                argv = build_cmd(n, c)
+                insts = instances_of(n, c)
             except ValueError as e:
-                self.log("%s: bad spec: %s (keeping previous instance if any)" % (n, e))
-                if n in self.proxies:
-                    built[n] = self.proxies[n]   # config error -> do NOT disturb running proxy
-                    continue
-                raise
-            spawn = self._spawn or make_uid_spawner(uid)
-            built[n] = ManagedProxy(n, c, argv, uid, spawn=spawn,
-                                    sleeper=self._sleep, timer=self._now)
-        return built, uids
+                self.log("%s: bad instances: %s" % (n, e))
+                insts = [("", c)]
+            for tag, icfg in insts:
+                key = n if not tag else "%s#%s" % (n, tag)
+                try:
+                    argv = build_cmd(key, icfg)
+                except ValueError as e:
+                    self.log("%s: bad spec: %s (keeping previous if any)" % (key, e))
+                    if key in self.proxies:
+                        built[key] = self.proxies[key]
+                        keys.append(key)
+                        continue
+                    raise
+                spawn = self._spawn or make_uid_spawner(uid)
+                built[key] = ManagedProxy(key, icfg, argv, uid, line=n,
+                                          spawn=spawn, sleeper=self._sleep, timer=self._now)
+                keys.append(key)
+            lines[n] = keys
+        return built, uids, lines
+
 
     def reconfigure(self, proxy_cfgs, restart_all=False):
         """USR1 diff path (or USR2 with restart_all=True).
@@ -491,7 +542,7 @@ class ProxySupervisor(threading.Thread):
             if self._stop_evt.is_set():
                 raise ValueError("supervisor was stopped; create a new one")
             old = self.proxies
-            built, uids = self._build_proxies(proxy_cfgs, order)
+            built, uids, lines = self._build_proxies(proxy_cfgs, order)
             for n in list(old):                          # removed from config
                 if n not in built:
                     old[n].stop()
@@ -510,11 +561,13 @@ class ProxySupervisor(threading.Thread):
                 o.stop()                                 # changed / restart-all / dead-but-old
                 self.log("%s: %s" % (n, "restart requested" if same else "config changed, restarting"))
             self.proxies, self.uid_cache = built, uids
+            self.lines = lines
             self.name_cfg, self.order = proxy_cfgs, order
             for n in self.order:
-                p = self.proxies.get(n)
-                if p is not None and p.proc is None and p.state not in ("external",):
-                    self._bring_up(n)
+                for key in self.lines.get(n, []):
+                    p = self.proxies.get(key)
+                    if p is not None and p.proc is None and p.state not in ("external",):
+                        self._bring_up(key)
 
     def restart_all(self):
         """USR2: stop + start every managed proxy (fresh rate-limit state)."""
@@ -563,10 +616,11 @@ class ProxySupervisor(threading.Thread):
                     if self.proxies.get(n) is p and not p.stopping and p.proc is not None \
                             and p.proc.poll() is None:
                         continue                     # already healthy again
-                    up = upstream_of(self.name_cfg.get(n, {}))
-                    if up is not None and up in self.proxies:
-                        up_p = self.proxies.get(up)
-                        if not up_p.proc or up_p.proc.poll() is not None:
+                    up = upstream_of(p.cfg)
+                    if up is not None and self.lines.get(up):
+                        if any(not (self.proxies.get(k2) and self.proxies[k2].proc
+                                    and self.proxies[k2].proc.poll() is None)
+                               for k2 in self.lines[up]):
                             continue                 # dependency down: retried next round
                     try:
                         if self.proxies.get(n) is p:

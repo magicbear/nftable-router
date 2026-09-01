@@ -459,8 +459,65 @@ def test_mark_upstream_chain():
     check("cycle via mark line caught", _raises(pm.validate_chain, cyc))
 
 
+
+
+def test_multi_instances():
+    print("[12] instances: one line -> multiple managed processes")
+    cfgs = {"L": {"daemon": "ss-redir", "port": 10520, "server": "9.9.9.9",
+                  "cipher": "aes-256-cfb", "password_file": "/pw", "uid": 1220, "mark": 70,
+                  "instances": [
+                      {"name": "tcp", "mode": "tcp", "plugin": "v2ray-plugin",
+                       "plugin_opts": "mode=websocket;tls;host=x"},
+                      {"name": "udp", "mode": "udp"}]},
+            "D": {"daemon": "custom", "port": 10521, "cmd": ["/bin/cat", "D"], "uid": 1221, "mark": 71,
+                  "upstream": "L"}}
+    inst = pm.instances_of("L", cfgs["L"])
+    check("2 instances parsed", [x[0] for x in inst] == ["tcp", "udp"])
+    check("udp instance inherits server", inst[1][1]["server"] == "9.9.9.9")
+    a_tcp = pm.build_cmd("L#tcp", inst[0][1])
+    a_udp = pm.build_cmd("L#udp", inst[1][1])
+    check("tcp inst: --plugin", "--plugin" in a_tcp and "-u" not in a_tcp and "-U" not in a_tcp)
+    check("udp inst: -U, no plugin", "-U" in a_udp and "--plugin" not in a_udp)
+
+    spawned = []
+    def sp(argv):
+        p = FakeProc(argv); spawned.append(" ".join(argv)); return p
+    # dep-gate probes use timeout=1.0 (return ready for L's port); own-port external
+    # probes use timeout=0.5 (return False -> spawn allowed)
+    pw = lambda port, timeout=None: timeout == 1.0 and port == 10520
+    sup = pm.ProxySupervisor(cfgs, spawn=sp, sleep=lambda s: None, now=lambda: 0, port_wait=pw)
+    check("3 managed instance keys total", len(sup.proxies) == 3 and
+          set(sup.proxies) == {"L#tcp", "L#udp", "D"})
+    check("lines map", sup.lines["L"] == ["L#tcp", "L#udp"])
+    sup.launch()
+    check("all 3 started (D gated on L ports passed)", len(spawned) == 3, str(spawned))
+    check("L#tcp spawns before L#udp (config order)",
+          "v2ray-plugin" in spawned[0] and "-U" in spawned[1])
+    # chain rules keyed per line still 1 rule for D->L
+    uids = {"L#tcp": 1220, "L#udp": 1220, "L": 1220, "D": 1221}
+    rules = pm.plan_proxy_chain_rules(cfgs, {"L": 1220, "D": 1221}, "ip")
+    check("D chained to L port still emits redirect rule",
+          any(e.get("redirect", {}).get("port") == 10520 for r in rules for e in r["expr"]))
+    # dependency gating waits for ALL instances' ports
+    seen_ports = []
+    def pw2(port, timeout=None):
+        if timeout == 1.0:
+            seen_ports.append(port)
+        return timeout == 1.0 and port == 10520
+    cfgs2 = {"L": dict(cfgs["L"], autostart=True),
+             "E": {"daemon": "custom", "port": 10522, "cmd": ["/bin/x", "E"], "uid": 1222, "upstream": "L"}}
+    sp2 = []
+    def sp2f(argv):
+        p = FakeProc(argv); sp2.append(argv[-1]); return p
+    sup2 = pm.ProxySupervisor(cfgs2, spawn=lambda argv: (sp2.append(argv[-1]), FakeProc(argv))[1],
+                              sleep=lambda s: None, now=lambda: 0, port_wait=pw2)
+    sup2.launch()
+    check("dependency E checked BOTH L instance ports",
+          10520 in seen_ports and 10521 not in seen_ports, str(seen_ports))
+
+
 if __name__ == "__main__":
-    for t in (test_build_cmd, test_chain_validation, test_chain_rules, test_mark_upstream_chain,
+    for t in (test_build_cmd, test_chain_validation, test_chain_rules, test_mark_upstream_chain, test_multi_instances,
               test_supervisor_restart, test_supervisor_stop_semantics,
               test_dependency_gating, test_redact, test_uid_requirement,
               test_reconfigure_diff, test_monitor_thread_safe_with_reconfigure):

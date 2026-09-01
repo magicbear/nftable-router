@@ -383,31 +383,46 @@ def health_snapshot(app):
     # --- managed proxies expected from config
     if cfg and psutil is not None and pmm is not None:
         managed = {k: v for k, v in cfg.get("proxy", {}).items() if pmm.is_managed(v)}
+        claimed = set()
         for name, c in managed.items():
+            try:
+                insts = pmm.instances_of(name, c) if hasattr(pmm, "instances_of") else [("", c)]
+            except Exception:
+                insts = [("", c)]
             want = {"managed": name, "daemon": c.get("daemon"), "port": c.get("port"),
                     "upstream": c.get("upstream"), "autostart": c.get("autostart", True),
-                    "pid": None, "state": "not running", "uptime": None, "cpu": None}
-            if c.get("autostart", True) is False:
-                want["state"] = "autostart off"
-            for p in procs.values():
-                try:
-                    cl = p.cmdline()
-                except Exception:
-                    continue
-                if not cl:
-                    continue
-                port_i = cl.index("-l") + 1 if "-l" in cl else None
-                if (os.path.basename(cl[0]) in ("ss-redir", "v2ray", "sing-box", str(c.get("binary") or ""))
-                        and port_i and port_i < len(cl) and str(c.get("port")) == cl[port_i]):
+                    "instances": []}
+            for tag, icfg in insts:
+                ent = {"tag": tag or "default", "port": icfg.get("port"),
+                       "mode": icfg.get("mode", "tcp"), "plugin": icfg.get("plugin"),
+                       "pid": None, "state": "not running", "uptime": None, "cpu": None}
+                if c.get("autostart", True) is False:
+                    ent["state"] = "autostart off"
+                for pid, p in procs.items():
+                    if pid in claimed:
+                        continue
                     try:
-                        with p.oneshot():
-                            want.update({"pid": p.pid, "state": "running" if p.status() == psutil.STATUS_RUNNING
-                                         or p.is_running() else p.status(),
-                                         "uptime": round(time.time() - p.create_time()),
-                                         "cpu": round(p.cpu_percent(0.05), 1)})
-                    except Exception as e:
-                        want["state"] = "error %s" % e
-                    break
+                        cl = p.cmdline()
+                    except Exception:
+                        continue
+                    if not cl:
+                        continue
+                    port_i = cl.index("-l") + 1 if "-l" in cl else None
+                    base = os.path.basename(cl[0])
+                    if (base in ("ss-redir", "ss-local", "v2ray", "sing-box", str(icfg.get("binary") or ""))
+                            and port_i and port_i < len(cl) and str(ent["port"]) == cl[port_i]):
+                        try:
+                            with p.oneshot():
+                                ent.update({"pid": pid, "state": "running",
+                                            "uptime": round(time.time() - p.create_time()),
+                                            "cpu": round(p.cpu_percent(0.05), 1)})
+                                claimed.add(pid)
+                        except Exception as e:
+                            ent["state"] = "error %s" % e
+                        break
+                want["instances"].append(ent)
+            run_n = sum(1 for e in want["instances"] if e["state"] == "running")
+            want["running"] = "%d/%d" % (run_n, len(want["instances"]))
             res["proxies"]["managed"].append(want)
         # external proxy-ish procs NOT under the router master
         try:

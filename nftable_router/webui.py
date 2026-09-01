@@ -410,6 +410,7 @@ function editProxy(name){
   uid:c.uid,server:c.server||c.proxy_ip,server_port:c.server_port,cipher:c.cipher,password:c.password,
   password_file:c.password_file,plugin:c.plugin,plugin_opts:c.plugin_opts,bind_addr:c.bind_addr,
   mode:c.mode,bind:c.bind,test_url:c.test_url,
+  test_dns:(c.test_dns instanceof Array)?c.test_dns.join(", "):(c.test_dns||""),
   restart_max:(c.restart||{}).max,restart_window:(c.restart||{}).window};
   var lines=Object.keys(CFG.proxy||{}).filter(function(x){return x!=name});
   cur.autostart_x=String(c.autostart!==false);
@@ -436,7 +437,9 @@ function editProxy(name){
     ["bind","bind ip:port","text"]],cur);
    g=mgroup(body,"能力 / 探测");
    mbools(g,["ipv4","ipv6","udp_v4","udp_v6","fullcone"],c,CAP_LABELS);
-   mfields(mgrid(g),[["test_url","探测 URL (test_url)","text"]],cur);
+   mfields(mgrid(g),[
+    ["test_url","探测 URL (test_url)","text",null,"http://connectivitycheck.../generate_204"],
+    ["test_dns","探测 DNS (逗号分隔)","text",null,"116.228.111.118, 223.5.5.5"]],cur);
    g=mgrid(mgroup(body,"重启抑制"));
    mfields(g,[["restart_max","重启上限","num"],["restart_window","重启窗口(秒)","num"]],cur);
    var adv=document.createElement("details");adv.style.marginTop="14px";
@@ -454,6 +457,7 @@ function editProxy(name){
   if(g("daemon"))out.daemon=g("daemon");
   ["uid","cipher","password","password_file","plugin","plugin_opts","bind_addr","mode","bind","test_url"].forEach(function(f){if(g(f))out[f]=g(f)});
   if(g("server")){out.server=g("server");out.proxy_ip=out.proxy_ip||g("server")}
+  if(g("test_dns"))out.test_dns=g("test_dns").split(/[,，\s]+/).filter(function(x){return x.length});
   var sp=gi("server_port");if(sp!=null)out.server_port=sp;
   ["ipv4","ipv6","udp_v4","udp_v6","fullcone"].forEach(function(f){out[f]=!!body.querySelector('[data-fk="'+f+'"]').checked});
   out.autostart=g("autostart_x")==="true";
@@ -629,10 +633,14 @@ function loadInfo(){api("/api/health").then(function(d){
  // managed proxies
  var mp=(d.proxies&&d.proxies.managed)||[];
  var pr=$("i-prox");pr.innerHTML="";
- var prows=mp.map(function(p){var st=p.state||"-";
-  return [p.managed,p.daemon||"",(p.port?(":"+p.port):"ip-rule"),p.upstream?("→ "+p.upstream):"",
-   el("span",st.indexOf("running")>=0?"good":(st==="not running"?"bad":"dim"),st),
-   p.pid||"",p.uptime!=null?Math.round(p.uptime/60)+"m":"",p.cpu!=null?p.cpu+"%":""]});
+ var prows=[];mp.forEach(function(p){
+  var its=(p.instances&&p.instances.length)?p.instances:[{tag:"default",state:p.state,pid:p.pid,uptime:p.uptime,cpu:p.cpu,port:p.port}];
+  its.forEach(function(e){var st=e.state||"-";
+   var stTxt=st+(p.instances?(" ("+ (p.running||"?") +")"):"");
+   prows.push([(e.tag==="default"?p.managed:p.managed+"#"+e.tag),p.daemon||"",
+    (e.port?(":"+e.port):"ip-rule"),p.upstream?("→ "+p.upstream):"",
+    el("span",st.indexOf("running")>=0?"good":(st==="not running"?"bad":"dim"),stTxt),
+    e.pid||"",e.uptime!=null?Math.round(e.uptime/60)+"m":"",e.cpu!=null?e.cpu+"%":""]);});});
  if(prows.length)putRows(pr,["线路","daemon","端口","上游","状态","pid","运行","cpu"],prows);
  else pr.appendChild(el("div","dim","无托管代理(配置加 daemon 字段后接管)"));
  // workers tree
