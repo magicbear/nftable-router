@@ -509,8 +509,8 @@ def test_iprule_apply_lifecycle():
     # external manual rule same fwmark -> untouched
     ipr3 = MockIPRoute(rules=[{"priority": 30000, "fwmark": 1005, "table": 200, "family": _sock.AF_INET}])
     r5 = ib.iprule_apply(ipr3, plans)
-    check("external fwmark respected (kept untouched, no duplicate add)",
-          r5["external"] == [1005] and
+    check("external fwmark respected (kept untouched, table adopted, no duplicate rule)",
+          r5["external"] == [{"mark": 1005, "table": 200, "prio": 30000}] and
           any(rr["fwmark"] == 1005 and rr["priority"] == 30000 for rr in ipr3.rules) and
           not any(c[0] == "rule" and c[1] == "add" and c[2].get("fwmark") == 1005
                   for c in ipr3.calls))
@@ -531,6 +531,27 @@ def test_iprule_apply_lifecycle():
     check("auto gw unavailable -> pending", r8["pending"] and not any(
         c[0] == "route" and c[1] == "add" for c in ipr6.calls))
 
+
+def test_external_rule_adopts_table():
+    print("[18] external fwmark rule -> route ensured in ITS table, no duplicate rule")
+    import socket as _s
+    binds = [{"ip": "93.184.216.39", "iface": "eno2.2000", "mark": 907,
+              "iprule": {"gateway": "93.184.216.38"}}]
+    cfg = {"egress_marks": binds, "proxy": {}}
+    plans = ib.iprule_plan(cfg, 4)
+    ipr = MockIPRoute(links={"ppp0": 33, "eno2.2000": 12},
+                      rules=[{"priority": 30000, "fwmark": 907, "table": 907, "family": _s.AF_INET}])
+    res = ib.iprule_apply(ipr, plans)
+    check("marked external", res["external"] == [{"mark": 907, "table": 907, "prio": 30000}])
+    check("no rule add", not any(c[0] == "rule" and c[1] == "add" for c in ipr.calls))
+    radd = [c[2] for c in ipr.calls if c[0] == "route" and c[1] == "add"]
+    check("default route added into adopted table 907",
+          len(radd) == 1 and radd[0]["table"] == 907 and radd[0]["gateway"] == "93.184.216.38"
+          and radd[0]["src"] == "93.184.216.39", str(radd))
+    # idempotent
+    ipr2 = MockIPRoute(links={"ppp0": 33, "eno2.2000": 12}, rules=ipr.rules, routes=ipr.routes)
+    res2 = ib.iprule_apply(ipr2, plans)
+    check("second pass no writes", ipr2.calls == [] and res2["external"])
 
 def test_wizard_post_bind():
     print("[17] run_wizard post_bind hook (gateway prompt)")
@@ -591,6 +612,7 @@ if __name__ == "__main__":
               test_wizard_flow, test_rules_safety_and_shape, test_guard_never_clobbers_policy_mark,
               test_atomic_save_and_backup, test_bad_input_no_partial_write, test_json_roundtrip_via_add_binding,
               test_clear_egress_rules, test_restore_json_detection,
+              test_external_rule_adopts_table,
               test_iprule_plan, test_iprule_apply_lifecycle, test_wizard_post_bind,
               test_iprule_combined_families_no_flap, test_iprule_line_mark_opt_in]:
         t()

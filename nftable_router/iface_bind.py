@@ -120,26 +120,35 @@ def load_config(path):
 
 
 def save_config(path, cfg, backup=True):
-    """Atomic rewrite; keeps a .bak. Raises ValueError on non-dict/jsonable data."""
+    """Atomic rewrite; keeps a .bak. Raises ValueError on non-dict/jsonable
+    data. IMPORTANT: writes through to realpath (deployed configs are often
+    symlinks -- os.replace on the link path would silently DETACH the link
+    and orphan the real file), and preserves the original file mode."""
     text = json.dumps(cfg, ensure_ascii=False, indent=3)
     # round-trip validation before touching the real file
     json.loads(text)
-    if backup and os.path.exists(path):
+    real = os.path.realpath(path)
+    try:
+        mode = os.stat(real).st_mode & 0o777
+    except OSError:
+        mode = 0o644
+    if backup and os.path.exists(real):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(real, "r", encoding="utf-8") as f:
                 old = f.read()
-            with open(path + ".bak", "w", encoding="utf-8") as f:
+            with open(real + ".bak", "w", encoding="utf-8") as f:
                 f.write(old)
         except OSError:
             pass
-    d = os.path.dirname(os.path.abspath(path)) or "."
+    d = os.path.dirname(os.path.abspath(real)) or "."
     fd, tmp = tempfile.mkstemp(prefix=".nft_route.", suffix=".tmp", dir=d)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text + "\n")
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        os.chmod(tmp, mode)
+        os.replace(tmp, real)
     except Exception:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -592,10 +601,23 @@ def iprule_apply(ipr, plans, log=None, auto_gateway=None):
         foreign = [r for r in cur.get(key, []) if r not in ours]
         exact = [r for r in ours if (r.get("table") or 0) == p["table"]
                  and r.get("priority") == p["priority"]]
+        adopted = False
         if foreign and not ours:
-            res["external"].append(p["mark"])
-            logf("ip rule %s: manual/external rule exists -> untouched" % tag)
-            continue
+            # The RULE is externally managed (e.g. manual prio-30000 policy
+            # rules): never duplicate or touch it -- but ADOPT the table it
+            # points at so the binding still guarantees its default route.
+            # (Previously this branch `continue`d entirely: bound entries that
+            #  reused a line mark got an empty routing table = the 907 case.)
+            ft = foreign[0].get("table")
+            if isinstance(ft, str) and ft.strip().isdigit():
+                ft = int(ft.strip())
+            if isinstance(ft, int) and ft not in (0, 252, 253, 254, 255):
+                p = dict(p, table=ft)
+            res["external"].append({"mark": p["mark"], "table": p["table"],
+                                    "prio": foreign[0].get("priority")})
+            logf("ip rule %s: external rule (prio %s -> table %s) respected; adopting table for default route"
+                 % (tag, foreign[0].get("priority"), p["table"]))
+            adopted = True
         # migrate: owned-band rules whose table/priority no longer match the
         # plan (config changed) are replaced instead of reported external
         for r in ours:
@@ -605,8 +627,8 @@ def iprule_apply(ipr, plans, log=None, auto_gateway=None):
                 del_rule_and_flush(r, p["mark"], fam, "table/priority changed")
             except Exception as e:
                 res["errors"].append("rule migrate fwmark %d: %s" % (p["mark"], e))
-        # 1) rule
-        if not exact:
+        # 1) rule (skipped when adopted from an external rule)
+        if not exact and not adopted:
             try:
                 ipr.rule("add", priority=p["priority"], fwmark=p["mark"],
                          table=p["table"], family=af[fam])
