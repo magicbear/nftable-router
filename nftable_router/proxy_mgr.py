@@ -53,6 +53,28 @@ DAEMONS = ("ss-redir", "v2ray", "sing-box", "custom")
 CHAIN_CMT = "**AUTOGEN BY PolicyRoute proxy-chain**"
 SECRET_KEYS = ("password", "k", "-k")
 
+# Fields that describe ONE PROCESS's connection (which server, which cipher,
+# which transport plugin, which local mode). When a line is split via
+# "instances" these must NOT silently fall back to the line-level value:
+# instances are different processes and routinely need different servers/
+# ciphers/plugins (e.g. a TCP instance tunnelled through v2ray-plugin over
+# websocket+tls, and a UDP instance connecting bare to the same or a
+# different endpoint -- v2ray-plugin does not carry UDP). Falling back used
+# to mean a field left unset on one instance silently inherited the OTHER
+# instance's sibling value via the shared line dict, which is exactly how a
+# TCP instance could end up misconfigured while UDP looked fine (or vice
+# versa) with no error. "daemon" and "port" stay line-shared on purpose:
+# every instance of a line uses the same daemon binary and (usually) the
+# same transparent port -- that's the point of splitting one line into
+# multiple listener processes on it.
+INSTANCE_SCOPED_FIELDS = frozenset((
+    "mode", "plugin", "plugin_opts", "bind_addr",
+    "cipher", "method", "password", "password_file",
+    "server", "proxy_ip", "server_port",
+    "obfs", "obfs_param", "protocol", "protocol_param",
+    "binary", "config", "cmd",
+))
+
 
 # ---------------------------------------------------------------------------
 # spec parsing / command building
@@ -78,6 +100,8 @@ def get_uid(proxy_cfg, what=""):
 def build_cmd(name, cfg):
     """Return argv list for the daemon. Raises ValueError on bad config."""
     daemon = cfg.get("daemon")
+    if daemon is None:
+        raise ValueError("%s: missing 'daemon' field" % name)
     if daemon not in DAEMONS:
         raise ValueError("%s: unknown daemon %r" % (name, daemon))
     if not cfg.get("port"):
@@ -180,8 +204,15 @@ def upstream_kind(proxy_cfgs, up_name):
 
 
 def instances_of(name, cfg):
-    """[(tag, merged_cfg)...]; a line without 'instances' yields one tag='' entry.
-    Each instance inherits the line config and may override port/mode/plugin/..."""
+    """[(tag, merged_cfg)...]; a line without 'instances' yields one tag=''
+    entry built from the line itself (single process, unchanged behaviour).
+
+    A line WITH 'instances' is a multi-PROCESS split: line-shared fields
+    (port, uid, upstream, autostart, restart, args, capability flags, ...)
+    still fall through, but INSTANCE_SCOPED_FIELDS (server/cipher/password/
+    plugin/mode/...) do NOT -- each instance must set its own, or it simply
+    won't have them (build_cmd raises a clear error naming the instance
+    rather than silently reusing a sibling instance's value)."""
     inst = cfg.get("instances")
     if not inst:
         return [("", cfg)]
@@ -190,7 +221,7 @@ def instances_of(name, cfg):
         if not isinstance(item, dict):
             raise ValueError("%s: instances[%d] must be object" % (name, i))
         tag = str(item.get("name") or i)
-        merged = dict(cfg)
+        merged = {k: v for k, v in cfg.items() if k not in INSTANCE_SCOPED_FIELDS}
         merged.pop("instances", None)
         merged.update({k: v for k, v in item.items() if k != "name"})
         out.append((tag, merged))
@@ -406,6 +437,7 @@ class ProxySupervisor(threading.Thread):
                 except ValueError as e:
                     self.log("uid error: %s" % e)
         self.uid_cache = uid_cache
+        self.spec_errors = {}           # key -> build error (quarantined specs)
         self._stop_evt = threading.Event()
         self._lock = threading.RLock()   # guards self.proxies/order vs monitor thread
         self.order = validate_chain(proxy_cfgs)          # raises on cycle/bad upstream
@@ -418,7 +450,14 @@ class ProxySupervisor(threading.Thread):
             keys = []
             for tag, icfg in instances_of(n, c):
                 key = n if not tag else "%s#%s" % (n, tag)
-                argv = build_cmd(key, icfg)              # raises on bad spec
+                try:
+                    argv = build_cmd(key, icfg)
+                except ValueError as e:
+                    # per-instance quarantine: a broken spec must NEVER stop
+                    # the other lines/instances from being supervised
+                    self.log("%s: spec error, SKIPPED: %s" % (key, e))
+                    self.spec_errors[key] = str(e)
+                    continue
                 spawn = self._spawn or make_uid_spawner(uid_cache.get(n))
                 p = ManagedProxy(key, icfg, argv, uid_cache.get(n), line=n,
                                  spawn=spawn, sleeper=self._sleep, timer=self._now)
@@ -492,6 +531,7 @@ class ProxySupervisor(threading.Thread):
         'instances' yields one ManagedProxy per instance (key 'line#tag');
         they share the line uid, so one skuid anti-loop/chain rule covers all."""
         built, uids, lines = {}, {}, {}
+        self.spec_errors = {}
         for n in order:
             c = proxy_cfgs[n]
             if not is_managed(c):
@@ -513,12 +553,12 @@ class ProxySupervisor(threading.Thread):
                 try:
                     argv = build_cmd(key, icfg)
                 except ValueError as e:
-                    self.log("%s: bad spec: %s (keeping previous if any)" % (key, e))
+                    self.log("%s: spec error, SKIPPED: %s" % (key, e))
+                    self.spec_errors[key] = str(e)
                     if key in self.proxies:
-                        built[key] = self.proxies[key]
+                        built[key] = self.proxies[key]   # keep running old instance
                         keys.append(key)
-                        continue
-                    raise
+                    continue
                 spawn = self._spawn or make_uid_spawner(uid)
                 built[key] = ManagedProxy(key, icfg, argv, uid, line=n,
                                           spawn=spawn, sleeper=self._sleep, timer=self._now)

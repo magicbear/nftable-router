@@ -463,17 +463,21 @@ def test_mark_upstream_chain():
 
 def test_multi_instances():
     print("[12] instances: one line -> multiple managed processes")
-    cfgs = {"L": {"daemon": "ss-redir", "port": 10520, "server": "9.9.9.9",
-                  "cipher": "aes-256-cfb", "password_file": "/pw", "uid": 1220, "mark": 70,
+    # daemon/port/uid/mark stay line-shared; every OTHER connection field
+    # (server/cipher/password/plugin/mode) must be set on EACH instance --
+    # they must NOT bleed from the line or from a sibling instance.
+    cfgs = {"L": {"daemon": "ss-redir", "port": 10520, "uid": 1220, "mark": 70,
                   "instances": [
-                      {"name": "tcp", "mode": "tcp", "plugin": "v2ray-plugin",
-                       "plugin_opts": "mode=websocket;tls;host=x"},
-                      {"name": "udp", "mode": "udp"}]},
+                      {"name": "tcp", "mode": "tcp", "server": "9.9.9.9",
+                       "cipher": "aes-256-cfb", "password_file": "/pw",
+                       "plugin": "v2ray-plugin", "plugin_opts": "mode=websocket;tls;host=x"},
+                      {"name": "udp", "mode": "udp", "server": "9.9.9.9",
+                       "cipher": "aes-256-cfb", "password_file": "/pw"}]},
             "D": {"daemon": "custom", "port": 10521, "cmd": ["/bin/cat", "D"], "uid": 1221, "mark": 71,
                   "upstream": "L"}}
     inst = pm.instances_of("L", cfgs["L"])
     check("2 instances parsed", [x[0] for x in inst] == ["tcp", "udp"])
-    check("udp instance inherits server", inst[1][1]["server"] == "9.9.9.9")
+    check("port stays line-shared", inst[0][1]["port"] == 10520 and inst[1][1]["port"] == 10520)
     a_tcp = pm.build_cmd("L#tcp", inst[0][1])
     a_udp = pm.build_cmd("L#udp", inst[1][1])
     check("tcp inst: --plugin", "--plugin" in a_tcp and "-u" not in a_tcp and "-U" not in a_tcp)
@@ -494,7 +498,6 @@ def test_multi_instances():
     check("L#tcp spawns before L#udp (config order)",
           "v2ray-plugin" in spawned[0] and "-U" in spawned[1])
     # chain rules keyed per line still 1 rule for D->L
-    uids = {"L#tcp": 1220, "L#udp": 1220, "L": 1220, "D": 1221}
     rules = pm.plan_proxy_chain_rules(cfgs, {"L": 1220, "D": 1221}, "ip")
     check("D chained to L port still emits redirect rule",
           any(e.get("redirect", {}).get("port") == 10520 for r in rules for e in r["expr"]))
@@ -507,8 +510,6 @@ def test_multi_instances():
     cfgs2 = {"L": dict(cfgs["L"], autostart=True),
              "E": {"daemon": "custom", "port": 10522, "cmd": ["/bin/x", "E"], "uid": 1222, "upstream": "L"}}
     sp2 = []
-    def sp2f(argv):
-        p = FakeProc(argv); sp2.append(argv[-1]); return p
     sup2 = pm.ProxySupervisor(cfgs2, spawn=lambda argv: (sp2.append(argv[-1]), FakeProc(argv))[1],
                               sleep=lambda s: None, now=lambda: 0, port_wait=pw2)
     sup2.launch()
@@ -516,8 +517,90 @@ def test_multi_instances():
           10520 in seen_ports and 10521 not in seen_ports, str(seen_ports))
 
 
+def test_instance_fields_do_not_leak():
+    print("[13] regression: instance connection fields do NOT cross-inherit")
+    # this is the exact shape of the reported bug: a line-level 'mode'/'plugin'
+    # (say, left over from before the line was split into instances) must
+    # NOT silently apply to an instance that didn't ask for it -- previously
+    # the "udp" instance below would have inherited mode="tcp" from the line
+    # and started as a second TCP-only process instead of UDP-only.
+    cfgs = {"L": {"daemon": "ss-redir", "port": 999, "uid": 1230, "mark": 80,
+                  "mode": "tcp", "plugin": "v2ray-plugin", "plugin_opts": "stale-line-level-value",
+                  "server": "1.2.3.4", "cipher": "aes-256-gcm", "password": "linepw",
+                  "instances": [
+                      {"name": "tcp", "server": "1.2.3.4", "cipher": "aes-256-gcm", "password": "pw1",
+                       "plugin": "v2ray-plugin", "plugin_opts": "real-tcp-value"},
+                      {"name": "udp", "mode": "udp", "server": "1.2.3.4",
+                       "cipher": "aes-256-gcm", "password": "pw2"}]}}
+    inst = dict(pm.instances_of("L", cfgs["L"]))
+    check("tcp instance keeps its OWN plugin_opts, not the line's",
+          inst["tcp"]["plugin_opts"] == "real-tcp-value")
+    check("udp instance got NO plugin at all (line-level plugin did not leak in)",
+          "plugin" not in inst["udp"])
+    check("udp instance mode is its own 'udp', not the line's 'tcp'",
+          inst["udp"]["mode"] == "udp")
+    check("udp instance password is its own, not the line's/tcp sibling's",
+          inst["udp"]["password"] == "pw2")
+    a_udp = pm.build_cmd("L#udp", inst["udp"])
+    check("udp argv has -U and no --plugin (would have been -u/tcp+plugin under the old bug)",
+          "-U" in a_udp and "--plugin" not in a_udp)
+
+    # a scoped field missing entirely on an instance -> clear per-instance
+    # error, NOT a silent fallback to a sibling's or the line's value
+    bad = {"daemon": "ss-redir", "port": 999, "uid": 1,
+           "server": "1.2.3.4", "cipher": "x", "password": "y",   # line-level: must be ignored
+           "instances": [{"name": "nopw"}]}
+    bad_inst = dict(pm.instances_of("X", bad))
+    try:
+        pm.build_cmd("X#nopw", bad_inst["nopw"])
+        check("missing-field instance raises", False)
+    except ValueError as e:
+        check("error names the actual instance, not the line",
+              "X#nopw" in str(e) and "server" in str(e))
+
+
+
+
+def test_spec_quarantine():
+    print("[13] bad spec quarantines ONLY that instance/line")
+    cfgs = {
+        "GOOD": {"daemon": "ss-redir", "port": 10530, "server": "1.1.1.1",
+                 "cipher": "x", "password": "p", "uid": 1230, "mark": 80},
+        "BAD":  {"daemon": "ss-redir", "port": 10531, "uid": 1231, "mark": 81},  # no server/password
+        "MIX":  {"daemon": "ss-redir", "port": 10532, "server": "2.2.2.2", "cipher": "x",
+                 "password": "p", "uid": 1232, "mark": 82,
+                 "instances": [{"name": "ok", "mode": "tcp", "server": "2.2.2.2",
+                                "cipher": "x", "password": "p"},
+                               {"name": "brk", "mode": "tcp"}]},   # inherits NOTHING at runtime
+    }
+    spawned = []
+    sup = pm.ProxySupervisor(cfgs, spawn=lambda a: (spawned.append(a[a.index("-l") + 1]), FakeProc(a))[1],
+                             sleep=lambda s: None, now=lambda: 0,
+                             port_wait=lambda p, **k: False)
+    check("supervisor built despite bad specs", True)
+    check("GOOD supervised", "GOOD" in sup.proxies)
+    check("BAD quarantined entirely", "BAD" not in sup.proxies and "BAD" in sup.spec_errors)
+    check("MIX#ok survives, MIX#brk quarantined (scoped fields never inherit)",
+          "MIX#ok" in sup.proxies and "MIX#brk" in sup.spec_errors)
+    check("MIX still has running instance (line not lost)", sup.lines.get("MIX") == ["MIX#ok"])
+    sup.launch()
+    check("GOOD and MIX#ok actually spawned",
+          sorted(spawned) == ["10530", "10532"], str(spawned))
+    # reconfigure: structural chain errors (unknown upstream) are rejected and
+    # leave the running set untouched (by design); spec errors quarantine
+    try:
+        sup.reconfigure({"GOOD": cfgs["GOOD"], "BAD": dict(cfgs["BAD"], upstream="NOPE")})
+        check("reconfigure unknown-upstream rejected", False)
+    except ValueError:
+        check("reconfigure unknown-upstream rejected, set untouched", "GOOD" in sup.proxies)
+    sup.reconfigure({"GOOD": cfgs["GOOD"], "BAD": cfgs["BAD"]})
+    check("reconfigure with BAD spec quarantined, GOOD keeps running proc",
+          "GOOD" in sup.proxies and "BAD" not in sup.proxies)
+
+
 if __name__ == "__main__":
-    for t in (test_build_cmd, test_chain_validation, test_chain_rules, test_mark_upstream_chain, test_multi_instances,
+    for t in (test_build_cmd, test_chain_validation, test_chain_rules, test_mark_upstream_chain, test_multi_instances, test_spec_quarantine,
+              test_instance_fields_do_not_leak,
               test_supervisor_restart, test_supervisor_stop_semantics,
               test_dependency_gating, test_redact, test_uid_requirement,
               test_reconfigure_diff, test_monitor_thread_safe_with_reconfigure):
