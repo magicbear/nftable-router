@@ -807,6 +807,19 @@ class PrintResultThread(threading.Thread):
                                 "src": rc.src,
                                 "sport": rc.sport
                             }))
+                        # webadmin live stream (independent subscriber; failures
+                        # here must never affect the router itself)
+                        try:
+                            self.r.publish("pr_stream", json.dumps({
+                                "ts": round(time.time(), 3),
+                                "ver": rc.pkt_version, "proto": rc.proto,
+                                "src": rc.src, "dst": rc.dst,
+                                "sport": rc.sport, "dport": rc.port,
+                                "line": rc.out_interface, "mark": rc.mark,
+                                "pri": rc.matched_priority, "sess": rc.test_session,
+                                "ms": round(rc.t_total, 2), "fc": 1 if rc.process_fullcone else 0}))
+                        except Exception as e:
+                            syslog.syslog(syslog.LOG_WARNING, "pr_stream publish failed: %s" % e)
                     except Exception as e:
                         print(tf.format("{msg:s,bg_red,black}", msg="[-] PrintResult Thread Error: %s" % e))
                         self.r = None
@@ -1520,7 +1533,19 @@ def time_to_level(t, proxy_id):
         return "🟤" if "port" not in config['proxy'][proxy_id] else "🟫"
 
 
+MASTER_PID_FILE = "/run/nft_route.pid"
+
+
+def write_master_pid():
+    try:
+        with open(MASTER_PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError as e:
+        syslog.syslog(syslog.LOG_WARNING, "cannot write master pidfile: %s" % e)
+
+
 if __name__ == "__main__":
+    write_master_pid()
     print("[+] create nftables mangle checking rules")
     nfu.delete_rules(comment=cmt_class, family=None)
 
