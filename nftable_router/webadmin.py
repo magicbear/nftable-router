@@ -297,6 +297,8 @@ def validate_config(cfg):
             errors.append("proxy %s: invalid mark %r" % (name, m))
         else:
             marks.setdefault(m, []).append(name)
+        if line.get("daemon") and not line.get("uid"):
+            errors.append("proxy %s: 设置了 daemon 但缺少 uid（托管进程必须指定运行用户）" % name)
         if "ipv4" not in line and "ipv6" not in line:
             errors.append("proxy %s: 缺少 ipv4/ipv6 标记（若你并未编辑过该线路，多半是页面快照过旧：先点 刷新/读取配置 再试）" % name)
         p = line.get("port")

@@ -3,13 +3,13 @@
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260901-2210"
+UI_VERSION = "20260901-2230"
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nft-route 管理台</title>
-<script>var UI_VER="20260901-2210";</script>
+<script>var UI_VER="20260901-2230";</script>
 <style>
 :root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
 --green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
@@ -554,7 +554,16 @@ function editProxy(name){
    g=mgrid(mgroup(body,"托管进程"));
    mfields(g,[
     ["daemon","托管进程","select",["ss-redir","v2ray","sing-box","custom"]],
-    ["uid","运行用户","text"],["autostart_x","自动启动","select",["true","false"]]],cur);
+    ["uid","运行用户 *","text",null,"如 shadowsocks（创建: useradd -rs /bin/false 用户名）"],
+    ["autostart_x","自动启动","select",["true","false"]]],cur);
+   (function(){
+    var dsel=g.querySelector('[data-fk="daemon"]'), uin=g.querySelector('[data-fk="uid"]');
+    var hint=el("span","bad","  已选择托管进程：运行用户为必填项（防环规则按此用户的 skuid 识别代理流量）");
+    hint.style.display="none";uin.parentNode.appendChild(hint);
+    function req(){var need=!!(dsel.value||"").trim();
+     uin.style.borderColor=need&&!uin.value.trim()?"var(--red)":"";
+     hint.style.display=need&&!uin.value.trim()?"inline":"none"}
+    dsel.onchange=req;uin.oninput=req;uin.onchange=req;req()})();
    g=mgroup(body,"能力 / 探测");
    mbools(g,["ipv4","ipv6","udp_v4","udp_v6","fullcone"],c,CAP_LABELS);
    mfields(mgrid(g),[
@@ -582,6 +591,7 @@ function editProxy(name){
   var p=gi("port");if(p!=null)out.port=p;else delete out.port;
   if(g("upstream"))out.upstream=g("upstream");else delete out.upstream;
   var dn=g("daemon");
+  if(dn&&!g("uid"))return toast("托管进程必须填写『运行用户』(uid)——进程降权与防环都依赖它","bad");
   if(dn)out.daemon=dn;else delete out.daemon;
   ["uid","bind","test_url"].forEach(function(f){var v=g(f);if(v)out[f]=v;else delete out[f]});
   if(g("test_dns"))out.test_dns=g("test_dns").split(/[,，\s]+/).filter(function(x){return x.length});
@@ -625,6 +635,8 @@ function editProxy(name){
   closeModal();
   pushCfg(function(){renderProxy();renderRules()})})}
 
+function nextMark(){var used={};Object.keys(CFG.proxy||{}).forEach(function(k){used[(CFG.proxy[k]||{}).mark]=1});
+ var m=1005;while(used[m]||m===0x99||m===0x100)m++;return m}
 function delProxy(name){
  var refs=proxyReferrers(name);
  if(refs.length)return toast("无法删除: 被 "+refs.join(", ")+" 引用（先改上游/规则）","bad");
