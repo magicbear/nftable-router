@@ -33,6 +33,8 @@ from nftable_router.nft_utils import nftUtils
 from nftable_router.icmp_builder import *
 from nftable_router.dns import *
 from nftable_router.fullcone_nat import *
+from nftable_router import netinfo
+from nftable_router import iface_bind as ib
 from pytput import TputFormatter
 import subprocess, urllib, psutil
 from queue import Queue, Empty
@@ -470,6 +472,124 @@ def create_tproxy(mark, port, ip_family, udp=False):
              })
 
 
+PRINT_FULL_MIN_WIDTH = 220
+PRINT_COMPACT_MIN_WIDTH = 130
+
+g_term_width = -1
+g_term_width_check = 0.0
+
+
+def egress_wizard_boot():
+    """Startup egress binding: scan interfaces, prompt wizard for unbound
+    public egress IP/interface -> fwmark, write nft_route.json (atomic+bak).
+    Must run in master BEFORE worker fork and BEFORE tty cbreak mode."""
+    global config
+    config_path = os.environ.get("NFT_ROUTE_CONFIG", "nft_route.json")
+    try:
+        detect = netinfo.detect()
+    except Exception as e:
+        syslog.syslog(syslog.LOG_WARNING, "egress scan failed: %s" % e)
+        print(tf.format("{msg:s,bg_yellow,black}", msg="[-] egress: interface scan failed: %s" % e))
+        return
+    candidates = ib.scan_candidates(detect)
+    for err in ib.validate_bindings(config):
+        print(tf.format("{msg:s,bg_yellow,black}", msg="[-] egress_marks config invalid: %s" % err))
+        syslog.syslog(syslog.LOG_WARNING, "egress_marks config invalid: %s" % err)
+    bound, needs = ib.plan_bindings(config, candidates)
+    for cand, b in bound:
+        print("[*] egress: %s %s -> mark %s (bound)" % (
+            "iface" if cand["dynamic"] else "ip  ",
+            cand["ifname"] + (" / " + cand["ip"] if not cand["dynamic"] else ""), b["mark"]))
+    if not needs:
+        return
+    interactive = sys.stdin.isatty() and is_master
+    if not interactive:
+        for cand in needs:
+            msg = "unbound public egress: %s %s (%s)" % (
+                cand["ifname"], cand["ip"], "dynamic" if cand["dynamic"] else "static")
+            print(tf.format("{msg:s,bg_yellow,black}", msg="[-] egress: %s" % msg))
+            syslog.syslog(syslog.LOG_WARNING, msg)
+        return
+
+    def chooser(cand, suggested):
+        lines = [k for k, v in config.get("proxy", {}).items() if int(v.get("mark", -1)) == int(suggested)]
+        kind = "dynamic iface %s" % cand["ifname"] if cand["dynamic"] else "static ip %s" % cand["ip"]
+        print()
+        ans = input("[*] egress wizard: %s (%s) -> bind fwmark [%s%s]:\n    "
+                    "(Enter=use default, 0x.. / decimal=custom, s=skip) " % (
+                        kind, cand["method"], suggested,
+                        (" / line %s" % ",".join(lines)) if lines else "")).strip().lower()
+        if ans in ("", "y", "yes"):
+            return suggested
+        if ans in ("s", "n", "no", "skip"):
+            return None
+        try:
+            return int(ans, 0)
+        except ValueError:
+            line_names = {k.lower(): int(v.get("mark", 0)) for k, v in config.get("proxy", {}).items()}
+            if ans in line_names and line_names[ans]:
+                return line_names[ans]
+            print("    [-] invalid input, skipped")
+            return None
+
+    created = ib.run_wizard(config, needs, chooser)
+    if created:
+        try:
+            ib.save_config(config_path, config)
+            print("[+] egress_marks updated in %s (%d new, backup: %s.bak)" % (config_path, len(created), config_path))
+            syslog.syslog(syslog.LOG_NOTICE, "egress_marks updated: %s" % json.dumps(created))
+        except Exception as e:
+            print(tf.format("{msg:s,bg_red,black}", msg="[-] egress_marks save FAILED (rules will use in-memory cfg): %s" % e))
+            syslog.syslog(syslog.LOG_CRIT, "egress_marks save failed: %s" % e)
+
+
+def apply_egress_rules(nfu, ip_family):
+    """Install prerouting setter rules (+ generic OUTPUT restore only when the
+    running ruleset has none). Pure 'meta mark/ct mark set' -- no verdicts,
+    no drop of transit traffic."""
+    bindings = ib.get_bindings(config)
+    if not bindings:
+        return
+    removed = ib.clear_egress_rules(nfu, ip_family, cmt_class)
+    if removed:
+        print("[*] egress marks (%s): cleared %d old rules" % (ip_family, removed))
+    try:
+        ruleset_rc, ruleset_json, _ = nfu.nft.json_cmd({"nftables": [{"list": {"ruleset": None}}]})
+        restore_exists = ib.restore_in_ruleset(ruleset_json if ruleset_rc == 0 else "", ip_family)
+    except Exception as e:
+        syslog.syslog(syslog.LOG_WARNING, "egress ruleset inspect failed: %s" % e)
+        restore_exists = False
+    chains, rules = ib.plan_rules(config, ip_family, restore_exists=restore_exists)
+    for ch in chains:
+        nfu.add_chain(ch)
+    n_ok = 0
+    for r in rules:
+        params = dict(r)
+        params["comment"] = cmt_class
+        rc = nfu.add_rule(params)
+        try:
+            ok = not any(x[0] for x in rc if isinstance(x, (list, tuple))) if isinstance(rc, list) else rc[0] == 0
+        except Exception:
+            ok = True
+        n_ok += 1 if ok else 0
+        if not ok:
+            print(tf.format("{msg:s,bg_red,black}", msg="[-] add egress rule failed (%s): %s" % (ip_family, rc)))
+            syslog.syslog(syslog.LOG_CRIT, "add egress rule failed %s: %s" % (ip_family, rc))
+    print("[+] egress marks (%s): %d/%d rules, restore %s" % (
+        ip_family, n_ok, len(rules), "already deployed" if restore_exists else "auto-added"))
+
+
+def get_term_width():
+    global g_term_width, g_term_width_check
+    if time.time() - g_term_width_check >= 1:
+        g_term_width_check = time.time()
+        try:
+            g_term_width = os.get_terminal_size(sys.stdout.fileno()).columns
+        except Exception:
+            g_term_width = -1
+    return g_term_width
+
+
 class PrintResultThread(threading.Thread):
     def __init__(self):
         threading.Thread.__init__(self)
@@ -675,18 +795,41 @@ class PrintResultThread(threading.Thread):
                             with g_cps.get_lock():
                                 g_cps.value += 1
 
+                        dst_str = rc.dst + (":%d" % rc.port if (rc.proto == 6 or rc.proto == 17) else "")
+                        if rc.process_fullcone:
+                            dst_str = tf.format("{dst:21s,cyan}", dst=dst_str)
+
+                        term_width = get_term_width()
                         g_io_lock.acquire()
                         try:
-                            print(
-                                "[*] %-6s: %s %15s [%s] -> %21s => %s\033[0m %1s %3d [%-50s] %2d %s%s" % (
-                                    proto_str, flag_str,
-                                    rc.src if rc.test_session != 1 else "",
-                                    src_interfaces,
-                                    tf.format("{dst:21s,cyan}", dst=rc.dst + ":%d" % (rc.port) if (
-                                            rc.proto == 6 or rc.proto == 17) else "") if rc.process_fullcone else "%s%s" % (
-                                        rc.dst, ":%d" % (rc.port) if (rc.proto == 6 or rc.proto == 17) else ""),
-                                    out_interface_color, "" if rc.matched_priority == -1 else rc.matched_priority, rc.mark,
-                                    "", worker_id, extra_string + "\b" * (len(extra_string) + 52 + 3), isp_string))
+                            if 0 < term_width < PRINT_COMPACT_MIN_WIDTH:
+                                print("[*] %-6s: %s %15s -> %21s => %s\033[0m %1s %3d %2d" % (
+                                          proto_str, flag_str,
+                                          rc.src if rc.test_session != 1 else "",
+                                          dst_str,
+                                          out_interface_color,
+                                          "" if rc.matched_priority == -1 else rc.matched_priority, rc.mark,
+                                          worker_id))
+                                print("    %s %s" % (extra_string, isp_string))
+                            elif 0 < term_width < PRINT_FULL_MIN_WIDTH:
+                                print("[*] %-6s: %s %15s -> %21s => %s\033[0m %1s %3d [%-50s] %2d %s%s" % (
+                                          proto_str, flag_str,
+                                          rc.src if rc.test_session != 1 else "",
+                                          dst_str,
+                                          out_interface_color,
+                                          "" if rc.matched_priority == -1 else rc.matched_priority, rc.mark,
+                                          "", worker_id, extra_string + "\b" * (len(extra_string) + 52 + 3),
+                                          isp_string))
+                            else:
+                                print("[*] %-6s: %s %15s [%s] -> %21s => %s\033[0m %1s %3d [%-50s] %2d %s%s" % (
+                                          proto_str, flag_str,
+                                          rc.src if rc.test_session != 1 else "",
+                                          src_interfaces,
+                                          dst_str,
+                                          out_interface_color,
+                                          "" if rc.matched_priority == -1 else rc.matched_priority, rc.mark,
+                                          "", worker_id, extra_string + "\b" * (len(extra_string) + 52 + 3),
+                                          isp_string))
                         finally:
                             g_io_lock.release()
 
@@ -1073,6 +1216,15 @@ def reload_queue(signum, sigframe):
     # nfqueue.unbind()
     load_config()
     test_thread.last_check = 0
+
+    # re-apply egress mark rules on reload (non-interactive; new unbound
+    # public egress IPs/interfaces are logged, wizard runs only at boot)
+    try:
+        for ip_family in ("ip", "ip6"):
+            apply_egress_rules(nfu, ip_family)
+    except Exception as e:
+        syslog.syslog(syslog.LOG_CRIT, "egress rules reload error: %s\n  %s" % (
+            str(e), '  '.join(traceback.format_tb(e.__traceback__))))
     # tp.lock.acquire()
     # tp.device_list = None
     # tp.lock.release()
@@ -1220,6 +1372,9 @@ if __name__ == "__main__":
         if _interface not in netifaces.interfaces():
             syslog.syslog(syslog.LOG_WARNING, f"Interface {_interface} not exists")
             nat_interfaces.pop(n)
+
+    # scan interfaces -> wizard-bind public egress IP/interface to fwmark -> save config
+    egress_wizard_boot()
 
     for ip_version, ip_family in [(4, "ip"), (6, "ip6")]:
         # nfu.delete_set(family=ip_family, table="nat", name="local")
@@ -1514,6 +1669,9 @@ if __name__ == "__main__":
                      {'counter': {'bytes': 0, 'packets': 0}},
                      {'masquerade': None}]
                  })
+
+        # egress return-path marking (prerouting setter + generic ct->meta restore)
+        apply_egress_rules(nfu, ip_family)
 
     nfqueue = netfilterqueue.NetfilterQueue()
     nfqueue.bind(4, ip_mark, mode=netfilterqueue.COPY_PACKET)
