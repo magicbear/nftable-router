@@ -389,17 +389,13 @@ def validate_chain(proxy_cfgs):
 # loop-guard / chain nft rules (pure dicts; committed by router.py via nfu)
 # ---------------------------------------------------------------------------
 
-# skuid->mark identity stamps. IMPORTANT: these live in nat_OUTPUT (inserted
-# at the head, before the policy NFQUEUE) -- NOT a dedicated 'type route'
-# output chain. A 'type route' chain was attempted and SIGSEGVs libnftables
-# 0.9.8's JSON command parsing (cmd->obj NULL deref inside
-# nft_run_cmd_from_buffer, before any netlink). Do not reintroduce one without
-# first verifying the exact add-chain/add-rule JSON interactively on the box.
-# NOTE this means skuid stamps decorate conntrack/meta at the NAT stage; they
-# do NOT re-run the FIB lookup for already-routed locally-generated packets
-# (that needs the socket's sk_mark, e.g. ss-redir '--mark', which is a
-# separate concern from this chain).
-ROUTE_OUT_CHAIN = "nat_OUTPUT"
+# skuid->fwmark identity stamps target iface_bind's dedicated TYPE-ROUTE output
+# chain: a mark set in a filter/nat OUTPUT chain never re-triggers the FIB
+# lookup (the routing decision for locally-generated packets happens earlier),
+# which was the exact 'marked but egressed via default route' production bug.
+# Command forms verified crash-free on the target nftables v0.9.8 by
+# tools/type_route_probe.py. test asserts ROUTE_OUT_CHAIN == iface_bind.CHAIN_ROUTE.
+ROUTE_OUT_CHAIN = "mangle_EGRESS_ROUTE"
 
 
 def _stamp_rule(family, uid, mark):

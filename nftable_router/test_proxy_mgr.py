@@ -313,13 +313,13 @@ def test_uid_optional_and_identity():
     check("numeric uid passes through", pm.get_uid(_cfg(uid=1207), "A") == 1207)
     check("string int uid parsed", pm.get_uid(_cfg(uid="1208"), "A") == 1208)
 
-    # skuid stamps live in nat_OUTPUT (head-inserted), NOT a separate type-route
-    # chain: a 'type route' chain SIGSEGVs libnftables 0.9.8 json parsing.
-    check("stamp chain is nat_OUTPUT (route chain crashed nft 0.9.8)",
-          pm.ROUTE_OUT_CHAIN == "nat_OUTPUT")
+    # skuid stamps target the dedicated type-route chain (forms verified on
+    # the real nftables v0.9.8 by tools/type_route_probe.py); redirect/accept
+    # verdicts stay in nat_OUTPUT.
+    check("stamp chain is iface_bind.CHAIN_ROUTE", pm.ROUTE_OUT_CHAIN == ib.CHAIN_ROUTE)
     plan = pm.plan_proxy_chain_rules({"HKFIB": {"mark": 126, "uid": 1270}}, {"HKFIB": 1270}, "ip")
-    check("mark-line stamp generated and targets nat_OUTPUT",
-          len(plan) == 1 and plan[0]["chain"] == "nat_OUTPUT"
+    check("mark-line stamp generated and targets the route chain",
+          len(plan) == 1 and plan[0]["chain"] == ib.CHAIN_ROUTE
           and {"mangle": {"key": {"meta": {"key": "mark"}}, "value": 126}} in plan[0]["expr"], str(plan))
     # a mark-type upstream WITH its own run-user -> our process adopts ITS skuid
     cfgs = {"M": {"mark": 60, "uid": 1260}, "A": _cfg(upstream="M", uid=1200)}

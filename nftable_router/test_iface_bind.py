@@ -230,10 +230,16 @@ def test_rules_safety_and_shape():
     check("restore prio after conntrack(-200) before policy queue(-90)",
           -200 < res4["prio"] < -90)
     check("restore prio back at -120", res4["prio"] == -120)
-    # NO dedicated type-route chain: 'add chain type route' SIGSEGVs libnftables
-    # 0.9.8 json parsing, so skuid stamps go into nat_OUTPUT (see proxy_mgr).
-    check("no type-route chain is planned",
+    # skuid stamps live in a DEDICATED type-route chain, provided separately by
+    # route_chain_spec() (installed by install_proxy_chain_rules, never mixed
+    # into plan_rules' filter set)
+    check("plan_rules itself never emits a route chain",
           not any(c.get("type") == "route" for c in chains4 + chains6))
+    rspec = ib.route_chain_spec("ip")
+    check("route chain: flat form, type route @ output -150, NO policy field",
+          rspec["type"] == "route" and rspec["hook"] == "output" and rspec["prio"] == -150
+          and "policy" not in rspec and rspec["name"] == ib.CHAIN_ROUTE)
+    check("route != restore chain (a chain cannot be two types)", ib.CHAIN_ROUTE != ib.CHAIN_RESTORE)
     check("ip rules safe", ib.rules_are_safe(rules4))
     check("ip6 rules safe", ib.rules_are_safe(rules6))
 

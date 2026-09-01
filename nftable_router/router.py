@@ -679,13 +679,13 @@ def apply_egress_rules(nfu, ip_family):
         syslog.syslog(syslog.LOG_WARNING, "egress ruleset inspect failed: %s" % e)
         restore_exists = False
     if not restore_exists:
-        # heal stale chains from earlier buggy builds: an intermediate version
-        # registered CHAIN_RESTORE as 'type route @ -150' (connmark restore must
-        # be a plain 'type filter @ -120' chain) and created a separate
-        # 'mangle_EGRESS_ROUTE' type-route chain before it SIGSEGV'd libnftables
-        # 0.9.8. Delete both by name (blind delete of a missing chain is a
-        # harmless no-op on this build) then re-plan the correct filter chain.
-        for stale in (ib.CHAIN_RESTORE, "mangle_EGRESS_ROUTE"):
+        # heal stale chains from earlier buggy builds: one registered our named
+        # RESTORE chain as 'type route @ -150' (connmark restore MUST stay a
+        # plain filter @ -120 chain; egress steering is CHAIN_ROUTE's job).
+        # A 'mangle_EGRESS_ROUTE' left over from the earlier experiment is
+        # recreated with the current spec by install_proxy_chain_rules when
+        # stamps exist. Blind delete of a missing chain = harmless no-op.
+        for stale in (ib.CHAIN_RESTORE, ib.CHAIN_ROUTE):
             nfu.nft.json_cmd({"nftables": [{"delete": {"chain": {
                 "family": ip_family, "table": "policy_route", "name": stale}}}]})
     chains, rules = ib.plan_rules(config, ip_family, restore_exists=restore_exists)
@@ -894,18 +894,38 @@ def install_proxy_chain_rules():
                 print("      [!] %s: inline password visible in /proc cmdline; prefer 'password_file'" % label)
     n_ok = 0
     for ip_family in ("ip", "ip6"):
+        planned = pmm.plan_proxy_chain_rules(config["proxy"], uid_cache, ip_family)
+        stamps = [r for r in planned if r["chain"] == ib.CHAIN_ROUTE]
+        verdicts = [r for r in planned if r["chain"] != ib.CHAIN_ROUTE]
+        if stamps:
+            # idempotent (same flat form every boot, like the nat chains).
+            # Forms verified crash-free on this nftables build by
+            # tools/type_route_probe.py before merging back.
+            rc = nfu.add_chain(ib.route_chain_spec(ip_family))
+            if rc[0] != 0:
+                print(tf.format("{msg:s,bg_red,black}", msg="[-] add route chain failed (%s): %s" % (ip_family, rc)))
+                syslog.syslog(syslog.LOG_CRIT, "add route chain failed %s: %s" % (ip_family, rc))
         # INSERT at the head of nat_OUTPUT: the policy queue rule verdicts
         # (queue) before appended rules would ever run, so appended skuid
         # rules are dead code exactly when the policy engine marks a proxy's
         # own upstream flow. Insert in reverse to preserve planned order.
-        # (NOTE: 'type route' OUTPUT chains were tried for skuid stamps and
-        # SIGSEGV libnftables 0.9.8 json parsing -- do not reintroduce without
-        # verifying every command form interactively on the box first.)
-        for r in reversed(pmm.plan_proxy_chain_rules(config["proxy"], uid_cache, ip_family)):
+        for r in reversed(verdicts):
             rc = nfu.insert_rule(dict(r))
             if rc[0] != 0:
                 print(tf.format("{msg:s,bg_red,black}", msg="[-] insert proxy-chain rule failed (%s): %s" % (ip_family, rc)))
                 syslog.syslog(syslog.LOG_CRIT, "insert proxy-chain rule failed %s: %s" % (ip_family, rc))
+            else:
+                n_ok += 1
+        # identity stamps APPEND into the type-route chain: only a route-type
+        # OUTPUT hook re-runs the FIB lookup, so skuid marks set there steer
+        # egress. The stamping itself is not a verdict -> insert order inside
+        # the chain is irrelevant; delete_rules(CHAIN_CMT) above keeps reloads
+        # duplicate-free.
+        for r in stamps:
+            rc = nfu.add_rule(dict(r))
+            if rc[0] != 0:
+                print(tf.format("{msg:s,bg_red,black}", msg="[-] add skuid stamp rule failed (%s): %s" % (ip_family, rc)))
+                syslog.syslog(syslog.LOG_CRIT, "add skuid stamp rule failed %s: %s" % (ip_family, rc))
             else:
                 n_ok += 1
     print("[+] proxy-chain skuid rules: %d installed" % n_ok)

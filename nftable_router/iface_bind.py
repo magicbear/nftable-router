@@ -61,15 +61,18 @@ EGRESS_MARKS_KEY = "egress_marks"
 #            clearRules because of a different comment tag).
 #            This is CONNMARK restore for already-tracked flows -- its natural
 #            home is a FILTER output chain.
-# NOTE there is intentionally NO 'type route' chain here: proxy skuid stamps are
-# inserted into nat_OUTPUT instead, because 'add chain type route' SIGSEGVs the
-# libnftables 0.9.8 JSON command parser (cmd->obj NULL deref inside
-# nft_run_cmd_from_buffer). Do not add a route chain without testing the exact
-# JSON on the target's nftables build first.
+#   ROUTE    output (type ROUTE, prio -150 mangle class, flat form, policy
+#            OMITTED): hosts ONLY the skuid->fwmark identity stamps built by
+#            proxy_mgr. Only a route-type OUTPUT chain re-triggers the FIB
+#            lookup after a mark change -- the production bug this split fixes.
+#            VERIFIED SAFE on this box's nftables v0.9.8 by tools/type_route_probe.py
+#            (all route flat/no-policy/stamp cases pass, zero crashes).
 CHAIN_SET = "nat_EGRESS_SET"
 CHAIN_RESTORE = "mangle_EGRESS_RESTORE"
+CHAIN_ROUTE = "mangle_EGRESS_ROUTE"
 SET_PRIO = -95
 RESTORE_PRIO = -120
+ROUTE_PRIO = -150
 DANGEROUS_VERDICTS = {"accept", "drop", "queue", "redirect", "tproxy", "reject"}
 RESTORE_SIGNATURE = "meta mark set ct mark"
 
@@ -397,7 +400,7 @@ def restore_in_ruleset(ruleset, family="ip"):
     """Detect a generic `ct mark -> meta mark` OUTPUT restore already deployed
     (e.g. the manual 'Src-Route Policy'), so we do not add a duplicate. The
     RESTORE lives in an OUTPUT chain of ANY type (it is connmark restore for
-    tracked flows -- egress steering is NOT its job; see proxy_mgr nat_OUTPUT
+    tracked flows -- egress steering is NOT its job; see route_chain_spec CHAIN_ROUTE
     so match on the expression regardless of filter/route. Accepts the nft JSON
     ruleset dict/list or raw text (substring fallback)."""
     if isinstance(ruleset, str):
@@ -438,6 +441,17 @@ def restore_in_ruleset(ruleset, family="ip"):
                 if m.get("key") == {"meta": {"key": "mark"}} and m.get("value") == {"ct": {"key": "mark"}}:
                     return True
     return False
+
+
+def route_chain_spec(family):
+    """Chain definition for the skuid->fwmark identity-stamp chain. FLAT form
+    WITHOUT a policy field -- both variants verified crash-free on the target's
+    nftables v0.9.8 by tools/type_route_probe.py (route_flat_no_policy /
+    stamp_in_route_flat_nopolicy). A separate chain is mandatory: the connmark
+    RESTORE chain is 'type filter' and a chain cannot be two types at once;
+    only 'type route' re-runs the FIB lookup after a mark change."""
+    return {"family": family, "table": "policy_route", "name": CHAIN_ROUTE,
+            "type": "route", "hook": "output", "prio": ROUTE_PRIO}
 
 
 def rules_are_safe(rules):
