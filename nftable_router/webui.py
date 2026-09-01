@@ -46,6 +46,11 @@ td.ell.wrap{white-space:normal;word-break:break-all;text-overflow:clip}
 .msec{margin-top:14px}
 .msec>b{display:block;color:var(--cyan);font-size:12px;border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:8px}
 .mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:8px 14px}
+.itabs{display:flex;gap:5px;align-items:center;margin:2px 0 10px;flex-wrap:wrap}
+.itab{background:#232a38;border:1px solid var(--line);color:var(--dim);padding:3px 12px;cursor:pointer;border-radius:14px;font:inherit}
+.itab.sel{color:var(--fg);border-color:var(--cyan);background:var(--bg)}
+.itab.bad{color:var(--red)}
+.ipane{border:1px dashed var(--line);border-radius:8px;padding:8px 10px}
 .mfield{display:flex;flex-direction:column;gap:3px;min-width:0}
 .mfield label{font-size:11px}
 .mfield input,.mfield select{width:100%;min-width:0}
@@ -362,7 +367,7 @@ function pushCfg(reload,cb){
 
 // ---------- proxy lines ----------
 var PROXY_COLS=["mark","weight","port","upstream","daemon","uid","server","server_port","cipher",
- "password","password_file","plugin","plugin_opts","bind_addr","obfs","obfs_param","protocol","protocol_param","mode","binary","config",
+ "password","password_file","plugin","plugin_opts","bind_addr","obfs","obfs_param","protocol","protocol_param","mode","binary","config","instances",
  "bind","proxy_ip","test_dns","test_url","ipv4","ipv6","udp_v4","udp_v6","fullcone","autostart","restart"];
 function proxyReferrers(name){
  var refs=[];
@@ -446,6 +451,92 @@ function editProxy(name){
   var lines=Object.keys(CFG.proxy||{}).filter(function(x){return x!=name});
   cur.autostart_x=String(c.autostart!==false);
   var CAP_LABELS={ipv4:"IPv4",ipv6:"IPv6",udp_v4:"UDP v4",udp_v6:"UDP v6",fullcone:"FullCone"};
+  // ---- instances (multi-process per line) shared state ----
+  var insts=(c.instances instanceof Array)?JSON.parse(JSON.stringify(c.instances)):[];
+  var cur_inst={i:-2};
+  var line_srv={mode:c.mode||"",plugin:c.plugin||"",plugin_opts:c.plugin_opts||"",
+   bind_addr:c.bind_addr||"",server:c.server||c.proxy_ip||"",
+   server_port:c.server_port!=null?String(c.server_port):"",
+   cipher:c.cipher||"",password:c.password||"",password_file:c.password_file||""};
+  var itabs=null, ipane=null;
+  var IF=[["iname","实例名","text"],["imode","模式","select",["tcp","tcp_and_udp","udp"]],
+   ["iplugin","传输插件","text"],["iopts","插件参数","text",null,"mode=websocket;tls;host=x;path=/dev"],
+   ["iport","端口(覆盖)","num"],["iserver","服务器(覆盖)","text"],
+   ["isp","服务器端口","num"],["icipher","加密(覆盖)","text"],
+   ["ipw","密码(覆盖)","text"],["ipwf","密码文件(覆盖)","text"]];
+  var DEF=[["dmode","模式(mode)","select",["","tcp","tcp_and_udp","udp"]],
+   ["dplugin","传输插件(plugin)","text",null,"如 v2ray-plugin"],
+   ["dopts","插件参数(plugin-opts)","text",null,"mode=websocket;tls;host=x;path=/dev"],
+   ["dbind","监听地址(-b)","text",null,"默认 0.0.0.0, IPv6 ::0"],
+   ["dserver","服务器地址","text"],["dsp","服务器端口","num"],
+   ["dcipher","加密算法","text"],["dpw","密码(内联,ps可见慎用)","text"],
+   ["dpwf","密码文件","text"]];
+  function gv(k){var e=ipane&&ipane.querySelector('[data-fk="'+k+'"]');return e?(e.value||"").trim():""}
+  function inst_commit(){
+   if(!ipane)return;
+   if(cur_inst.i===-2){
+    line_srv={mode:gv("dmode"),plugin:gv("dplugin"),plugin_opts:gv("dopts"),bind_addr:gv("dbind"),
+     server:gv("dserver"),server_port:gv("dsp"),cipher:gv("dcipher"),
+     password:gv("dpw"),password_file:gv("dpwf")};
+    return}
+   if(cur_inst.i<0||!insts[cur_inst.i])return;
+   var o={name:gv("iname")||insts[cur_inst.i].name};
+   var md=gv("imode");if(md)o.mode=md;
+   if(gv("iplugin"))o.plugin=gv("iplugin");
+   if(gv("iopts"))o.plugin_opts=gv("iopts");
+   if(gv("iport"))o.port=parseInt(gv("iport"),10);
+   if(gv("iserver"))o.server=gv("iserver");
+   if(gv("isp"))o.server_port=parseInt(gv("isp"),10);
+   if(gv("icipher"))o.cipher=gv("icipher");
+   if(gv("ipw"))o.password=gv("ipw");
+   if(gv("ipwf"))o.password_file=gv("ipwf");
+   insts[cur_inst.i]=o;itabs_render()}
+  function itabs_render(){
+   if(!itabs)return;
+   itabs.innerHTML="";ipane.innerHTML="";
+   var tb0=el("button","itab"+(cur_inst.i===-2?" sel":""),"默认(线路)");
+   tb0.title="线路级协议配置；实例里留空的字段继承这里";
+   tb0.onclick=function(){if(cur_inst.i===-2)return;inst_commit();cur_inst.i=-2;itabs_render()};
+   itabs.appendChild(tb0);
+   insts.forEach(function(o,i){
+    var tb=el("button","itab"+(i===cur_inst.i?" sel":""),String(o.name||("i"+i)));
+    tb.onclick=function(){if(i===cur_inst.i)return;inst_commit();cur_inst.i=i;itabs_render()};
+    itabs.appendChild(tb)});
+   var ba=el("button","itab","+ 实例");
+   ba.onclick=function(){inst_commit();var n=1;
+    while(insts.some(function(o){return String(o.name)==="i"+n}))n++;
+    insts.push({name:"i"+n,mode:"tcp"});cur_inst.i=insts.length-1;itabs_render()};
+   itabs.appendChild(ba);
+   if(cur_inst.i>=0){
+    var bd=el("button","itab bad","× 删除本实例");
+    bd.onclick=function(){if(!confirm("删除实例 "+((insts[cur_inst.i]||{}).name||"")+" ?"))return;
+     insts.splice(cur_inst.i,1);cur_inst.i=insts.length?Math.min(cur_inst.i,insts.length-1):-2;itabs_render()};
+    itabs.appendChild(bd)}
+   if(cur_inst.i===-2){
+    mfields(ipane,DEF,{dmode:line_srv.mode,dplugin:line_srv.plugin,dopts:line_srv.plugin_opts,
+     dbind:line_srv.bind_addr,dserver:line_srv.server,dsp:line_srv.server_port,
+     dcipher:line_srv.cipher,dpw:line_srv.password,dpwf:line_srv.password_file});
+    if(!insts.length){
+     var hint=el("div","dim","未启用实例 = 单进程托管。点 + 实例 加多进程（TCP走插件 / UDP裸连，同端口不冲突）");
+     hint.style.marginTop="6px";
+     var qp=el("button","dim","+ TCP/UDP 双实例(常用)");
+     qp.style.marginLeft="10px";
+     qp.onclick=function(){inst_commit();insts=[{name:"tcp",mode:"tcp"},{name:"udp",mode:"udp"}];
+      if(!line_srv.mode)line_srv.mode="tcp";
+      cur_inst.i=0;itabs_render()};
+     hint.appendChild(qp);ipane.appendChild(hint)}
+    return}
+   var o=insts[cur_inst.i]||{};
+   var d={iname:o.name||"",imode:o.mode||"tcp",iplugin:o.plugin||"",iopts:o.plugin_opts||"",
+    iport:o.port!=null?o.port:"",iserver:o.server||"",isp:o.server_port!=null?o.server_port:"",
+    icipher:o.cipher||"",ipw:o.password||"",ipwf:o.password_file||""};
+   mfields(ipane,IF,d);
+   var inh=function(a,b){return (a&&String(a))||b||""};
+   var setph=function(k,v){var e=ipane.querySelector('[data-fk="'+k+'"]');if(e&&v!=""&&v!=null)e.placeholder="留空继承: "+v};
+   setph("iport",c.port);setph("iserver",inh(line_srv.server,c.proxy_ip));setph("isp",inh(line_srv.server_port,c.server_port));
+   setph("icipher",inh(line_srv.cipher,c.cipher));setph("ipwf",inh(line_srv.password_file,c.password_file));
+   var iname=ipane.querySelector('[data-fk="iname"]');iname&&(iname.onchange=function(){inst_commit()});
+  }
   openModal(isNew?"新增线路":"编辑线路: "+name,function(body){
    var g=mgrid(mgroup(body,"基本信息"));
    mfields(g,[
@@ -456,23 +547,17 @@ function editProxy(name){
    mfields(g,[
     ["daemon","托管进程","select",["ss-redir","v2ray","sing-box","custom"]],
     ["uid","运行用户","text"],["autostart_x","自动启动","select",["true","false"]]],cur);
-   g=mgrid(mgroup(body,"服务端 / 协议"));
-   mfields(g,[
-    ["server","服务器地址","text"],["server_port","服务器端口","num"],
-    ["cipher","加密算法","text"],["password","密码(内联,ps可见慎用)","text"],
-    ["password_file","密码文件","text"],
-    ["plugin","传输插件(plugin)","text",null,"如 v2ray-plugin"],
-    ["plugin_opts","插件参数(plugin-opts)","text",null,"mode=websocket;tls;host=x;path=/dev"],
-    ["bind_addr","监听地址(-b)","text",null,"默认0.0.0.0, IPv6用 ::0"],
-    ["mode","模式","select",["tcp","tcp_and_udp"]],
-    ["bind","bind ip:port","text"]],cur);
    g=mgroup(body,"能力 / 探测");
    mbools(g,["ipv4","ipv6","udp_v4","udp_v6","fullcone"],c,CAP_LABELS);
    mfields(mgrid(g),[
     ["test_url","探测 URL (test_url)","text",null,"http://connectivitycheck.../generate_204"],
-    ["test_dns","探测 DNS (逗号分隔)","text",null,"116.228.111.118, 223.5.5.5"]],cur);
+    ["test_dns","探测 DNS (逗号分隔)","text",null,"116.228.111.118, 223.5.5.5"],
+    ["bind","探测源 ip:port(bind)","text",null,"192.168.200.2:10051"]],cur);
    g=mgrid(mgroup(body,"重启抑制"));
    mfields(g,[["restart_max","重启上限","num"],["restart_window","重启窗口(秒)","num"]],cur);
+   var ig=mgroup(body,"协议与实例（默认=线路配置；实例留空字段继承默认页）");
+   itabs=el("div","itabs");ipane=el("div","ipane");ig.appendChild(itabs);ig.appendChild(ipane);
+   itabs_render();
    var adv=document.createElement("details");adv.style.marginTop="14px";
    adv.appendChild(el("summary","dim","高级字段(其余键保留，可直接编辑JSON)"));
    var ta=document.createElement("textarea");ta.className="padv";
@@ -486,14 +571,24 @@ function editProxy(name){
   var p=gi("port");if(p!=null)out.port=p;
   if(g("upstream"))out.upstream=g("upstream");
   if(g("daemon"))out.daemon=g("daemon");
-  ["uid","cipher","password","password_file","plugin","plugin_opts","bind_addr","mode","bind","test_url"].forEach(function(f){if(g(f))out[f]=g(f)});
-  if(g("server")){out.server=g("server");out.proxy_ip=out.proxy_ip||g("server")}
+  ["uid","bind","test_url"].forEach(function(f){if(g(f))out[f]=g(f)});
   if(g("test_dns"))out.test_dns=g("test_dns").split(/[,，\s]+/).filter(function(x){return x.length});
-  var sp=gi("server_port");if(sp!=null)out.server_port=sp;
+  inst_commit();
+  if(line_srv.server){out.server=line_srv.server;out.proxy_ip=out.proxy_ip||line_srv.server}
+  ["mode","plugin","plugin_opts","bind_addr","cipher","password","password_file"].forEach(function(f){if(line_srv[f])out[f]=line_srv[f]});
+  if(line_srv.server_port!=="")out.server_port=parseInt(line_srv.server_port,10);
   ["ipv4","ipv6","udp_v4","udp_v6","fullcone"].forEach(function(f){out[f]=!!body.querySelector('[data-fk="'+f+'"]').checked});
   out.autostart=g("autostart_x")==="true";
   var rmx=gi("restart_max"),rmw=gi("restart_window");
   if(rmx!=null||rmw!=null)out.restart={max:rmx==null?5:rmx,window:rmw==null?300:rmw};
+  if(insts.length){
+   var inames={};
+   for(var ii=0;ii<insts.length;ii++){
+    if(!insts[ii].name)return toast("实例缺少名字","bad");
+    if(inames[insts[ii].name])return toast("实例名重复: "+insts[ii].name,"bad");
+    inames[insts[ii].name]=1}
+   out.instances=insts}
+  else if(c.instances&&c.instances.length)out.instances=[];
   var adv;try{adv=JSON.parse(body.querySelector(".padv").value||"{}")}catch(e){return toast("高级字段不是合法JSON","bad")}
   for(var ak in adv)out[ak]=adv[ak];
   if(out.mark==null)return toast("mark 必填","bad");
