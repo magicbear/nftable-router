@@ -74,7 +74,7 @@ label{color:var(--dim)}
   <button data-t=mtr>链路MTR</button>
   <button data-t=rt>路由表</button>
   <button data-t=cfg>配置JSON</button>
-  <button data-t=info>状态</button>
+  <button data-t=info>状态<span id="nav-dirty" class="warn" style="display:none"> ●</span></button>
  </nav></header>
 <main>
 <section id=s-flow class=sel>
@@ -105,14 +105,12 @@ label{color:var(--dim)}
 
 <section id=s-proxy>
  <div class=bar><button id=p-refresh>刷新</button><button id=p-add>+ 新增线路</button>
-  <label><input type=checkbox id=p-autoreload checked> 保存后重载主进程</label>
   <span class=dim>托管线路(daemon)与 ip-rule 线路统一在此管理；unknown 字段在高级 JSON 中保留</span></div>
  <div id=ptable></div>
 </section>
 
 <section id=s-rules>
  <div class=bar><button id=r-refresh>刷新</button><button id=r-add>+ 新增优先级</button>
-  <label><input type=checkbox id=r-autoreload checked> 保存后重载主进程</label>
   <span class=dim>规则自上而下匹配；每优先级可映射多条线路；条件键同 nft_route.json rules 语义</span></div>
  <div id=rtable></div>
 </section>
@@ -135,7 +133,6 @@ label{color:var(--dim)}
  <div class=bar>
   <button id=c-reload>读取配置</button><button id=c-fmt>格式化</button>
   <button id=c-check>校验</button>
-  <label><input type=checkbox id=c-autoreload checked> 保存后 SIGUSR1 重载主进程</label>
   <button id=c-save class=good>保存 (自动备份 .bak)</button>
   <span class=dim id=c-path></span>
  </div>
@@ -154,6 +151,8 @@ label{color:var(--dim)}
 </section>
 <section id=s-info>
  <div class=bar><button id=i-refresh>刷新</button><button id=i-testnow class=good>▶ 立即测试线路</button>
+  <button id=i-reload class=good>⟳ 重载主进程 (SIGUSR1)</button>
+  <span id=i-dirty class=warn></span>
   <span class=dim id=i-round></span><span class=dim>状态每4秒自动刷新</span></div>
  <div class=card id=i-master></div>
  <div class=card><b>线路测试状态</b><div style=overflow:auto><table id=i-lines></table></div></div>
@@ -352,16 +351,20 @@ $("b-add").onclick=function(){
  if(dyn&&!body.gateway)body.gateway="auto";
  api("/api/bind",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
  .then(function(r){
-  if(r.ok){toast("已绑定: "+body.ifname+" mark 0x"+mark.toString(16)+" · 主进程已收到重载","good");loadBind()}
+  if(r.ok){toast("已绑定: "+body.ifname+" mark 0x"+mark.toString(16)+"(未重载,状态页可重载)","good");markDirty();loadBind()}
   else toast("拒绝: "+(r.error||JSON.stringify(r.errors||r)),"bad")}).catch(function(e){toast("请求失败 "+e,"bad")})};
 
 // ---------- shared config state ----------
 var CFG=null;
 function knownOnly(o,keys){var r={};for(var k in o){if(keys.indexOf(k)<0)r[k]=o[k]}return r}
-function pushCfg(reload,cb){
+function markDirty(){localStorage.setItem("nft_dirty","1");updateDirtyUI()}
+function updateDirtyUI(){
+ var d=localStorage.getItem("nft_dirty")==="1";
+ var dot=document.getElementById("nav-dirty");if(dot)dot.style.display=d?"inline":"none"}
+function pushCfg(cb){
  api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({config:CFG,reload:!!reload})}).then(function(r){
-   if(r.ok){toast("已保存"+(reload&&r.reload&&r.reload.ok?" 并通知主进程重载(pid "+r.reload.pid+")":" · 未重载"),"good");if(cb)cb()}
+  body:JSON.stringify({config:CFG,reload:false})}).then(function(r){
+   if(r.ok){toast("已写入配置文件(未重载) — 到 状态 页点『重载主进程』生效","good");markDirty();if(cb)cb()}
    else{var msg=(r.errors||[r.error||JSON.stringify(r)]).join("\\n");
     toast("拒绝保存:\\n"+msg,"bad");$("c-msg")&&($("c-msg").innerHTML="<span class=bad>"+msg.replace(/\\n/g,"<br>")+"</span>")}})}
 
@@ -598,7 +601,7 @@ function editProxy(name){
   if(newName!=name)delete CFG.proxy[name];
   CFG.proxy=CFG.proxy||{};CFG.proxy[newName]=out;
   closeModal();
-  pushCfg($("p-autoreload").checked,function(){renderProxy();renderRules()})})}
+  pushCfg(function(){renderProxy();renderRules()})})}
 function nextMark(){var used={};Object.keys(CFG.proxy||{}).forEach(function(k){used[(CFG.proxy[k]||{}).mark]=1});
  var m=1;while(used[m]||m===0x99||m===0x100)m++;return m}
 function delProxy(name){
@@ -606,7 +609,7 @@ function delProxy(name){
  if(refs.length)return toast("无法删除: 被 "+refs.join(", ")+" 引用（先改上游/规则）","bad");
  if(!confirm("删除线路 "+name+" 并重载?"))return;
  delete CFG.proxy[name];
- pushCfg($("p-autoreload").checked,function(){renderProxy();renderRules()})}
+ pushCfg(function(){renderProxy();renderRules()})}
 $("p-refresh").onclick=function(){loadCfg(renderProxy)};
 $("p-add").onclick=function(){editProxy(null)};
 
@@ -630,27 +633,27 @@ function renderRules(){
   var card=el("div","card");
   var head=el("div","bar");
   head.appendChild(el("b","","优先级 "+pi));
-  var up=el("button","dim","↑");up.onclick=function(){if(pi>0){var a=CFG.rules;var x=a.splice(pi,1)[0];a.splice(pi-1,0,x);pushCfg($("r-autoreload").checked,renderRules)}};
-  var dn=el("button","dim","↓");dn.onclick=function(){if(pi<CFG.rules.length-1){var a=CFG.rules;var x=a.splice(pi,1)[0];a.splice(pi+1,0,x);pushCfg($("r-autoreload").checked,renderRules)}};
-  var rm=el("button"," bad","删除优先级");rm.onclick=function(){if(!confirm("删除优先级 "+pi+"?"))return;CFG.rules.splice(pi,1);pushCfg($("r-autoreload").checked,renderRules)};
+  var up=el("button","dim","↑");up.onclick=function(){if(pi>0){var a=CFG.rules;var x=a.splice(pi,1)[0];a.splice(pi-1,0,x);pushCfg(renderRules)}};
+  var dn=el("button","dim","↓");dn.onclick=function(){if(pi<CFG.rules.length-1){var a=CFG.rules;var x=a.splice(pi,1)[0];a.splice(pi+1,0,x);pushCfg(renderRules)}};
+  var rm=el("button"," bad","删除优先级");rm.onclick=function(){if(!confirm("删除优先级 "+pi+"?"))return;CFG.rules.splice(pi,1);pushCfg(renderRules)};
   head.appendChild(up);head.appendChild(dn);head.appendChild(rm);card.appendChild(head);
   Object.keys(prio||{}).forEach(function(line){
    var row=el("div");row.style.cssText="display:flex;gap:8px;align-items:center;margin:4px 0";
    var sel=document.createElement("select");
    Object.keys(CFG.proxy||{}).forEach(function(pn){var op=el("option","",pn);op.value=pn;if(pn==line)op.selected=true;sel.appendChild(op)});
-   sel.onchange=function(){var v=prio[line];delete prio[line];prio[sel.value]=v;pushCfg($("r-autoreload").checked,renderRules)};
+   sel.onchange=function(){var v=prio[line];delete prio[line];prio[sel.value]=v;pushCfg(renderRules)};
    row.appendChild(sel);
    var cond=prio[line];
    var txt=el("span","dim",ruleLabel(cond));row.appendChild(txt);
    var ed=el("button","dim","编辑条件");ed.onclick=function(){editCond(pi,line)};row.appendChild(ed);
-   var dl=el("button"," bad","移除");dl.onclick=function(){if(!confirm("从优先级 "+pi+" 移除 "+line+"?"))return;delete prio[line];pushCfg($("r-autoreload").checked,renderRules)};
+   var dl=el("button"," bad","移除");dl.onclick=function(){if(!confirm("从优先级 "+pi+" 移除 "+line+"?"))return;delete prio[line];pushCfg(renderRules)};
    row.appendChild(dl);card.appendChild(row)});
   var addl=el("button","dim","+ 本优先级加线路");
   addl.onclick=function(){
    var name=prompt("线路名 (必须已在线路管理中存在)","");
    if(!name)return;if(!CFG.proxy[name])return toast("线路不存在: "+name,"bad");
    if(prio[name])return toast("已存在","warn");
-   prio[name]={any:true};pushCfg($("r-autoreload").checked,renderRules)};
+   prio[name]={any:true};pushCfg(renderRules)};
   card.appendChild(addl);
   box.appendChild(card)})}
 function editCond(pi,line){
@@ -691,10 +694,10 @@ function editCond(pi,line){
   if(out.any&&Object.keys(out).length>1)delete out.any;
   prio[line]=out;
   closeModal();
-  pushCfg($("r-autoreload").checked,function(){renderRules()})})}
+  pushCfg(function(){renderRules()})})}
 $("r-refresh").onclick=function(){loadCfg(renderRules)};
 $("r-add").onclick=function(){if(!Object.keys(CFG.proxy||{}).length)return toast("先创建线路","bad");
- CFG.rules.push({});pushCfg($("r-autoreload").checked,renderRules)};
+ CFG.rules.push({});pushCfg(renderRules)};
 
 // ---------- config tab ----------
 function loadCfg(cb){api("/api/config").then(function(d){
@@ -707,9 +710,9 @@ $("c-check").onclick=function(){var cfg;try{cfg=JSON.parse($("c-box").value)}cat
  api("/api/validate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg})}).then(function(r){
   $("c-msg").innerHTML=r.ok?"<span class=good>校验通过</span>":("<span class=bad>错误:</span><br>"+r.errors.map(function(x){return "· "+x}).join("<br>"))})};
 $("c-save").onclick=function(){var cfg;try{cfg=JSON.parse($("c-box").value)}catch(e){return toast("JSON 错误: "+e,"bad")}
- if(!confirm("保存配置"+($("c-autoreload").checked?" 并通知主进程重载(SIGUSR1)":"")+"？"))return;
- api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg,reload:$("c-autoreload").checked})}).then(function(r){
-  if(r.ok){toast("已保存"+(r.reload&&r.reload.ok?" · 主进程已重载(pid "+r.reload.pid+")":" · 未发送信号"), "good");loadCfg()}
+ if(!confirm("保存整份配置到 nft_route.json？(仅写文件，不通知主进程)"))return;
+ api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg,reload:false})}).then(function(r){
+  if(r.ok){toast("已保存(未重载) — 到 状态 页点『重载主进程』生效","good");markDirty();loadCfg()}
   else{var msg=(r.errors||[r.error||JSON.stringify(r)]).join("\\n");toast("拒绝保存:\\n"+msg,"bad");$("c-msg").innerHTML="<span class=bad>"+msg.replace(/\\n/g,"<br>")+"</span>"}})};
 loadCfg();
 
@@ -869,6 +872,14 @@ function putRows(t,cols,rows){
    tr.appendChild(td)});tb.appendChild(tr)});
  t.appendChild(tb)}
 function loadInfo(){api("/api/health").then(function(d){
+ var cm=d.config_mtime, lr=d.last_reload;
+ var stale_ui=localStorage.getItem("nft_dirty")==="1";
+ var stale=(cm&&(!lr||cm>lr))||stale_ui;
+ var box=$("i-dirty");
+ if(box){box.textContent=stale?("⚠ 配置已修改尚未重载 · 配置 "+(cm?new Date(cm*1000).toLocaleTimeString():"?")+" / 上次重载 "+(lr?new Date(lr*1000).toLocaleTimeString():"从未")):"";
+  box.style.color="var(--yellow)"}
+ if(!stale&&lr&&cm&&cm<=lr){localStorage.removeItem("nft_dirty")}
+ updateDirtyUI();
  $("info-box").textContent=JSON.stringify(d,null,2);
  var m=d.master||{};
  var mw=$("i-master");mw.innerHTML="";
@@ -922,6 +933,11 @@ function loadInfo(){api("/api/health").then(function(d){
  if(d.error){var er=el("div","bad","health: "+d.error);$("i-master").appendChild(er)}
  }).catch(function(e){$("i-round").textContent="health 加载失败: "+e})}
 $("i-refresh").onclick=loadInfo;
+$("i-reload").onclick=function(){
+ if(!confirm("向主进程发送 SIGUSR1 执行完整重载？\\n(重读配置:egress/链/规则/worker全部重启)"))return;
+ api("/api/reload",{method:"POST"}).then(function(r){
+  if(r.ok){toast("已重载 (pid "+r.pid+")","good");localStorage.removeItem("nft_dirty");updateDirtyUI();loadInfo()}
+  else toast("重载失败: "+(r.error||""),"bad")}).catch(function(e){toast(""+e,"bad")})};
 $("i-testnow").onclick=function(){
  api("/api/test_now",{method:"POST"}).then(function(r){
   toast(r.ok?"已请求立即测试线路（轮询周期1s，稍候看结果）":"触发失败: "+(r.error||""),r.ok?"good":"bad");

@@ -883,6 +883,7 @@ class App:
         self.hub = Hub()
         self.streamer = Streamer(self.ring, self.hub, args.redis_host, args.redis_port, args.redis_db)
         self.started = time.time()
+        self.last_reload = None   # ts of last explicit /api/reload from this UI
 
 
 def _load_ui():
@@ -995,6 +996,7 @@ class Handler(BaseHTTPRequestHandler):
                 st["config_mtime"] = os.stat(self.cfg_path()).st_mtime
             except OSError:
                 pass
+            st["last_reload"] = self.app.last_reload
             st.update({"master": check_master(),
                        "redis_stream": self.app.streamer.alive,
                        "ws_clients": self.app.hub.count(),
@@ -1037,7 +1039,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(500, {"ok": False, "error": "save failed: %s" % e})
                 return
-            rc = signal_master() if body.get("reload", True) else {"ok": None, "error": "reload suppressed"}
+            # config saves NEVER signal implicitly; explicit /api/reload only
+            rc = {"ok": None, "error": "use POST /api/reload"}
+            if body.get("reload"):
+                rc = signal_master()
             self.send_json(200, {"ok": True, "reload": rc})
         elif path == "/api/bind":
             cfg = ib.load_config(self.cfg_path())
@@ -1068,12 +1073,15 @@ class Handler(BaseHTTPRequestHandler):
             if gw or cand["dynamic"]:
                 entry.setdefault("iprule", {})["gateway"] = gw or "auto"
             ib.save_config(self.cfg_path(), cfg)
-            rc = signal_master() if body.get("reload", True) else {}
+            rc = {} if not body.get("reload") else signal_master()
             self.send_json(200, {"ok": True, "entry": entry, "reload": rc})
         elif path == "/api/routes":
             self.send_json(200, rt_edit(body))
         elif path == "/api/reload":
-            self.send_json(200, signal_master())
+            r = signal_master()
+            if r.get("ok"):
+                self.app.last_reload = time.time()
+            self.send_json(200, r)
         elif path == "/api/mtr":
             try:
                 cfg = ib.load_config(self.cfg_path())
