@@ -38,6 +38,7 @@ process is spawned.
 
 import errno
 import json
+import shutil
 import os
 import pwd
 import re
@@ -84,7 +85,9 @@ def build_cmd(name, cfg):
     extra = [str(a) for a in cfg.get("args", [])]
 
     if daemon == "ss-redir":
-        argv = ["/usr/sbin/ss-redir", "-b", "0.0.0.0", "-l", str(cfg["port"])]
+        # Debian: /usr/bin/ss-redir ; some builds /usr/sbin/ -> resolve via PATH
+        ssb = cfg.get("binary") or shutil.which("ss-redir") or "/usr/sbin/ss-redir"
+        argv = [ssb, "-b", "0.0.0.0", "-l", str(cfg["port"])]
         server = cfg.get("server") or cfg.get("proxy_ip")
         if not server:
             raise ValueError("%s: ss-redir needs 'server'/'proxy_ip'" % name)
@@ -108,7 +111,7 @@ def build_cmd(name, cfg):
         return argv + extra
 
     if daemon in ("v2ray", "sing-box"):
-        binary = cfg.get("binary", daemon)
+        binary = cfg.get("binary") or shutil.which(daemon) or daemon
         conf = cfg.get("config")
         if not conf:
             raise ValueError("%s: daemon %s needs 'config' path" % (name, daemon))
