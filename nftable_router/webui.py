@@ -36,6 +36,8 @@ td.line{color:var(--purple)}td.dst{color:var(--cyan)}td.src{color:#c9b458}
 .bad{color:var(--red)}.good{color:var(--green)}.warn{color:var(--yellow)}.dim{color:var(--dim)}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:8px}
+td.ell{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+td.ell.wrap{white-space:normal;word-break:break-all;text-overflow:clip}
 #colsbox{margin:0 0 8px}#colsbox label{display:inline-block;margin:2px 12px 2px 0;color:var(--fg);cursor:pointer;user-select:none}
 #colsbox label input{vertical-align:-2px}#colsbox button{margin-left:10px}
 #toast{position:fixed;right:14px;bottom:14px;max-width:420px}
@@ -113,7 +115,7 @@ var COLS=[
  {id:"sport",label:"源端口",   def:1, get:function(r){return r.sport!=null?r.sport:""}},
  {id:"dst",  label:"目的",     def:1, cls:function(){return "dst"},  get:function(r){return r.dst}},
  {id:"dport",label:"目的端口", def:1, get:function(r){return r.dport!=null?r.dport:""}},
- {id:"qname",label:"域名",     def:1, cls:function(){return "dim"}, get:function(r){return r.qname||""}},
+ {id:"qname",label:"域名",     def:1, cls:function(){return "dim ell"}, get:function(r){return r.qname||""}},
  {id:"cc",   label:"国家",     def:1, get:function(r){var g=r.geo||{};return g.cc?flagOf(g.cc):""}},
  {id:"cname",label:"国家名",   def:0, get:function(r){var g=r.geo||{};return g.cn||""}},
  {id:"region",label:"地区",    def:0, get:function(r){var g=r.geo||{};return g.rg||""}},
@@ -139,7 +141,10 @@ function rowMatch(r,q){if(!q)return true;return searchText(r).indexOf(q)>=0}
 function trOf(r){
  var tr=el("tr");
  visibleCols().forEach(function(c){
-  var v=c.get(r);var td=el("td",c.cls?c.cls(r):"",v!=null?String(v):"");
+  var v=c.get(r);var txt=v!=null?String(v):"";
+  var td=el("td",c.cls?c.cls(r):"",txt);
+  if(txt)td.title=txt;
+  if(c.cls&&/\bell\b/.test(c.cls(r)))td.onclick=function(){this.classList.toggle("wrap")};
   tr.appendChild(td)});
  tr.dataset.k=searchText(r);
  if(r.sess==2)tr.style.opacity=.55;
