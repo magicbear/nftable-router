@@ -3,13 +3,13 @@
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260901-2300"
+UI_VERSION = "20260901-2320"
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nft-route 管理台</title>
-<script>var UI_VER="20260901-2300";</script>
+<script>var UI_VER="20260901-2320";</script>
 <style>
 :root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
 --green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
@@ -104,6 +104,7 @@ label{color:var(--dim)}
   <span><label>类型</label><br><select id=b-dyn><option value=0>静态(按IP)</option><option value=1>动态(按接口)</option></select></span>
   <span><label>fwmark（复用线路或自定义）</label><br><select id=b-mark></select> <input id=b-markx placeholder=自定义 width:90px style=width:90px disabled></span>
   <span><label>网关 (动态可填 auto)</label><br><input id=b-gw placeholder="93.184.216.35 / auto"></span>
+  <span id="b-match" class=dim style="align-self:end"></span>
   <span style=align-self:end><button id=b-add>绑定并重载</button></span>
  </div></div>
 </section>
@@ -306,12 +307,19 @@ tabs.forEach(function(b){b.onclick=function(){
 
 // ---------- bind tab ----------
 var ifData=null;
+function unbindEntry(b){
+ if(!confirm("解绑 "+(b.ip||b.iface)+" (mark "+b.mark+") ?\n只修改配置文件；在状态页『重载主进程』后 nft 打标规则才会撤销。\n注意:ip rule/路由表若为手工段(ext)不会被自动删除。"))return;
+ api("/api/unbind",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({mark:b.mark,ip:b.ip||"",iface:b.iface||""})}).then(function(r){
+   if(r.ok){if(r.mtime)CFG_MTIME=r.mtime;markDirty();toast("已解绑 "+(b.ip||b.iface)+"(未重载)","good");
+    loadCfg(function(){loadBind()})}
+   else toast("解绑失败: "+(r.error||""),"bad")}).catch(function(e){toast("请求失败 "+e,"bad")})}
 function api(p,init){return fetch(p,init).then(function(x){return x.json()})}
 function loadBind(){
  api("/api/interfaces").then(function(d){
   ifData=d;
   var tb=$("tbl-bound");tb.innerHTML="";
-  var cols=["接口/IP","类型","mark","网关","状态"];cols.forEach(function(c){tb.tHead=tb.tHead||document.createElement("thead");tb.tHead.appendChild(el("th","",c))});
+  var thead=document.createElement("thead");thead.innerHTML="<tr><th>接口/IP</th><th>类型</th><th>mark</th><th>网关</th><th>状态</th><th>操作</th></tr>";tb.appendChild(thead);
   var body=document.createElement("tbody");(d.bindings||[]).forEach(function(b){
    var tr=el("tr");
    tr.appendChild(el("td","",(b.ip||"")+(b.iface?(" @"+b.iface):"")));
@@ -319,10 +327,14 @@ function loadBind(){
    tr.appendChild(el("td","good","0x"+(b.mark>>>0).toString(16)+" ("+b.mark+")"));
    tr.appendChild(el("td","dim",((b.iprule||{}).gateway)||"未设置"));
    tr.appendChild(el("td","dim","生效由主进程对账"));
+   var tdop=el("td");
+   var bd=el("button"," bad","解绑");
+   bd.onclick=(function(bb){return function(){unbindEntry(bb)}})(b);
+   tdop.appendChild(bd);tr.appendChild(tdop);
    body.appendChild(tr)});
   tb.appendChild(body);
   var tc=$("tbl-cand");tc.innerHTML="";
-  tc.tHead=tc.tHead||document.createElement("thead");tc.tHead.innerHTML="<tr><th>接口</th><th>地址</th><th>获取方式</th><th>绑定</th></tr>";
+  tc.tHead=tc.tHead||document.createElement("thead");tc.tHead.innerHTML="<tr><th>接口</th><th>地址</th><th>获取方式</th><th>绑定</th><th>操作</th></tr>";
   var cb=document.createElement("tbody");
   (d.candidates||[]).forEach(function(c){
    var tr=el("tr");
@@ -330,7 +342,9 @@ function loadBind(){
    tr.appendChild(el("td","",c.ip?c.ip+"/"+c.prefixlen:""));
    tr.appendChild(el("td","dim",c.method+(c.dynamic?" · 动态":"")));
    tr.appendChild(el("td",c.bound?"good":"warn",c.bound?("已绑定 mark "+c.mark):"未绑定"));
-   cb.appendChild(tr)});
+   var td=el("td");
+   if(!c.bound){var bt=el("button","good","→ 填表");bt.onclick=function(){bindPrefill(c)};td.appendChild(bt)}
+   tr.appendChild(td);cb.appendChild(tr)});
   tc.appendChild(cb);
   // form options
   var sel=$("b-iface");sel.innerHTML="";
@@ -345,6 +359,24 @@ function loadBind(){
   mk.appendChild(el("option","","自定义数值…")).dataset.v="x";
   mk.onchange=function(){$("b-markx").disabled=this.dataset.v!="x"};
  }).catch(function(e){toast("接口扫描失败: "+e,"bad")})}
+function bindPrefill(c){
+ var sel=$("b-iface");[].some.call(sel.options,function(o){return o.value===c.ifname})&&(sel.value=c.ifname);
+ $("b-ip").value=c.dynamic?"":c.ip;
+ $("b-dyn").value=c.dynamic?"1":"0";
+ if(c.dynamic)$("b-gw").value=$("b-gw").value||"auto";
+ sel.dispatchEvent(new Event("change"));$("b-ip").dispatchEvent(new Event("input"));
+ $("b-ip").scrollIntoView({behavior:"smooth",block:"center"})}
+function syncIfaceFromIp(){
+ var ip=$("b-ip").value.trim();if(!ip||!ifData)return;
+ var c=[].find.call(ifData.candidates||[],function(x){return x.ip===ip});
+ var hint=$("b-match");
+ if(!c){hint.textContent="⚠ 该IP不在扫描到的公网候选里(内网/未起来/输错)";hint.className="warn";return}
+ hint.textContent="✓ "+ip+" 位于 "+c.ifname+(c.dynamic?" (动态)":"");hint.className="good";
+ var sel=$("b-iface");
+ if([].some.call(sel.options,function(o){return o.value===c.ifname})&&sel.value!==c.ifname){
+  if(confirm("IP "+ip+" 实际在 "+c.ifname+" 上，接口已从 "+sel.value+" 自动纠正"))sel.value=c.ifname}
+ $("b-dyn").value=c.dynamic?"1":"0"}
+$("b-ip").addEventListener("input",syncIfaceFromIp);
 $("b-add").onclick=function(){
  if(!ifData)return toast("先等候选列表加载","warn");
  var dyn=$("b-dyn").value=="1";

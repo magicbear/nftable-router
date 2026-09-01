@@ -1129,6 +1129,38 @@ class Handler(BaseHTTPRequestHandler):
                     "prefixlen": int(body.get("prefixlen", 32)),
                     "version": 6 if ":" in ip else 4,
                     "dynamic": dyn, "method": "manual"}
+            # --- IP <-> NIC consistency against LIVE interfaces (route dev!) ---
+            try:
+                det = netinfo.detect()
+            except Exception:
+                det = {}
+            def owner_of(addr):
+                return [nm for nm, r in det.items()
+                        if any(a["addr"] == addr for a in r["addrs"])]
+            if cand["ifname"] not in det:
+                self.send_json(422, {"ok": False,
+                                     "error": "接口 %s 不存在于本机" % cand["ifname"]})
+                return
+            if ip and not dyn:
+                own = owner_of(ip)
+                if not own:
+                    self.send_json(422, {"ok": False,
+                                         "error": "IP %s 当前不在任何接口上（确认是否输错/接口未起来）；如确需预绑定请在服务器上直接改配置" % ip})
+                    return
+                if cand["ifname"] not in own:
+                    self.send_json(422, {"ok": False,
+                                         "error": "IP %s 不在接口 %s 上，实际位于 %s —— 路由表 dev 会挂错网卡，已拒绝；请改用正确接口" % (
+                                             ip, cand["ifname"], "/".join(own))})
+                    return
+            if dyn and det[cand["ifname"]].get("master"):
+                self.send_json(422, {"ok": False,
+                                     "error": "%s 是 %s 的从属网卡，请绑定主接口 %s" % (
+                                         cand["ifname"], det[cand["ifname"]]["master"],
+                                         det[cand["ifname"]]["master"])})
+                return
+            if ip and dyn:      # dynamic: iface wins, drop mistyped ip
+                ip = ""
+                cand["ip"] = ""
             try:
                 entry = ib.add_binding(cfg, cand, mark)
             except ValueError as e:
@@ -1144,6 +1176,34 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 nm = None
             self.send_json(200, {"ok": True, "entry": entry, "reload": rc, "mtime": nm})
+        elif path == "/api/unbind":
+            cfg = ib.load_config(self.cfg_path())
+            ip = str(body.get("ip") or "").strip()
+            iface = str(body.get("iface") or "").strip()
+            try:
+                mark = int(body.get("mark"))
+            except (TypeError, ValueError):
+                self.send_json(422, {"ok": False, "error": "mark 必填(精确定位绑定条目)"})
+                return
+            removed, keep = [], []
+            for e in cfg.get("egress_marks", []):
+                hit = int(e.get("mark", -1)) == mark and (
+                    (e.get("ip") == ip and ip) or (e.get("iface") == iface and iface))
+                (removed if hit else keep).append(e)
+            if not removed:
+                self.send_json(404, {"ok": False, "error": "未找到匹配绑定 (mark %d / %s / %s)" % (mark, ip, iface)})
+                return
+            cfg["egress_marks"] = keep
+            try:
+                ib.save_config(self.cfg_path(), cfg)
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "save failed: %s" % e})
+                return
+            try:
+                nm = os.stat(self.cfg_path()).st_mtime
+            except OSError:
+                nm = None
+            self.send_json(200, {"ok": True, "removed": removed, "mtime": nm})
         elif path == "/api/routes":
             self.send_json(200, rt_edit(body))
         elif path == "/api/reload":

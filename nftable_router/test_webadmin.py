@@ -163,6 +163,18 @@ def test_server_e2e():
         args = type("A", (), {"config": cpath, "ring_max": 1000, "redis_host": "127.0.0.1",
                               "redis_port": 1, "redis_db": 1, "pidfile": os.path.join(d, "no.pid")})()
         wa.PIDFILE_ARG = args.pidfile
+        wa.netinfo.detect = lambda: {
+            "lo": {"index": 1, "up": True, "lower_up": True, "loopback": True, "master": None,
+                   "methods": ["loopback"], "dhcp": False,
+                   "addrs": [{"version": 4, "addr": "127.0.0.1", "prefixlen": 8, "scope": "host"}]},
+            "ppp0": {"index": 33, "up": True, "lower_up": True, "master": None,
+                     "methods": ["ppp"], "dhcp": False, "addrs": []},
+            "bond1.9": {"index": 12, "up": True, "lower_up": True, "master": None,
+                        "methods": ["static"], "dhcp": False,
+                        "addrs": [{"version": 4, "addr": "203.0.113.9", "prefixlen": 31, "scope": "global"}]},
+            "bond1.8": {"index": 11, "up": True, "lower_up": True, "master": None, "methods": ["static"],
+                        "dhcp": False, "addrs": []},
+        }
         app = wa.App(args)
         app.ring.push({"ts": time.time(), "proto": 6, "src": "1.1.1.1", "dst": "2.2.2.2",
                        "sport": 1, "dport": 2, "line": "A", "mark": 51, "pri": 0, "sess": 0, "ms": 1.0})
@@ -298,6 +310,24 @@ def test_server_e2e():
             check("bind added egress entry", res.get("ok") and len(eb) == 1)
             check("iprule.gateway auto recorded", eb and eb[0]["iprule"]["gateway"] == "auto")
             s.close()
+            def post_json(path_, obj):
+                ss = socket.create_connection(("127.0.0.1", port), timeout=3)
+                pl = json.dumps(obj)
+                ss.sendall(("POST %s HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
+                            "\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (path_, len(pl), pl)).encode())
+                hd = b""
+                while b"\r\n\r\n" not in hd:
+                    hd += ss.recv(4096)
+                hh, rr = hd.split(b"\r\n\r\n", 1)
+                r_ = json.loads(read_http_body(ss, hh, rr)); ss.close()
+                return hh, r_
+            hh, r_ = post_json("/api/bind", {"ifname": "ghost0", "dynamic": True, "mark": 7001, "reload": False})
+            check("bind nonexistent iface -> 422", b"422" in hh and "不存在" in r_.get("error", ""))
+            hh, r_ = post_json("/api/bind", {"ifname": "bond1.8", "ip": "203.0.113.9", "mark": 7002, "reload": False})
+            check("IP not on chosen iface -> 422 names real owner",
+                  b"422" in hh and "bond1.9" in r_.get("error", ""))
+            hh, r_ = post_json("/api/bind", {"ifname": "bond1.9", "ip": "203.0.113.9", "mark": 7003, "reload": False})
+            check("correct iface+ip pair accepted", r_.get("ok") is True)
             # websocket flow: handshake -> hello+snap frames -> broadcast -> client close
             s = socket.create_connection(("127.0.0.1", port), timeout=3)
             head, rest = http_req(s, "GET /ws/stream HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
