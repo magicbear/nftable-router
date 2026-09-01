@@ -589,7 +589,10 @@ function putRows(t,cols,rows){
  cols.forEach(function(c){tr.appendChild(el("th","",c))});th.appendChild(tr);t.appendChild(th);
  var tb=document.createElement("tbody");
  rows.forEach(function(r){var tr=el("tr");r.forEach(function(c){
-   if(c&&c.nodeType)tr.appendChild(c);else tr.appendChild(el("td","",c==null?"":String(c)))});tb.appendChild(tr)});
+   var td=el("td");
+   if(c&&c.nodeType){td.appendChild(c)}
+   else{td.textContent=(c==null?"":String(c))}
+   tr.appendChild(td)});tb.appendChild(tr)});
  t.appendChild(tb)}
 function loadInfo(){api("/api/health").then(function(d){
  $("info-box").textContent=JSON.stringify(d,null,2);
