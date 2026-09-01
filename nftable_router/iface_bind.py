@@ -394,7 +394,8 @@ def restore_in_ruleset(ruleset, family="ip"):
         items = []
     for item in items:
         rule = item.get("rule") if isinstance(item, dict) else None
-        if not rule or rule.get("family") != family:
+        # an inet-family table covers both ip and ip6 hooks
+        if not rule or rule.get("family") not in (family, "inet"):
             continue
         for e in rule.get("expr", []):
             m = e.get("mangle", {}) if isinstance(e, dict) else {}
@@ -448,10 +449,22 @@ IPRULE_PRIO_SPAN = 900
 
 
 def iprule_plan(cfg, family=4):
-    """Normalize config into desired ip-rule state (list of plans)."""
+    """Normalize config into desired ip-rule state (list of plans).
+
+    Bindings that reuse a proxy-LINE mark are only auto-managed when the
+    binding carries an explicit "iprule" object: line marks normally already
+    have hand-maintained ip rules/tables (tunnel routes etc.), and silently
+    shadowing them with a bare-default table would divert that line's policy
+    traffic. Invalid entries are skipped (validate_bindings reports them)."""
     plans = []
+    line_marks = proxy_marks(cfg)
     for b in get_bindings(cfg):
-        mark = int(b["mark"])
+        try:
+            mark = int(b["mark"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if mark in line_marks and not b.get("iprule"):
+            continue
         ip = b.get("ip")
         dynamic = bool(b.get("dynamic"))
         if ip is not None:
@@ -486,13 +499,21 @@ def _our_priority(prio):
 
 def iprule_apply(ipr, plans, log=None, auto_gateway=None):
     """Idempotent reconcile of ip rules + route tables using a pyroute2
-    IPRoute-like object. Returns summary dict of lists:
+    IPRoute-like object.
+
+    IMPORTANT: `plans` must contain the plans of EVERY family managed in the
+    config (v4 + v6 together). The stale sweep below removes any owned-band
+    rule whose (fwmark, family) is absent from the plans -- passing a single
+    family's plans would tear down the other family's live rules.
+
+    Returns summary dict of lists:
       added / kept / external / removed / pending (waiting gateway) / errors.
     auto_gateway(dev, family) -> gw|None resolver is injectable for tests."""
     res = {"added": [], "kept": [], "external": [], "removed": [], "pending": [], "errors": []}
     logf = log or (lambda m: None)
     af = {4: socket.AF_INET, 6: socket.AF_INET6}
     want_marks = {(p["mark"], p["family"]) for p in plans}
+    active_tables = {(p["table"], p["family"]) for p in plans}
 
     def norm_fwmark(r):
         fw = r.get("fwmark", 0)
@@ -500,7 +521,19 @@ def iprule_apply(ipr, plans, log=None, auto_gateway=None):
             fw = int(fw, 0)
         return fw & 0xffffffff
 
-    # current rules for this family
+    def del_rule_and_flush(r, m, fam, why):
+        ipr.rule("del", priority=r.get("priority"), fwmark=m,
+                 table=r.get("table"), family=af[fam])
+        logf("ip rule del fwmark %d (%s)" % (m, why))
+        tbl = r.get("table") or m
+        if (tbl, fam) not in active_tables:
+            try:      # flush the default route we owned in that table
+                ipr.route("del", dst="default", table=tbl, family=af[fam])
+                logf("route table %d flushed (%s)" % (tbl, why))
+            except Exception:
+                pass  # table already empty / no default -> nothing to do
+
+    # current rules, both families
     cur = {}
     for fam in (4, 6):
         try:
@@ -513,25 +546,16 @@ def iprule_apply(ipr, plans, log=None, auto_gateway=None):
             if m:
                 cur.setdefault((m, fam), []).append(r)
 
-    # ---- remove stale (ours, no longer in config)
-    active_tables = {(p["table"], p["family"]) for p in plans}
+    # ---- remove stale (ours, no longer in config). Ownership is the priority
+    # band alone: a custom "iprule.table" rule is still ours to clean up.
     for (m, fam), rl in cur.items():
         if (m, fam) in want_marks:
             continue
         for r in rl:
-            if _our_priority(r.get("priority", 0)) and (r.get("table") or 0) == m:
+            if _our_priority(r.get("priority", 0)):
                 try:
-                    ipr.rule("del", priority=r.get("priority"), fwmark=m,
-                             table=r.get("table"), family=af[fam])
-                    logf("ip rule del fwmark %d (stale binding)" % m)
+                    del_rule_and_flush(r, m, fam, "stale binding")
                     res["removed"].append(m)
-                    tbl = r.get("table") or m
-                    if (tbl, fam) not in active_tables:
-                        try:      # flush the default route we owned in that table
-                            ipr.route("del", dst="default", table=tbl, family=af[fam])
-                            logf("route table %d flushed (binding removed)" % tbl)
-                        except Exception:
-                            pass  # table already empty / no default -> nothing to do
                 except Exception as e:
                     res["errors"].append("rule del fwmark %d: %s" % (m, e))
 
@@ -564,15 +588,25 @@ def iprule_apply(ipr, plans, log=None, auto_gateway=None):
         key = (p["mark"], fam)
         tag = "fwmark %d -> table %s via %s dev %s" % (
             p["mark"], p["table"], p["gateway"] or "auto", p["dev"])
-        ours = [r for r in cur.get(key, []) if _our_priority(r.get("priority", 0))
-                and (r.get("table") or 0) == p["table"]]
+        ours = [r for r in cur.get(key, []) if _our_priority(r.get("priority", 0))]
         foreign = [r for r in cur.get(key, []) if r not in ours]
+        exact = [r for r in ours if (r.get("table") or 0) == p["table"]
+                 and r.get("priority") == p["priority"]]
         if foreign and not ours:
             res["external"].append(p["mark"])
             logf("ip rule %s: manual/external rule exists -> untouched" % tag)
             continue
+        # migrate: owned-band rules whose table/priority no longer match the
+        # plan (config changed) are replaced instead of reported external
+        for r in ours:
+            if r in exact:
+                continue
+            try:
+                del_rule_and_flush(r, p["mark"], fam, "table/priority changed")
+            except Exception as e:
+                res["errors"].append("rule migrate fwmark %d: %s" % (p["mark"], e))
         # 1) rule
-        if not ours:
+        if not exact:
             try:
                 ipr.rule("add", priority=p["priority"], fwmark=p["mark"],
                          table=p["table"], family=af[fam])

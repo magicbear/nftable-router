@@ -87,6 +87,21 @@ class nftUtils():
         else:
             return self.nft.json_cmd({"nftables": [{"add": {"rule": params}}]})
 
+    def insert_rule(self, params):
+        """Like add_rule but INSERTS at the head of the chain (nft 'insert
+        rule'), so the rule evaluates before every appended rule."""
+        if type(params['chain']) is list:
+            rc = []
+            chains = params['chain']
+            for i in range(0, len(chains)):
+                v_params = params
+                v_params['chain'] = chains[i]
+                rc.append(self.nft.json_cmd({"nftables": [{"insert": {"rule": v_params}}]}))
+
+            return rc
+        else:
+            return self.nft.json_cmd({"nftables": [{"insert": {"rule": params}}]})
+
     def replace_rule(self, params):
         # print("[-] replace rule")
         if type(params['chain']) is list:

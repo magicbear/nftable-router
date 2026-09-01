@@ -546,13 +546,53 @@ def test_wizard_post_bind():
     check("entry got iprule.gateway", created[0].get("iprule", {}).get("gateway") == "auto")
 
 
+def test_iprule_combined_families_no_flap():
+    print("[18] combined v4+v6 apply: no cross-family rule teardown")
+    # regression: per-family apply calls used to treat the OTHER family's own
+    # rules as stale and delete them every sync cycle (60s egress blackholes)
+    binds = [{"iface": "ppp0", "mark": 1007, "dynamic": True,
+              "iprule": {"gateway": "auto"}}]
+    cfg = _cfg_with_bindings(binds)
+    plans = ib.iprule_plan(cfg, 4) + ib.iprule_plan(cfg, 6)
+    check("dynamic binding plans both families", {p["family"] for p in plans} == {4, 6})
+    ipr = MockIPRoute()
+    auto_gw = lambda dev, fam: "10.64.64.64" if fam == 4 else None
+    r1 = ib.iprule_apply(ipr, plans, auto_gateway=auto_gw)
+    check("both family rules added", sorted(r1["added"]) == [1007, 1007], str(r1))
+    r2 = ib.iprule_apply(ipr, plans, auto_gateway=auto_gw)
+    check("second combined apply: nothing added/removed",
+          not r2["added"] and not r2["removed"], str(r2))
+    check("v4 rule survived", any(r.get("fwmark") == 1007 and r.get("family") == _sock.AF_INET
+                                  for r in ipr.rules))
+    check("v6 rule survived", any(r.get("fwmark") == 1007 and r.get("family") == _sock.AF_INET6
+                                  for r in ipr.rules))
+
+
+def test_iprule_line_mark_opt_in():
+    print("[19] proxy-line marks are managed only with explicit iprule")
+    # reusing a line mark without explicit iprule must NOT be auto-managed:
+    # line marks usually have hand-maintained rules/tables (tunnel routes),
+    # and a bare-default auto table would divert that line's policy traffic
+    cfg = _cfg_with_bindings([{"ip": "93.184.216.34", "iface": "bond0.2000", "mark": 51}])
+    check("line mark without iprule -> no plan", ib.iprule_plan(cfg, 4) == [])
+    cfg2 = _cfg_with_bindings([{"ip": "93.184.216.34", "iface": "bond0.2000", "mark": 51,
+                               "iprule": {"gateway": "93.184.216.35"}}])
+    check("line mark with explicit iprule -> planned",
+          [p["mark"] for p in ib.iprule_plan(cfg2, 4)] == [51])
+    cfg3 = _cfg_with_bindings([{"ip": "93.184.216.34", "iface": "bond0.2000", "mark": 1005,
+                               "iprule": {"gateway": "93.184.216.35"}}])
+    check("non-line mark planned as before",
+          [p["mark"] for p in ib.iprule_plan(cfg3, 4)] == [1005])
+
+
 if __name__ == "__main__":
     for t in [test_classify_and_scan, test_plan_bound_vs_needs, test_dynamic_identity_by_iface,
               test_next_free_mark, test_duplicate_and_collision_rejected, test_validate_bindings,
               test_wizard_flow, test_rules_safety_and_shape, test_guard_never_clobbers_policy_mark,
               test_atomic_save_and_backup, test_bad_input_no_partial_write, test_json_roundtrip_via_add_binding,
               test_clear_egress_rules, test_restore_json_detection,
-              test_iprule_plan, test_iprule_apply_lifecycle, test_wizard_post_bind]:
+              test_iprule_plan, test_iprule_apply_lifecycle, test_wizard_post_bind,
+              test_iprule_combined_families_no_flap, test_iprule_line_mark_opt_in]:
         t()
     print("\n==== %d passed, %d failed ====" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

@@ -147,7 +147,13 @@ def test_chain_rules():
     }
     uid_cache = {"A": 1200, "B": 1201, "U": None}
     rules = pm.plan_proxy_chain_rules(cfgs, uid_cache, "ip")
-    check("one rule per chained proxy", len(rules) == 1)
+    # chained A -> redirect rule; direct managed B -> skuid accept guard
+    # (exempts B's upstream egress from policy marking / self-redirect)
+    check("redirect rule for chained + accept guard for direct", len(rules) == 2)
+    guards = [r for r in rules if any("accept" in e for e in r["expr"])]
+    check("direct B got exactly one accept guard",
+          len(guards) == 1 and any(
+              e.get("match", {}).get("right") == 1201 for e in guards[0]["expr"]))
     r = rules[0]
     skuid = [e for e in r["expr"] if e.get("match", {}).get("left") == {"meta": {"key": "skuid"}}]
     check("matches A's own skuid", any(e["match"]["op"] == "==" and e["match"]["right"] == 1200 for e in skuid))
@@ -157,9 +163,12 @@ def test_chain_rules():
     dport = [e for e in r["expr"] if e.get("match", {}).get("left") == {"payload": {"protocol": "tcp", "field": "dport"}}]
     check("excludes dport==upstream port (anti re-entry)",
           any(e["match"]["op"] == "!=" and e["match"]["right"] == 10507 for e in dport))
-    verdicts = {"drop", "accept", "queue", "reject"}
-    check("no hard verdicts in chain rules",
+    verdicts = {"drop", "queue", "reject"}
+    check("no drop/queue/reject in chain rules",
           not any(set(e.keys()) & verdicts for r in rules for e in r["expr"]))
+    check("accept only on the direct guard, never on redirect rules",
+          not any("accept" in e for r in rules if any("redirect" in x for x in r["expr"])
+                  for e in r["expr"]))
     check("chain rule targets nat_OUTPUT", r["chain"] == "nat_OUTPUT")
     r6 = pm.plan_proxy_chain_rules(cfgs, uid_cache, "ip6")
     check("ip6 payload protocol honored",

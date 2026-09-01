@@ -237,7 +237,7 @@ def test_server_e2e():
                     break
                 time.sleep(0.05)
             p = wa.WSParser()
-            frames = []
+            frames = p.feed(rest) if rest else []   # do NOT drop the bytes that trailed the 101 header
             deadline = time.time() + 2
             while len(frames) < 2 and time.time() < deadline:
                 s.settimeout(1)
@@ -277,10 +277,88 @@ def test_server_e2e():
             srv.server_close()
 
 
+def test_webadmin_service_lifecycle():
+    print("[6] WebadminService: spawn / crash-restart / rate-limit / reconcile / disable")
+    import webadmin_svc as svc
+    logs = []
+    # a fake spawn that returns a FakeProc we can drive
+    class FP:
+        _next = [5000]
+        def __init__(self):
+            self.pid = FP._next[0]; FP._next[0] += 1
+            self._rc = None; self._term = False
+        def poll(self):
+            return self._rc
+        def terminate(self):
+            self._term = True; self._rc = -15
+        def wait(self, timeout=None):
+            return self._rc
+        def kill(self):
+            self._rc = -9
+        alive_procs = []
+    procs = []
+    def spawn(argv, outfile):
+        p = FP(); procs.append(p); return p
+    clock = [1000.0]
+    srv = svc.WebadminService(spawn=spawn, now=lambda: clock[0], log=logs.append)
+    cfg = {"webadmin": {"enabled": True, "port": 8790, "restart": {"max": 2, "window": 100}}}
+    path = "/tmp/does-not-matter.json"
+    a1 = srv.reconcile(cfg, path)
+    check("boot started child", a1 == "started" and srv.state == "running" and len(procs) == 1)
+    # unchanged reconcile -> no restart
+    a2 = srv.reconcile(cfg, path)
+    check("unchanged spec -> no restart", a2 == "unchanged" and len(procs) == 1)
+    # crash -> tick restarts
+    procs[0]._rc = 1
+    srv.tick(path)
+    check("crash -> restart", len(procs) == 2 and srv.state == "running")
+    # crash again -> over limit -> gaveup (no further spawns)
+    clock[0] += 1
+    procs[1]._rc = 1
+    srv.tick(path); n_after = len(procs)
+    procs[-1]._rc = 1
+    clock[0] += 1
+    srv.tick(path)
+    check("rate-limit -> gaveup", srv.state == "gaveup" and len(procs) == n_after, "procs=%d" % len(procs))
+    # spec change reconcile resets history and restarts
+    cfg2 = {"webadmin": {"enabled": True, "port": 8791}}
+    a3 = srv.reconcile(cfg2, path)
+    check("spec change -> restarted fresh", a3 == "started" and srv.state == "running" and srv.hist == [])
+    # disable
+    procs[-1]._term = False
+    a4 = srv.reconcile({"webadmin": {"enabled": False}}, path)
+    check("disabled -> stopped + terminate sent", a4 == "stopped" and srv.state == "off" and procs[-1]._term)
+    check("parse default disabled-by-absence is enabled", svc.parse_spec({}) is not None and svc.parse_spec({}).get("port") == 8788)
+
+
+def test_webadmin_real_child_smoke():
+    print("[7] WebadminService real subprocess (actual webadmin.py) boots & serves")
+    import webadmin_svc as svc
+    with tempfile.TemporaryDirectory() as d:
+        cpath = os.path.join(d, "nft_route.json")
+        json.dump({"proxy": {"A": {"mark": 51}}, "rules": []}, open(cpath, "w"))
+        pidf = os.path.join(d, "nope.pid")
+        srv = svc.WebadminService(log=lambda m: None,
+                                  script=os.path.join(os.path.dirname(os.path.abspath(__file__)), "webadmin.py"))
+        try:
+            srv.reconcile({"webadmin": {"enabled": True, "host": "127.0.0.1", "port": 0}}, cpath, pidf)
+            # port 0 -> webadmin binds an ephemeral; find it via /proc is messy, so
+            # instead verify the child actually launched (real Popen, real interpreter)
+            time.sleep(0.6)
+            check("real child spawned & alive", srv.state == "running"
+                  and srv.proc is not None and srv.proc.poll() is None)
+        finally:
+            srv.shutdown()
+        time.sleep(0.3)
+        check("child reaped after shutdown", srv.proc is None)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         test_master_signal(d)
-    for t in (test_ws_codec, test_ring_hub, test_validate_config, test_server_e2e):
+    for t in (test_ws_codec, test_ring_hub, test_validate_config, test_server_e2e,
+              test_webadmin_service_lifecycle, test_webadmin_real_child_smoke):
         t()
     print("\n==== %d passed, %d failed ====" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)
+

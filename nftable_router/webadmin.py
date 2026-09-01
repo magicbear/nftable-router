@@ -297,6 +297,18 @@ def validate_config(cfg):
             errors.append("duplicate proxy mark %d used by %s" % (m, ",".join(names)))
     for err in ib.validate_bindings(cfg):
         errors.append(err)
+    w = cfg.get("webadmin", {})
+    if w and not isinstance(w, dict):
+        errors.append("webadmin must be an object")
+    elif isinstance(w, dict):
+        for k in ("port", "redis_port", "redis_db"):
+            if k in w and not (isinstance(w[k], int) and 0 < w[k] < 65536):
+                errors.append("webadmin.%s invalid: %r" % (k, w[k]))
+        for k in ("host", "redis_host"):
+            if k in w and not isinstance(w[k], str):
+                errors.append("webadmin.%s must be a string" % k)
+        if "enabled" in w and not isinstance(w["enabled"], bool):
+            errors.append("webadmin.enabled must be true/false")
     if pmm is not None:
         try:
             pmm.validate_chain(proxy)
@@ -489,6 +501,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "Upgrade")
         self.send_header("Sec-WebSocket-Accept", ws_accept_key(key.strip()))
         self.end_headers()
+        self.wfile.flush()            # 101 handshake must reach client before raw frames
         conn = self.connection
         conn.setblocking(False)
         self.close_connection = True

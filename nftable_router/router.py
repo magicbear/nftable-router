@@ -36,6 +36,7 @@ from nftable_router.fullcone_nat import *
 from nftable_router import netinfo
 from nftable_router import iface_bind as ib
 from nftable_router import proxy_mgr as pmm
+from nftable_router.webadmin_svc import WebadminService
 from pytput import TputFormatter
 import subprocess, urllib, psutil
 from queue import Queue, Empty
@@ -100,6 +101,31 @@ g_runner = []
 g_proxy_sup = None            # ProxySupervisor instance (master only)
 g_proxy_pending = Value('b', False)   # SIGUSR1 -> incremental reconfigure in main loop
 g_proxy_restart_all = Value('b', False)  # SIGUSR2 -> restart ALL managed proxies
+g_webadmin = None                         # WebadminService instance (master child proc)
+
+
+def config_file_path():
+    return os.environ.get("NFT_ROUTE_CONFIG", "nft_route.json")
+
+
+def sync_webadmin():
+    """Boot + SIGUSR1 entry: (re)start the webadmin child if its config
+    section changed. Never raises (router must not break on webadmin issues)."""
+    global g_webadmin
+    try:
+        if g_webadmin is None:
+            def _log(m):
+                print("[webadmin] %s" % m)
+                syslog.syslog(syslog.LOG_NOTICE, "webadmin: %s" % m)
+            g_webadmin = WebadminService(log=_log)
+        prev = g_webadmin.spec
+        action = g_webadmin.reconcile(config, config_file_path(), MASTER_PID_FILE)
+        if action == "started" and g_webadmin.spec != prev:
+            print("[+] webadmin on http://%s:%d (config webadmin.* to manage)" % (
+                g_webadmin.spec["host"], g_webadmin.spec["port"]))
+    except Exception as e:
+        syslog.syslog(syslog.LOG_CRIT, "webadmin sync error: %s\n  %s" % (
+            str(e), '  '.join(traceback.format_tb(e.__traceback__))))
 is_master = True
 worker_id = 0  # Modified by Process
 process_term = False  # Modified by Process
@@ -483,53 +509,75 @@ g_term_width = -1
 g_term_width_check = 0.0
 
 
-def egress_wizard_boot():
-    """Startup egress binding: scan interfaces, prompt wizard for unbound
-    public egress IP/interface -> fwmark, write nft_route.json (atomic+bak).
-    Must run in master BEFORE worker fork and BEFORE tty cbreak mode."""
-    global config
-    config_path = os.environ.get("NFT_ROUTE_CONFIG", "nft_route.json")
+def _egress_scan():
+    """scan interfaces -> (candidates bound, candidates needing a mark,
+    bindings missing a gateway); logs validation problems. None on scan error."""
     try:
         detect = netinfo.detect()
     except Exception as e:
         syslog.syslog(syslog.LOG_WARNING, "egress scan failed: %s" % e)
         print(tf.format("{msg:s,bg_yellow,black}", msg="[-] egress: interface scan failed: %s" % e))
-        return
+        return None
     candidates = ib.scan_candidates(detect)
     for err in ib.validate_bindings(config):
         print(tf.format("{msg:s,bg_yellow,black}", msg="[-] egress_marks config invalid: %s" % err))
         syslog.syslog(syslog.LOG_WARNING, "egress_marks config invalid: %s" % err)
     bound, needs = ib.plan_bindings(config, candidates)
+    missing_gw = [b for b in ib.get_bindings(config)
+                  if not (b.get("iprule") or {}).get("gateway")]
+    return bound, needs, missing_gw
+
+
+def egress_wizard_boot():
+    """Startup egress check: scan + LOG ONLY. Never prompts -- an unattended
+    restart must not block routing on an input() nobody answers. Binding is
+    done from the running UI ('e' key -> egress_wizard_ui)."""
+    scan = _egress_scan()
+    if scan is None:
+        return
+    bound, needs, missing_gw = scan
     for cand, b in bound:
         print("[*] egress: %s %s -> mark %s (bound)" % (
             "iface" if cand["dynamic"] else "ip  ",
             cand["ifname"] + (" / " + cand["ip"] if not cand["dynamic"] else ""), b["mark"]))
-    missing_gw = [b for b in ib.get_bindings(config)
-                  if not (b.get("iprule") or {}).get("gateway")]
-    if not needs and not missing_gw:
+    for cand in needs:
+        msg = "unbound public egress: %s %s (%s) -- press 'e' in the UI to bind" % (
+            cand["ifname"], cand["ip"], "dynamic" if cand["dynamic"] else "static")
+        print(tf.format("{msg:s,bg_yellow,black}", msg="[-] egress: %s" % msg))
+        syslog.syslog(syslog.LOG_WARNING, msg)
+    for b in missing_gw:
+        msg = "egress binding %s (mark %s) has no iprule gateway -- press 'e' in the UI to set" % (
+            b.get("iface") or b.get("ip"), b["mark"])
+        print(tf.format("{msg:s,bg_yellow,black}", msg="[-] egress: %s" % msg))
+        syslog.syslog(syslog.LOG_WARNING, msg)
+
+
+def egress_wizard_ui(input_fn):
+    """Interactive egress wizard, run from the main-loop UI ('e' key) with
+    the tty temporarily back in line mode. input_fn(prompt) -> str must read
+    from the SAME fd the main loop polls (not Python's buffered stdin)."""
+    global config
+    config_path = os.environ.get("NFT_ROUTE_CONFIG", "nft_route.json")
+    scan = _egress_scan()
+    if scan is None:
         return
-    interactive = sys.stdin.isatty() and is_master
-    if not interactive:
-        for cand in needs:
-            msg = "unbound public egress: %s %s (%s)" % (
-                cand["ifname"], cand["ip"], "dynamic" if cand["dynamic"] else "static")
-            print(tf.format("{msg:s,bg_yellow,black}", msg="[-] egress: %s" % msg))
-            syslog.syslog(syslog.LOG_WARNING, msg)
-        for b in missing_gw:
-            msg = "egress binding %s (mark %s) has no iprule gateway" % (
-                b.get("iface") or b.get("ip"), b["mark"])
-            print(tf.format("{msg:s,bg_yellow,black}", msg="[-] egress: %s" % msg))
-            syslog.syslog(syslog.LOG_WARNING, msg)
+    bound, needs, missing_gw = scan
+    for cand, b in bound:
+        print("[*] egress: %s %s -> mark %s (bound)" % (
+            "iface" if cand["dynamic"] else "ip  ",
+            cand["ifname"] + (" / " + cand["ip"] if not cand["dynamic"] else ""), b["mark"]))
+    if not needs and not missing_gw:
+        print("[*] egress: all public egress bound, all gateways set")
         return
 
     def chooser(cand, suggested):
         lines = [k for k, v in config.get("proxy", {}).items() if int(v.get("mark", -1)) == int(suggested)]
         kind = "dynamic iface %s" % cand["ifname"] if cand["dynamic"] else "static ip %s" % cand["ip"]
         print()
-        ans = input("[*] egress wizard: %s (%s) -> bind fwmark [%s%s]:\n    "
-                    "(Enter=use default, 0x.. / decimal=custom, s=skip) " % (
-                        kind, cand["method"], suggested,
-                        (" / line %s" % ",".join(lines)) if lines else "")).strip().lower()
+        ans = input_fn("[*] egress wizard: %s (%s) -> bind fwmark [%s%s]:\n    "
+                       "(Enter=use default, 0x.. / decimal=custom, s=skip) " % (
+                           kind, cand["method"], suggested,
+                           (" / line %s" % ",".join(lines)) if lines else "")).strip().lower()
         if ans in ("", "y", "yes"):
             return suggested
         if ans in ("s", "n", "no", "skip"):
@@ -546,31 +594,41 @@ def egress_wizard_boot():
     def gateway_prompt(cand, entry):
         dyn = bool(cand.get("dynamic"))
         hint = "回车=auto(跟随接口默认路由)" if dyn else "回车=稍后在配置里手填"
-        ans = input("    gateway for %s (mark %s)  [%s]: " % (
+        ans = input_fn("    gateway for %s (mark %s)  [%s]: " % (
             cand["ifname"], entry["mark"], hint)).strip()
         entry.setdefault("iprule", {})["gateway"] = ans if ans else ("auto" if dyn else "")
 
     changed = []
-    created = ib.run_wizard(config, needs, chooser, post_bind=gateway_prompt if interactive else None)
-    # existing bindings still missing a gateway -> ask interactively as well
-    if interactive:
-        for b in ib.get_bindings(config):
-            if not (b.get("iprule") or {}).get("gateway"):
-                dyn = bool(b.get("dynamic"))
-                hint = "回车=auto(跟随接口默认路由)" if dyn else "回车=稍后在配置里手填"
-                ans = input("    gateway for %s (mark %s, already bound) [%s]: " % (
-                    b.get("iface") or b.get("ip"), b["mark"], hint)).strip()
-                b.setdefault("iprule", {})["gateway"] = ans if ans else ("auto" if dyn else "")
+    created = ib.run_wizard(config, needs, chooser, post_bind=gateway_prompt)
+    # existing bindings still missing a gateway -> ask as well
+    for b in ib.get_bindings(config):
+        if not (b.get("iprule") or {}).get("gateway"):
+            dyn = bool(b.get("dynamic"))
+            hint = "回车=auto(跟随接口默认路由)" if dyn else "回车=稍后在配置里手填"
+            ans = input_fn("    gateway for %s (mark %s, already bound) [%s]: " % (
+                b.get("iface") or b.get("ip"), b["mark"], hint)).strip()
+            new_gw = ans if ans else ("auto" if dyn else "")
+            if new_gw:
+                b.setdefault("iprule", {})["gateway"] = new_gw
                 changed.append(b)
-    if created or changed:
-        try:
-            ib.save_config(config_path, config)
-            print("[+] egress_marks updated in %s (%d new, %d gateway-filled, backup: %s.bak)" % (
-                config_path, len(created), len(changed), config_path))
-            syslog.syslog(syslog.LOG_NOTICE, "egress_marks updated: %s" % json.dumps(created))
-        except Exception as e:
-            print(tf.format("{msg:s,bg_red,black}", msg="[-] egress_marks save FAILED (rules will use in-memory cfg): %s" % e))
-            syslog.syslog(syslog.LOG_CRIT, "egress_marks save failed: %s" % e)
+    if not created and not changed:
+        return
+    try:
+        ib.save_config(config_path, config)
+        print("[+] egress_marks updated in %s (%d new, %d gateway-filled, backup: %s.bak)" % (
+            config_path, len(created), len(changed), config_path))
+        syslog.syslog(syslog.LOG_NOTICE, "egress_marks updated: %s" % json.dumps(created))
+    except Exception as e:
+        print(tf.format("{msg:s,bg_red,black}", msg="[-] egress_marks save FAILED (rules will use in-memory cfg): %s" % e))
+        syslog.syslog(syslog.LOG_CRIT, "egress_marks save failed: %s" % e)
+    # activate immediately (same thread as every other nfu/iprule user)
+    try:
+        for _fam in ("ip", "ip6"):
+            apply_egress_rules(nfu, _fam)
+    except Exception as e:
+        print(tf.format("{msg:s,bg_red,black}", msg="[-] egress rules apply failed: %s" % e))
+        syslog.syslog(syslog.LOG_CRIT, "egress rules apply failed: %s" % e)
+    sync_iprules("wizard")
 
 
 def apply_egress_rules(nfu, ip_family):
@@ -579,6 +637,14 @@ def apply_egress_rules(nfu, ip_family):
     no drop of transit traffic."""
     bindings = ib.get_bindings(config)
     if not bindings:
+        return
+    errors = ib.validate_bindings(config)
+    if errors:
+        # fail loud & closed: duplicate marks/idents would install ambiguous
+        # setter rules -- better no egress marking than a wrong one
+        for err in errors:
+            print(tf.format("{msg:s,bg_red,black}", msg="[-] egress_marks invalid, rules NOT applied: %s" % err))
+            syslog.syslog(syslog.LOG_CRIT, "egress_marks invalid, rules not applied: %s" % err)
         return
     removed = ib.clear_egress_rules(nfu, ip_family, cmt_class)
     if removed:
@@ -629,18 +695,19 @@ def sync_iprules(reason=""):
         syslog.syslog(syslog.LOG_WARNING, "sync_iprules: IPRoute open failed: %s" % e)
         return
     try:
-        for fam in (4, 6):
-            plans = ib.iprule_plan(config, fam)
-            if not plans:
-                continue
+        # BOTH families in ONE apply: iprule_apply's stale sweep removes any
+        # owned-band rule absent from the plans, so per-family calls would
+        # tear down the other family's live rules every cycle.
+        plans = ib.iprule_plan(config, 4) + ib.iprule_plan(config, 6)
+        if plans:
             res = ib.iprule_apply(ipr, plans,
                                   log=lambda m: syslog.syslog(syslog.LOG_NOTICE, "iprule: %s" % m))
             for p, why in res["pending"]:
                 pending_note.append("%d:%s" % (p, why))
             if res["added"] or res["removed"] or res["errors"] or res["external"]:
                 dirty = True
-                msg = ("iprules(%s%s): +%s -%s ext=%s err=%s" % (
-                    ("v%d" % fam), ("/" + reason) if reason else "",
+                msg = ("iprules(%s): +%s -%s ext=%s err=%s" % (
+                    reason or "sync",
                     res["added"] or "-", res["removed"] or "-",
                     res["external"] or "-", res["errors"] or "-"))
                 print("[*] %s" % msg)
@@ -679,16 +746,20 @@ def install_proxy_chain_rules():
         syslog.syslog(syslog.LOG_CRIT, "proxy chain config error, management disabled: %s" % e)
         return
     uid_cache = {}
+    chain_disabled = set()
     for name in list(managed):
         try:
             uid_cache[name] = pmm.get_uid(managed[name], name)
         except ValueError as e:
             if pmm.upstream_of(managed[name]) or any(
                     pmm.upstream_of(c) == name for n, c in managed.items()):
-                # uid is mandatory for chained proxies (skuid rules)
-                print(tf.format("{msg:s,bg_red,black}", msg="[-] %s" % e))
-                syslog.syslog(syslog.LOG_CRIT, "proxy chain disabled for %s: %s" % (name, e))
+                # uid is mandatory for chained proxies (skuid rules). Fail
+                # CLOSED: without the skuid rule its traffic would silently
+                # bypass the chain (direct leak), so don't run it at all.
+                print(tf.format("{msg:s,bg_red,black}", msg="[-] %s (chained proxy NOT started)" % e))
+                syslog.syslog(syslog.LOG_CRIT, "proxy chain disabled for %s (not started): %s" % (name, e))
                 managed.pop(name)
+                chain_disabled.add(name)
             else:
                 uid_cache[name] = None
     print("[*] managed proxies, start order (deepest dependency first):")
@@ -710,11 +781,15 @@ def install_proxy_chain_rules():
             print("      [!] %s: inline password visible in /proc cmdline; prefer 'password_file'" % n)
     n_ok = 0
     for ip_family in ("ip", "ip6"):
-        for r in pmm.plan_proxy_chain_rules(config["proxy"], uid_cache, ip_family):
-            rc = nfu.add_rule(dict(r))
+        # INSERT at the head of nat_OUTPUT: the policy queue rule verdicts
+        # (queue) before appended rules would ever run, so appended skuid
+        # rules are dead code exactly when the policy engine marks a proxy's
+        # own upstream flow. Insert in reverse to preserve planned order.
+        for r in reversed(pmm.plan_proxy_chain_rules(config["proxy"], uid_cache, ip_family)):
+            rc = nfu.insert_rule(dict(r))
             if rc[0] != 0:
-                print(tf.format("{msg:s,bg_red,black}", msg="[-] add proxy-chain rule failed (%s): %s" % (ip_family, rc)))
-                syslog.syslog(syslog.LOG_CRIT, "add proxy-chain rule failed %s: %s" % (ip_family, rc))
+                print(tf.format("{msg:s,bg_red,black}", msg="[-] insert proxy-chain rule failed (%s): %s" % (ip_family, rc)))
+                syslog.syslog(syslog.LOG_CRIT, "insert proxy-chain rule failed %s: %s" % (ip_family, rc))
             else:
                 n_ok += 1
     print("[+] proxy-chain skuid rules: %d installed" % n_ok)
@@ -724,17 +799,21 @@ def install_proxy_chain_rules():
         print("    " + msg)
         syslog.syslog(syslog.LOG_NOTICE, msg)
 
+    # chained proxies whose uid could not be resolved must not run (their
+    # traffic would silently bypass the chain) -> supervise but never start
+    sup_cfgs = {k: (dict(v, autostart=False) if k in chain_disabled else v)
+                for k, v in config["proxy"].items()}
     if g_proxy_sup is not None:
         # SIGUSR1 reload path: diff start/stop only (unchanged processes stay up)
         try:
-            g_proxy_sup.reconfigure(config["proxy"])
+            g_proxy_sup.reconfigure(sup_cfgs)
             print("[*] proxy supervisor reconfigured (incremental)")
         except ValueError as e:
             print(tf.format("{msg:s,bg_red,black}", msg="[-] proxy reconfigure failed, running set kept: %s" % e))
             syslog.syslog(syslog.LOG_CRIT, "proxy reconfigure failed, running set kept: %s" % e)
         return
     try:
-        g_proxy_sup = pmm.ProxySupervisor(config["proxy"], on_status=on_status,
+        g_proxy_sup = pmm.ProxySupervisor(sup_cfgs, on_status=on_status,
                                           log=lambda m: syslog.syslog(syslog.LOG_NOTICE, "proxyd: %s" % m))
         g_proxy_sup.start()
     except ValueError as e:
@@ -1400,19 +1479,11 @@ def reload_queue(signum, sigframe):
     # nfqueue.unbind()
     load_config()
     test_thread.last_check = 0
-    # SIGUSR1: reconcile chain rules + managed proxies INCREMENTALLY from the
-    # MAIN loop (new->start, removed->stop, changed->restart, same->keep alive;
-    # spawn/fork must not happen inside signal handler context)
+    # SIGUSR1: egress rules + chain rules + managed proxies are ALL handled
+    # from the MAIN loop (g_proxy_pending): nfu.nft json_cmd is not reentrant,
+    # and this handler can interrupt the main loop mid-json_cmd; spawn/fork
+    # must not happen inside signal handler context either.
     g_proxy_pending.value = True
-
-    # re-apply egress mark rules on reload (non-interactive; new unbound
-    # public egress IPs/interfaces are logged, wizard runs only at boot)
-    try:
-        for ip_family in ("ip", "ip6"):
-            apply_egress_rules(nfu, ip_family)
-    except Exception as e:
-        syslog.syslog(syslog.LOG_CRIT, "egress rules reload error: %s\n  %s" % (
-            str(e), '  '.join(traceback.format_tb(e.__traceback__))))
     # tp.lock.acquire()
     # tp.device_list = None
     # tp.lock.release()
@@ -1573,7 +1644,8 @@ if __name__ == "__main__":
             syslog.syslog(syslog.LOG_WARNING, f"Interface {_interface} not exists")
             nat_interfaces.pop(n)
 
-    # scan interfaces -> wizard-bind public egress IP/interface to fwmark -> save config
+    # scan interfaces, log unbound public egress (bind interactively later
+    # with the 'e' key in the UI; boot never blocks on a prompt)
     egress_wizard_boot()
     # closed-loop ip rule / route table reconcile (gateways from config)
     sync_iprules("boot")
@@ -1888,11 +1960,15 @@ if __name__ == "__main__":
 
     load_executor()
 
+    # web admin as a supervised child process (config: nft_route.json 'webadmin' section)
+    sync_webadmin()
+
     fcnat_listner = None
     fcnat_cleaner = None
 
     t_dns_clean = 0
     t_iprule = 0
+    t_webadmin = 0
     queue_stdin = []
     mouse_offset = 0
     old_settings = termios.tcgetattr(sys.stdin.fileno())
@@ -1955,13 +2031,51 @@ if __name__ == "__main__":
                     queue_stdin = queue_stdin[1:]
                     for n in range(g_parallel_process):
                         print("[+] Process %02d process: %d" % (n, g_worker_process_connections[n].value))
+                elif queue_stdin[0] == b"e":
+                    queue_stdin = queue_stdin[1:]
+                    print()
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+
+                    def _wizard_input(prompt):
+                        print(prompt, end="", flush=True)
+                        return unbuffered_stdin.readline().decode("utf-8", "replace").rstrip("\n")
+
+                    try:
+                        egress_wizard_ui(_wizard_input)
+                    except Exception as e:
+                        print(tf.format("{msg:s,bg_red,black}", msg="[-] egress wizard error: %s" % e))
+                        print(''.join(traceback.format_tb(e.__traceback__)))
+                        syslog.syslog(syslog.LOG_ERR, "egress wizard error: %s" % e)
+                    finally:
+                        tty.setcbreak(sys.stdin.fileno())
                 else:
                     queue_stdin = queue_stdin[1:]
 
             if g_proxy_pending.value:
                 g_proxy_pending.value = False
+                # re-apply egress mark rules (moved out of the SIGUSR1 handler:
+                # nfu is not reentrant against this loop's own json_cmd calls)
+                try:
+                    for ip_family in ("ip", "ip6"):
+                        apply_egress_rules(nfu, ip_family)
+                except Exception as e:
+                    syslog.syslog(syslog.LOG_CRIT, "egress rules reload error: %s\n  %s" % (
+                        str(e), '  '.join(traceback.format_tb(e.__traceback__))))
                 sync_iprules("reload")
                 install_proxy_chain_rules()
+                # webadmin child: restart only if its config section changed
+                try:
+                    sync_webadmin()
+                except Exception as e:
+                    syslog.syslog(syslog.LOG_CRIT, "webadmin reload error: %s" % e)
+
+            if time.time() - t_webadmin > 5:
+                t_webadmin = time.time()
+                if g_webadmin is not None:
+                    try:
+                        g_webadmin.tick(config_file_path(), MASTER_PID_FILE)
+                    except Exception as e:
+                        syslog.syslog(syslog.LOG_WARNING, "webadmin tick error: %s" % e)
 
             if time.time() - t_iprule > 60:
                 t_iprule = time.time()
@@ -2066,6 +2180,8 @@ if __name__ == "__main__":
                     # g_io_lock.release()
         except KeyboardInterrupt:
             term.value = True
+            if g_webadmin is not None:
+                g_webadmin.shutdown()   # stop webadmin child with the main app
             if g_proxy_sup:
                 g_proxy_sup.stop_all()   # before rules are cleared & master SIGKILLs itself
             clearRules()

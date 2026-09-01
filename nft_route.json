@@ -20,12 +20,22 @@
       "connectivitycheck.platform.hicloud.com",
       "connect.rom.miui.com"
    ],
-   "ignore_list": {
-      "ipv4": [
-      ],
-      "ipv6": []
-   },
-   "proxy": {
+    "ignore_list": {
+       "ipv4": [
+       ],
+       "ipv6": []
+    },
+    "webadmin": {
+       "enabled": true,
+       "host": "127.0.0.1",
+       "port": 8788,
+       "redis_host": "127.0.0.1",
+       "redis_port": 6379,
+       "redis_db": 1,
+       "log": null,
+       "restart": { "max": 5, "window": 300 }
+    },
+    "proxy": {
       "line1": {
          "ipv4": true,
          "ipv6": false,

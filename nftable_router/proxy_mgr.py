@@ -20,10 +20,16 @@ New optional fields inside a nft_route.json proxy entry:
   "autostart":     default true; false = supervise only if started manually
   "restart":       {"max": N, "window": seconds} rate-limit (default 5/300)
 
-Loop prevention / chain rules (installed into nat_OUTPUT, comment-tagged,
-managed entirely here because we know each proxy's uid):
-  meta skuid == uid(A), tcp, ip daddr != @local, ip daddr != <server of A>
-  -> redirect to port(B)
+Loop prevention / chain rules (INSERTED at the HEAD of nat_OUTPUT so they
+run BEFORE the policy NFQUEUE rule and the per-mark tproxy redirects;
+comment-tagged, managed entirely here because we know each proxy's uid):
+  chained (has "upstream"):
+    meta skuid == uid(A), tcp, daddr != @local, tcp dport != port(B)
+      -> redirect to port(B)          # incl. A's own server: that IS the chain
+  direct (managed, uid set, no upstream):
+    meta skuid == uid(A), daddr != @local -> accept
+      # exempts A's upstream traffic from policy marking, which could
+      # otherwise redirect it into A's own listener (self-loop)
 Self-loop / cycle / missing-upstream / unmanaged-upstream are rejected at
 plan time; chain start order is topological (deepest dependency first);
 each dependency's listen port is verified reachable before the dependent
@@ -194,24 +200,39 @@ def validate_chain(proxy_cfgs):
 # ---------------------------------------------------------------------------
 
 def plan_proxy_chain_rules(proxy_cfgs, uid_cache, family="ip"):
-    """One redirect rule per chained proxy, keyed on ITS OWN skuid, so the
-    chain is explicit and immune to mark confusion; @local excluded."""
+    """Per managed proxy with a known uid, keyed on ITS OWN skuid:
+      - chained  -> redirect to the upstream's transparent port
+      - direct   -> accept (skip the policy queue / tproxy-mark redirects)
+    Both guard against the self-connect loop where the policy engine marks a
+    proxy's own upstream flow with a tproxy mark and redirects it back into
+    its own listener. MUST be installed at the head of nat_OUTPUT (insert,
+    not append) or the policy queue rule verdicts first and these never run."""
     rules = []
     for name in proxy_cfgs:
         cfg = proxy_cfgs[name]
-        up_name = upstream_of(cfg) if is_managed(cfg) else None
-        if not up_name:
+        if not is_managed(cfg):
             continue
-        try:
-            uid = uid_cache[name]
-        except KeyError:
+        uid = uid_cache.get(name)
+        if uid is None:
+            continue
+        up_name = upstream_of(cfg)
+        skuid = {"match": {"left": {"meta": {"key": "skuid"}}, "op": "==", "right": uid}}
+        not_local = {"match": {"left": {"payload": {"protocol": family, "field": "daddr"}},
+                               "op": "!=", "right": "@local"}}
+        if not up_name:
+            # direct managed proxy: its upstream egress must never re-enter
+            # the policy queue (covers tcp AND udp)
+            rules.append({"family": family, "table": "policy_route", "chain": "nat_OUTPUT",
+                          "comment": CHAIN_CMT, "expr": [
+                              skuid, not_local,
+                              {"counter": {"bytes": 0, "packets": 0}},
+                              {"accept": None}]})
             continue
         up_port = int(proxy_cfgs[up_name]["port"])
         expr = [
-            {"match": {"left": {"meta": {"key": "skuid"}}, "op": "==", "right": uid}},
+            skuid,
             {"match": {"left": {"meta": {"key": "l4proto"}}, "op": "==", "right": "tcp"}},
-            {"match": {"left": {"payload": {"protocol": family, "field": "daddr"}},
-                       "op": "!=", "right": "@local"}},
+            not_local,
         ]
         # belt & braces: never redirect a flow whose dport already IS the
         # upstream port (would re-enter the same listener forever)
@@ -263,7 +284,7 @@ class ManagedProxy:
         self._sleep = sleeper or time.sleep
         self._time = timer or time.time
         self.proc = None
-        self.state = "stopped"          # starting|running|backoff|gaveup|stopped
+        self.state = "stopped"          # starting|running|backoff|gaveup|stopped|deferred|external
         self.restart_history = []
         self.stopping = False
 
@@ -349,7 +370,10 @@ class ProxySupervisor(threading.Thread):
 
     # -- launch with dependency gating -------------------------------------
     def _bring_up(self, n):
-        """start one proxy (dependency + external-port gated); call under lock"""
+        """start one proxy (dependency + external-port gated); call under lock.
+        Waits are SHORT (the lock blocks reconfigure/monitor): on any gate
+        failure the proxy is left in state 'deferred' and the monitor loop
+        retries it every pacing tick."""
         p = self.proxies.get(n)
         if p is None or p.stopping:
             return
@@ -359,11 +383,16 @@ class ProxySupervisor(threading.Thread):
         if up is not None:
             up_p = self.proxies.get(up)
             if up_p is None or up_p.proc is None or up_p.proc.poll() is not None:
+                p.state = "deferred"
                 self.log("%s: dependency %s not up, deferring" % (n, up))
                 return
             port = self.name_cfg[up].get("port")
-            if port and not self._port_wait(port):
-                self.log("%s: dependency %s port %s unreachable, deferring" % (n, up, port))
+            # timeout=1.0: short (this runs under self._lock, long waits stall
+            # reconfigure/monitor) but distinct from the 0.5 own-port probe
+            # below so injected test stubs can tell the two probes apart
+            if port and not self._port_wait(port, timeout=1.0):
+                p.state = "deferred"
+                self.log("%s: dependency %s port %s not ready, deferring" % (n, up, port))
                 return
         my_port = self.name_cfg[n].get("port")
         if my_port and self._port_wait(my_port, timeout=0.5):
@@ -463,19 +492,10 @@ class ProxySupervisor(threading.Thread):
                     if p.stopping:
                         continue
                     if p.proc is None:
-                        # deferred earlier (dependency down / not ready): retry now
-                        if p.state in ("gaveup", "stopped", "external"):
-                            continue
-                        up = upstream_of(self.name_cfg[n])
-                        if up is not None:
-                            up_p = self.proxies.get(up)
-                            if up_p is None or not up_p.proc or up_p.proc.poll() is not None:
-                                continue
-                        try:
-                            p.start_once()
-                            self.on_status(n, p.state, p.proc.pid)
-                        except OSError as e:
-                            self.log("%s: spawn failed: %s" % (n, e))
+                        # deferred earlier (dependency down / not ready):
+                        # re-run the full gated bring-up
+                        if p.state == "deferred":
+                            self._bring_up(n)
                         continue
                     rc = p.proc.poll()
                     if rc is None or p.stopping:
@@ -492,6 +512,11 @@ class ProxySupervisor(threading.Thread):
                 # end with lock
                 if retry_wait:
                     break
+            if not retry_wait:
+                # pacing: without this the loop busy-spins at 100% CPU while
+                # every proxy is healthy (and hammers the RLock)
+                if stop_evt.wait(1.0):
+                    return
             if retry_wait:
                 n, p, wait = retry_wait
                 if stop_evt.wait(wait):
