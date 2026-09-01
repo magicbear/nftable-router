@@ -893,14 +893,23 @@ class PrintResultThread(threading.Thread):
                         # webadmin live stream (independent subscriber; failures
                         # here must never affect the router itself)
                         try:
-                            self.r.publish("pr_stream", json.dumps({
-                                "ts": round(time.time(), 3),
-                                "ver": rc.pkt_version, "proto": rc.proto,
-                                "src": rc.src, "dst": rc.dst,
-                                "sport": rc.sport, "dport": rc.port,
-                                "line": rc.out_interface, "mark": rc.mark,
-                                "pri": rc.matched_priority, "sess": rc.test_session,
-                                "ms": round(rc.t_total, 2), "fc": 1 if rc.process_fullcone else 0}))
+                            ev = {"ts": round(time.time(), 3),
+                                  "ver": rc.pkt_version, "proto": rc.proto,
+                                  "src": rc.src, "dst": rc.dst,
+                                  "sport": rc.sport, "dport": rc.port,
+                                  "line": rc.out_interface, "mark": rc.mark,
+                                  "pri": rc.matched_priority, "sess": rc.test_session,
+                                  "ms": round(rc.t_total, 2), "fc": 1 if rc.process_fullcone else 0}
+                            if isinstance(rc.geodata, dict):
+                                gd = rc.geodata
+                                ev["geo"] = {"cc": gd.get("country_code") or "",
+                                             "cn": gd.get("country_name") or "",
+                                             "rg": gd.get("region_name") or "",
+                                             "ct": gd.get("city_name") or "",
+                                             "isp": gd.get("isp_domain") or "",
+                                             "ac": 1 if gd.get("anycast") == "ANYCAST" else 0,
+                                             "idc": 1 if gd.get("idc") == "IDC" else 0}
+                            self.r.publish("pr_stream", json.dumps(ev))
                         except Exception as e:
                             syslog.syslog(syslog.LOG_WARNING, "pr_stream publish failed: %s" % e)
                     except Exception as e:

@@ -36,6 +36,8 @@ td.line{color:var(--purple)}td.dst{color:var(--cyan)}td.src{color:#c9b458}
 .bad{color:var(--red)}.good{color:var(--green)}.warn{color:var(--yellow)}.dim{color:var(--dim)}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:8px}
+#colsbox{margin:0 0 8px}#colsbox label{display:inline-block;margin:2px 12px 2px 0;color:var(--fg);cursor:pointer;user-select:none}
+#colsbox label input{vertical-align:-2px}#colsbox button{margin-left:10px}
 #toast{position:fixed;right:14px;bottom:14px;max-width:420px}
 #toast div{margin-top:6px;padding:8px 12px;border-radius:8px;background:#20283a;border:1px solid var(--line)}
 label{color:var(--dim)}
@@ -54,14 +56,13 @@ label{color:var(--dim)}
 <main>
 <section id=s-flow class=sel>
  <div class=bar>
-  <button id=b-pause>⏸ 暂停</button><button id=b-clear>清空</button>
-  <input id=f-text placeholder="过滤: IP / 线路 / 域名关键字" style=width:260px>
+  <button id=b-pause>⏸ 暂停</button><button id=b-clear>清空</button><button id=b-cols>⚙ 列</button>
+  <input id=f-text placeholder="过滤: IP / 线路 / 国家 / 运营商关键字" style=width:280px>
   <label><input type=checkbox id=f-new> 仅新连接</label>
   <span class=dim>上限 1000 行(旧行自动淘汰)</span>
  </div>
- <div id=flowwrap><table><thead><tr>
-  <th>时间</th><th>协议</th><th>源</th><th>源端口</th><th>目的</th><th>目的端口</th>
-  <th>线路</th><th>mark</th><th>规则</th><th>会话</th><th>ms</th></tr></thead>
+ <div id=colsbox class=card style="display:none"></div>
+ <div id=flowwrap><table><thead id=flowhead></thead>
  <tbody id=flowbody></tbody></table></div>
 </section>
 
@@ -105,25 +106,60 @@ function hhmmss(ts){var d=new Date(ts*1000);function p(n,l){n=""+n;while(n.lengt
  return p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds())+"."+p(d.getMilliseconds()%1000,3).slice(0,1)}
 
 // ---------- flow table ----------
-function rowMatch(r,q){if(!q)return true;var s=(r.src+" "+r.dst+" "+(r.line||"")+" "+r.mark).toLowerCase();return s.indexOf(q)>=0}
+var COLS=[
+ {id:"time", label:"时间",     def:1, get:function(r){return hhmmss(r.ts)}},
+ {id:"proto",label:"协议",     def:1, cls:function(r){return "p"+r.proto}, get:function(r){return PROTO[r.proto]||r.proto}},
+ {id:"src",  label:"源",       def:1, cls:function(){return "src"},  get:function(r){return r.src}},
+ {id:"sport",label:"源端口",   def:1, get:function(r){return r.sport!=null?r.sport:""}},
+ {id:"dst",  label:"目的",     def:1, cls:function(){return "dst"},  get:function(r){return r.dst}},
+ {id:"dport",label:"目的端口", def:1, get:function(r){return r.dport!=null?r.dport:""}},
+ {id:"cc",   label:"国家",     def:1, get:function(r){var g=r.geo||{};return g.cc?flagOf(g.cc):""}},
+ {id:"cname",label:"国家名",   def:0, get:function(r){var g=r.geo||{};return g.cn||""}},
+ {id:"region",label:"地区",    def:0, get:function(r){var g=r.geo||{};return g.rg||""}},
+ {id:"city", label:"城市",     def:0, get:function(r){var g=r.geo||{};return g.ct||""}},
+ {id:"isp",  label:"运营商",   def:0, cls:function(){return "dim"},  get:function(r){var g=r.geo||{};return g.isp||""}},
+ {id:"tags", label:"标签",     def:0, cls:function(){return "warn"}, get:function(r){var g=r.geo||{};var t=[];if(g.ac)t.push("任播");if(g.idc)t.push("IDC");return t.join(" ")}},
+ {id:"line", label:"线路",     def:1, cls:function(){return "line"}, get:function(r){return r.line||"-"}},
+ {id:"mark", label:"mark",     def:1, get:function(r){return r.mark!=null?("0x"+(r.mark>>>0).toString(16)):"-"}},
+ {id:"pri",  label:"规则",     def:0, cls:function(){return "dim"},  get:function(r){return r.pri>=0?("#"+r.pri):""}},
+ {id:"sess", label:"会话",     def:0, cls:function(){return "dim"},  get:function(r){var s=["","存活","ECMP","ICMP","QoS"][r.sess]||"";if(r.fc)s="fullcone "+s;return s}},
+ {id:"ms",   label:"ms",       def:1, cls:function(){return "dim"},  get:function(r){return r.ms!=null?r.ms.toFixed(1):""}}
+];
+function flagOf(cc){if(!cc)return "";if(cc.length!=2)return cc;var s="";
+ for(var i=0;i<2;i++){var c=cc.toUpperCase().charCodeAt(i);if(c<65||c>90)return cc;s+=String.fromCodePoint(127462+c-65)}return s}
+function defaultSel(){return COLS.filter(function(c){return c.def}).map(function(c){return c.id})}
+function curSel(){try{var x=JSON.parse(localStorage.getItem("nft_cols"));
+ if(x&&x instanceof Array){var ok={};COLS.forEach(function(c){ok[c.id]=1});return x.filter(function(i){return ok[i]})}}catch(e){}
+ return defaultSel()}
+function visibleCols(){var w={};curSel().forEach(function(i){w[i]=1});return COLS.filter(function(c){return w[c.id]})}
+function searchText(r){var g=r.geo||{};
+ return [r.src,r.dst,r.line,r.mark,g.cc,g.cn,g.rg,g.ct,g.isp,PROTO[r.proto]||r.rproto].join(" ").toLowerCase()}
+function rowMatch(r,q){if(!q)return true;return searchText(r).indexOf(q)>=0}
 function trOf(r){
  var tr=el("tr");
- tr.appendChild(el("td","",hhmmss(r.ts)));
- var pr=el("td","p"+r.proto,PROTO[r.proto]||r.proto);tr.appendChild(pr);
- tr.appendChild(el("td","src",r.src));
- tr.appendChild(el("td","",r.sport!=null?r.sport:""));
- tr.appendChild(el("td","dst",r.dst));
- tr.appendChild(el("td","",r.dport!=null?r.dport:""));
- var ln=el("td","line",r.line||"-");tr.appendChild(ln);
- tr.appendChild(el("td","",r.mark!=null?("0x"+(r.mark>>>0).toString(16)):"-"));
- tr.appendChild(el("td","dim",r.pri>=0?("#"+r.pri):""));
- var sess=["","存活检测","ECMP复用","ICMP","QoS"][r.sess]||"";
- if(r.fc)sess="fullcone "+sess;
- tr.appendChild(el("td","dim",sess));
- tr.appendChild(el("td","dim",(r.ms!=null?r.ms.toFixed(1):"")));
- tr.dataset.k=(r.src+" "+r.dst+" "+(r.line||"")).toLowerCase();
+ visibleCols().forEach(function(c){
+  var v=c.get(r);var td=el("td",c.cls?c.cls(r):"",v!=null?String(v):"");
+  tr.appendChild(td)});
+ tr.dataset.k=searchText(r);
  if(r.sess==2)tr.style.opacity=.55;
  return tr}
+function buildHead(){
+ var h=$("flowhead");h.innerHTML="";var tr=el("tr");
+ visibleCols().forEach(function(c){tr.appendChild(el("th","",c.label))});
+ if(!tr.childNodes.length)tr.appendChild(el("th","dim","(未选列 — 点 ⚙列 勾选)"));
+ h.appendChild(tr)}
+function buildColsBox(){
+ var box=$("colsbox");var sel=curSel();box.innerHTML="";
+ COLS.forEach(function(c){
+  var lb=document.createElement("label"),cb=document.createElement("input");
+  cb.type="checkbox";cb.dataset.id=c.id;cb.checked=sel.indexOf(c.id)>=0;cb.onchange=applySel;
+  lb.appendChild(cb);lb.appendChild(document.createTextNode(" "+c.label));box.appendChild(lb)});
+ var rst=el("button","","恢复默认");rst.onclick=function(){localStorage.removeItem("nft_cols");applySel()};
+ box.appendChild(rst)}
+function applySel(){
+ var ids=[];document.querySelectorAll("#colsbox input:checked").forEach(function(cb){ids.push(cb.dataset.id)});
+ localStorage.setItem("nft_cols",JSON.stringify(ids));
+ buildHead();buildColsBox();rerender()}
 function push(r){
  rows.push(r);evtTotal++;
  if(rows.length>MAXROWS){var n=rows.length-MAXROWS;rows.splice(0,n);
@@ -137,15 +173,18 @@ function push(r){
  $("n-rows").textContent=rows.length;$("n-evt").textContent=evtTotal}
 function rerender(){
  var b=$("flowbody");b.innerHTML="";var q=($("f-text").value||"").toLowerCase();
- var n=0;for(var i=rows.length-1;i>=0&&n<MAXROWS;i--){
+ var frag=document.createDocumentFragment();var n=0;
+ for(var i=rows.length-1;i>=0&&n<MAXROWS;i--){
   var r=rows[i];if(!rowMatch(r,q))continue;
   if($("f-new").checked&&r.sess!=0)continue;
-  b.insertBefore(trOf(r),b.firstChild);n++}
- $("n-rows").textContent=rows.length}
+  frag.insertBefore(trOf(r),frag.firstChild);n++}
+ b.appendChild(frag);$("n-rows").textContent=n}
 $("f-text").addEventListener("input",rerender);
 $("f-new").addEventListener("change",rerender);
 $("b-pause").onclick=function(){paused=!paused;this.textContent=paused?"▶ 继续":"⏸ 暂停"};
 $("b-clear").onclick=function(){rows=[];$("flowbody").innerHTML="";$("n-rows").textContent=0};
+$("b-cols").onclick=function(){var b=$("colsbox");b.style.display=b.style.display=="none"?"block":"none"};
+buildHead();buildColsBox();
 
 // ---------- websocket ----------
 function connect(){
@@ -193,7 +232,7 @@ function loadBind(){
   var cb=document.createElement("tbody");
   (d.candidates||[]).forEach(function(c){
    var tr=el("tr");
-   tr.appendChild(el("td","",(c.ip||"@")+c.ifname));
+   tr.appendChild(el("td","",c.ifname));
    tr.appendChild(el("td","",c.ip?c.ip+"/"+c.prefixlen:""));
    tr.appendChild(el("td","dim",c.method+(c.dynamic?" · 动态":"")));
    tr.appendChild(el("td",c.bound?"good":"warn",c.bound?("已绑定 mark "+c.mark):"未绑定"));
