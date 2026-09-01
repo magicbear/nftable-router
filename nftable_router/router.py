@@ -475,6 +475,12 @@ def load_config():
                 fptr.close()
 
             config = new_config
+            for nm, ln in config["proxy"].items():
+                miss = [k for k in ("ipv4", "ipv6") if k not in ln]
+                if miss:
+                    msg = "proxy %s missing flags %s -> treated as disabled for those families" % (nm, miss)
+                    print(tf.format("{msg:s,bg_yellow,black}", msg="[-] %s" % msg))
+                    syslog.syslog(syslog.LOG_WARNING, msg)
             g_proxy_index = proxy_index
         except Exception as e:
             print("[-] \033[41mLoad Config Error: %s\033[0m" % (e))
@@ -780,22 +786,31 @@ def install_proxy_chain_rules():
         if n not in managed:
             continue
         up = pmm.upstream_of(cfg)
-        try:
-            argv = pmm.build_cmd(n, cfg)
-        except ValueError as e:
-            print("      [%s] BUILD ERROR: %s" % (n, e))
-            continue
         if up:
             kind = pmm.upstream_kind(config["proxy"], up) if hasattr(pmm, "upstream_kind") else None
             where = ("via -> %s (%s)" % (up, "tproxy redirect :%s" % config["proxy"][up].get("port")
                         if kind == "port" else "ip-rule mark %s" % config["proxy"][up].get("mark")))
         else:
-            where = "direct: %s:%s" % (cfg.get("server") or cfg.get("proxy_ip"), cfg.get("server_port", "-"))
-        print("      [%-12s] %-8s :%-6s %s  uid=%s  cmd=%s" % (
-            n, cfg.get("daemon"), cfg.get("port"), where,
-            uid_cache.get(n), " ".join(pmm.redact(argv))))
-        if cfg.get("password"):
-            print("      [!] %s: inline password visible in /proc cmdline; prefer 'password_file'" % n)
+            where = None
+        try:
+            insts = pmm.instances_of(n, cfg)
+        except ValueError as e:
+            print("      [%s] BUILD ERROR: %s" % (n, e))
+            continue
+        for tag, icfg in insts:
+            label = n if not tag else "%s#%s" % (n, tag)
+            try:
+                argv = pmm.build_cmd(label, icfg)
+            except ValueError as e:
+                print("      [%s] BUILD ERROR: %s" % (label, e))
+                continue
+            iwhere = where or "direct: %s:%s" % (
+                icfg.get("server") or icfg.get("proxy_ip"), icfg.get("server_port", "-"))
+            print("      [%-14s] %-8s :%-6s %s  uid=%s  cmd=%s" % (
+                label, icfg.get("daemon"), icfg.get("port"), iwhere,
+                uid_cache.get(n), " ".join(pmm.redact(argv))))
+            if icfg.get("password"):
+                print("      [!] %s: inline password visible in /proc cmdline; prefer 'password_file'" % label)
     n_ok = 0
     for ip_family in ("ip", "ip6"):
         # INSERT at the head of nat_OUTPUT: the policy queue rule verdicts
@@ -1298,7 +1313,7 @@ def ip_mark(packet):
                             if pkt_version == 6 and tun_id in g_dead_proxy_ipv6 and \
                                     g_dead_proxy_ipv6[tun_id].value < 0:
                                 continue
-                            if not config["proxy"][tun_id][pkt_version_str]:
+                            if not config["proxy"][tun_id].get(pkt_version_str, False):
                                 continue
                             if config["proxy"][tun_id].get('weight', -1) < 0:
                                 continue
@@ -1469,21 +1484,28 @@ def clearRules():
     print("[*] clear rules finished")
 
 
-def stop_all_executors(grace=2.5):
-    """two-phase: signal ALL workers first, then join+harvest (total ~grace,
-    not per worker). Used by reload and shutdown paths."""
+def stop_all_executors(grace=1.5):
+    """Signal ALL workers, harvest against ONE shared deadline, then
+    kill+reap all stragglers together (total ~grace, never grace-per-worker).
+    Workers idle in netfilterqueue's blocking recv (GIL held inside the C
+    call) cannot run the deferred Python SIGTERM handler at all, so they are
+    stragglers by design; killing them there is safe (no callback in flight,
+    g_lock not held)."""
     global g_runner
     for run_p in g_runner:
         try:
             run_p.terminate()
         except OSError:
             pass
+    deadline = time.time() + grace
     for run_p in g_runner:
-        run_p.join(grace)
-        if run_p.is_alive():
-            print("[-] force kill %d" % run_p.worker_id)
-            run_p.kill()
-            run_p.join(0.5)
+        run_p.join(max(0.0, deadline - time.time()))
+    stragglers = [run_p for run_p in g_runner if run_p.is_alive()]
+    for run_p in stragglers:
+        print("[*] worker %d blocked in nf recv (idle), killing" % run_p.worker_id)
+        run_p.kill()
+    for run_p in stragglers:
+        run_p.join(1.0)
 
 
 def quit(signum, sigframe):
@@ -1504,11 +1526,7 @@ def restart_all_proxies(signum, sigframe):
 def load_executor():
     global g_runner
 
-    for run_p in g_runner:
-        try:
-            run_p.release_process()
-        except Exception as e:
-            pass
+    stop_all_executors()
 
     g_runner = []
 
@@ -1530,39 +1548,23 @@ def reload_queue(signum, sigframe):
 
 
 class NFQUEUE_Executeor(Process):
-    _stop_evt = None   # per-process Event, created in __init__ (post-fork)
 
     def __init__(self, worker_id):
-        NFQUEUE_Executeor._stop_evt = threading.Event()
-        # threading.Thread.__init__(self)
         super().__init__()
         self.worker_id = worker_id
+        # per-INSTANCE event: reload respawns workers one by one and a shared
+        # class attribute made every worker use the last-created event, so a
+        # SIGTERM could signal the wrong worker's event.
+        self._stop_evt = threading.Event()
 
-    def release_process(self, grace=2.5) -> None:
-        """terminate -> worker's main thread sits in Event.wait() (real Python
-        frame, handler runs instantly) -> os._exit. join, force-kill only on
-        the rare miss. Previous versions: 2s lock-poll per worker (60-90s
-        reloads), then SystemExit which netfilterqueue's C loop swallows."""
-        try:
-            self.terminate()
-        except OSError:
-            pass
-        self.join(grace)
-        if self.is_alive():
-            print("[-] force kill %d" % self.worker_id)
-            self.kill()
-            self.join(1.0)
-
-
-    @staticmethod
-    def quit(signum, sigframe):
+    def _on_term(self, signum, sigframe):
         global process_term
         process_term = True
         # signal-safe: only flag+wake; main thread of run() does the exiting
         # (a raise here dies in netfilterqueue's PyErr_Print path or never
         # runs while the main thread sits inside the C recv)
         try:
-            NFQUEUE_Executeor._stop_evt.set()
+            self._stop_evt.set()
         except Exception:
             pass
 
@@ -1572,9 +1574,9 @@ class NFQUEUE_Executeor(Process):
         syslog.openlog(ident="PolicyRoute[%d]::W%02d" % (os.getpid(), self.worker_id))
         worker_id = self.worker_id
 
-        stop = NFQUEUE_Executeor._stop_evt
-        signal.signal(signal.SIGTERM, self.quit)
-        signal.signal(signal.SIGQUIT, self.quit)
+        stop = self._stop_evt
+        signal.signal(signal.SIGTERM, self._on_term)
+        signal.signal(signal.SIGQUIT, self._on_term)
         signal.signal(signal.SIGUSR1, signal.SIG_IGN)   # reload is master-only
         signal.signal(signal.SIGUSR2, signal.SIG_IGN)
 
@@ -1782,7 +1784,7 @@ if __name__ == "__main__":
         for priority in range(0, len(config["rules"])):
             for tun_id, rule_cfg in config["rules"][priority].items():
                 for geo_k, geo_list in rule_cfg.items():
-                    if geo_k == "cidr" and config["proxy"][tun_id]["ipv%d" % (ip_version)]:
+                    if geo_k == "cidr" and config["proxy"][tun_id].get("ipv%d" % ip_version, False):
                         for cidr in geo_list:
                             if cidr.version == ip_version and cidr.is_private:
                                 nfu.add_rule({'family': ip_family, 'chain': ['nat_PREROUTING'], 'table': 'policy_route',
@@ -1833,7 +1835,7 @@ if __name__ == "__main__":
                                 #             {'counter': {'bytes': 0, 'packets': 0}}]
                                 #         ))
 
-                                if config["proxy"][tun_id]["udp_v%d" % (ip_version)]:
+                                if config["proxy"][tun_id].get("udp_v%d" % ip_version, False):
                                     nfu.add_rule(
                                         dict(family=ip_family, chain=['mangle_PREROUTING'], table='policy_route',
                                              comment=cmt_class, expr=[
@@ -1909,12 +1911,12 @@ if __name__ == "__main__":
         redir_ports = []
         for k, proxy_cfg in config["proxy"].items():
             # tap0 ss-redir
-            if proxy_cfg["ipv%d" % (ip_version)]:
+            if proxy_cfg.get("ipv%d" % ip_version, False):
                 if "port" in proxy_cfg:
                     if proxy_cfg["port"] not in redir_ports:
                         redir_ports.append(proxy_cfg["port"])
                     create_tproxy(mark=proxy_cfg["mark"], port=proxy_cfg["port"], ip_family=ip_family,
-                                  udp=proxy_cfg["udp_v%d" % (ip_version)])
+                                  udp=proxy_cfg.get("udp_v%d" % ip_version, False))
                 if proxy_cfg["mark"] not in proxy_marks:
                     proxy_marks.append(proxy_cfg["mark"])
                 # [0x1, 0x2, 0x5, 0x6, 0x7, 0x8, 0x99]
@@ -2107,31 +2109,19 @@ if __name__ == "__main__":
                         str(e), '  '.join(traceback.format_tb(e.__traceback__))))
                 # egress/chain/proxy/webadmin reconcile piggybacks on pending:
                 g_proxy_pending.value = True
-                # restart NFQUEUE workers: signal ALL at once, then harvest +
-                # respawn. (Was: in signal handler -> recursive reload storms;
-                # and per-worker 2s lock/deadline polls -> 60-90s reloads.)
+                # restart NFQUEUE workers: ONE shared grace window for all,
+                # stragglers killed together, then respawn. (Was: in signal
+                # handler -> recursive reload storms; per-worker 2s lock/
+                # deadline polls; and per-worker join timeouts -> idle workers
+                # force-killed one after another, ~3s x N.)
                 t_reload_workers = time.time()
-                for run_p in g_runner:
-                    try:
-                        run_p.terminate()
-                    except OSError:
-                        pass
-                for np_id in range(len(g_runner)):
-                    try:
-                        run_p = g_runner[np_id]
-                        run_p.join(3.0)
-                        if run_p.is_alive():
-                            print("[-] force kill %d" % np_id)
-                            run_p.kill()
-                            run_p.join(0.5)
-                        nq = NFQUEUE_Executeor(np_id)
-                        nq.start()
-                        g_runner[np_id] = nq
-                    except Exception as e:
-                        print(tf.format("{msg:s,bg_red,black}", msg="[-] Reload Error: %s" % e))
-                        print(''.join(traceback.format_tb(e.__traceback__)))
-                        syslog.syslog(syslog.LOG_CRIT, "Reload Process Error: %s\n  %s" % (
-                            str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+                try:
+                    load_executor()
+                except Exception as e:
+                    print(tf.format("{msg:s,bg_red,black}", msg="[-] Reload Error: %s" % e))
+                    print(''.join(traceback.format_tb(e.__traceback__)))
+                    syslog.syslog(syslog.LOG_CRIT, "Reload Process Error: %s\n  %s" % (
+                        str(e), '  '.join(traceback.format_tb(e.__traceback__))))
                 print("[+] %s (%.2fs)" % (tf.format("{msg:s,green,bold}", msg="reboot executer done"),
                                            time.time() - t_reload_workers))
 

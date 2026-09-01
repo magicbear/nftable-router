@@ -297,6 +297,8 @@ def validate_config(cfg):
             errors.append("proxy %s: invalid mark %r" % (name, m))
         else:
             marks.setdefault(m, []).append(name)
+        if "ipv4" not in line and "ipv6" not in line:
+            errors.append("proxy %s: missing family flags (ipv4/ipv6 must be set explicitly)" % name)
         p = line.get("port")
         if p is not None and not (isinstance(p, int) and 1 <= p <= 65535):
             errors.append("proxy %s: invalid port %r" % (name, p))
