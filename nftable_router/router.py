@@ -900,6 +900,13 @@ class PrintResultThread(threading.Thread):
                                   "line": rc.out_interface, "mark": rc.mark,
                                   "pri": rc.matched_priority, "sess": rc.test_session,
                                   "ms": round(rc.t_total, 2), "fc": 1 if rc.process_fullcone else 0}
+                            try:
+                                _rn = dns_list[rc.dst]
+                                if _rn:
+                                    ev["qname"] = ",".join(sorted({str(d.qname).rstrip(".")
+                                                                   for d in _rn}))[:160]
+                            except KeyError:
+                                pass
                             if isinstance(rc.geodata, dict):
                                 gd = rc.geodata
                                 ev["geo"] = {"cc": gd.get("country_code") or "",
