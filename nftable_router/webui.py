@@ -3,13 +3,13 @@
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260901-2140"
+UI_VERSION = "20260901-2210"
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nft-route 管理台</title>
-<script>var UI_VER="20260901-2140";</script>
+<script>var UI_VER="20260901-2210";</script>
 <style>
 :root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
 --green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
@@ -356,7 +356,8 @@ $("b-add").onclick=function(){
  if(dyn&&!body.gateway)body.gateway="auto";
  api("/api/bind",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
  .then(function(r){
-  if(r.ok){toast("已绑定: "+body.ifname+" mark 0x"+mark.toString(16)+"(未重载,状态页可重载)","good");markDirty();loadBind()}
+  if(r.ok){markDirty();toast("已绑定: "+body.ifname+" mark 0x"+mark.toString(16)+"(未重载,状态页可重载)","good");
+   loadCfg(function(){loadBind()})}
   else toast("拒绝: "+(r.error||JSON.stringify(r.errors||r)),"bad")}).catch(function(e){toast("请求失败 "+e,"bad")})};
 
 // ---------- shared config state ----------
@@ -377,7 +378,7 @@ function pushCfg(cb){
     return}
    if(r.errors){var em=(r.errors||[]).join("\\n");toast("拒绝保存:\\n"+em,"bad");
     $("c-msg")&&($("c-msg").innerHTML="<span class=bad>"+em.replace(/\\n/g,"<br>")+"</span>");return}
-   if(r.ok){toast("已写入配置文件(未重载) — 到 状态 页点『重载主进程』生效","good");markDirty();if(cb)cb()}
+   if(r.ok){if(r.mtime)CFG_MTIME=r.mtime;toast("已写入配置文件(未重载) — 到 状态 页点『重载主进程』生效","good");markDirty();if(cb)cb()}
    else if(!r.stale&&!r.errors){toast("保存失败: "+(r.error||JSON.stringify(r)),"bad")}
    else{var msg=(r.errors||[r.error||JSON.stringify(r)]).join("\\n");
     toast("拒绝保存:\\n"+msg,"bad");$("c-msg")&&($("c-msg").innerHTML="<span class=bad>"+msg.replace(/\\n/g,"<br>")+"</span>")}})}
@@ -734,7 +735,7 @@ $("c-save").onclick=function(){var cfg;try{cfg=JSON.parse($("c-box").value)}catc
  api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg,reload:false,base_mtime:CFG_MTIME,ui_ver:(typeof UI_VER!=="undefined"?UI_VER:"")})}).then(function(r){
   if(r.stale){toast("配置已被外部修改，请先点『读取配置』重新加载","bad");return}
   if(r.outdated_ui){toast(String(r.error),"bad");return}
-  if(r.ok){toast("已保存(未重载) — 到 状态 页点『重载主进程』生效","good");markDirty();loadCfg()}
+  if(r.ok){if(r.mtime)CFG_MTIME=r.mtime;toast("已保存(未重载) — 到 状态 页点『重载主进程』生效","good");markDirty();loadCfg()}
   else{var msg=(r.errors||[r.error||JSON.stringify(r)]).join("\\n");toast("拒绝保存:\\n"+msg,"bad");$("c-msg").innerHTML="<span class=bad>"+msg.replace(/\\n/g,"<br>")+"</span>"}})};
 loadCfg();
 

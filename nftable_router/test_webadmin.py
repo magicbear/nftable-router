@@ -242,6 +242,36 @@ def test_server_e2e():
             h, r2 = head.split(b"\r\n\r\n", 1)
             res = json.loads(read_http_body(s, h, r2)); s.close()
             check("stale base_mtime -> 409 stale:true", res.get("stale") is True)
+            # consecutive saves: 2nd uses mtime returned by 1st -> must pass
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            s.sendall(b"GET /api/config HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += s.recv(4096)
+            h0, r00 = head.split(b"\r\n\r\n", 1)
+            mt0 = json.loads(read_http_body(s, h0, r00))["mtime"]; s.close()
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            c3 = json.load(open(cpath)); c3["egress_marks"] = [{"iface": "lo0", "mark": 4321, "dynamic": True}]
+            payload = json.dumps({"config": c3, "ui_ver": "test", "base_mtime": mt0})
+            s.sendall(("POST /api/config HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
+                       "\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(payload), payload)).encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += s.recv(4096)
+            h2, r22 = head.split(b"\r\n\r\n", 1)
+            res = json.loads(read_http_body(s, h2, r22)); s.close()
+            check("save returns new mtime", res.get("ok") and res.get("mtime"))
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            payload2 = json.dumps({"config": json.load(open(cpath)), "ui_ver": "test",
+                                   "base_mtime": res["mtime"]})
+            s.sendall(("POST /api/config HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
+                       "\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(payload2), payload2)).encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += s.recv(4096)
+            h3, r33 = head.split(b"\r\n\r\n", 1)
+            res2 = json.loads(read_http_body(s, h3, r33)); s.close()
+            check("consecutive save with returned mtime -> 200", b"200" in h3 and res2.get("ok"))
             # old/cached UI build -> 428 outdated_ui
             s = socket.create_connection(("127.0.0.1", port), timeout=3)
             oldpayload = json.dumps({"config": newcfg, "base_mtime": mt, "ui_ver": "20200101-0000"})
@@ -264,10 +294,9 @@ def test_server_e2e():
                 head += s.recv(4096)
             h, r2 = head.split(b"\r\n\r\n", 1)
             res = json.loads(read_http_body(s, h, r2))
-            check("bind added egress entry", res.get("ok") and
-                  json.load(open(cpath))["egress_marks"][0]["iface"] == "ppp0")
-            check("iprule.gateway auto recorded",
-                  json.load(open(cpath))["egress_marks"][0]["iprule"]["gateway"] == "auto")
+            eb = [e for e in json.load(open(cpath))["egress_marks"] if e.get("iface") == "ppp0"]
+            check("bind added egress entry", res.get("ok") and len(eb) == 1)
+            check("iprule.gateway auto recorded", eb and eb[0]["iprule"]["gateway"] == "auto")
             s.close()
             # websocket flow: handshake -> hello+snap frames -> broadcast -> client close
             s = socket.create_connection(("127.0.0.1", port), timeout=3)

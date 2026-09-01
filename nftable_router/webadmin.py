@@ -1096,7 +1096,11 @@ class Handler(BaseHTTPRequestHandler):
             rc = {"ok": None, "error": "use POST /api/reload"}
             if body.get("reload"):
                 rc = signal_master()
-            self.send_json(200, {"ok": True, "reload": rc})
+            try:
+                nm = os.stat(self.cfg_path()).st_mtime
+            except OSError:
+                nm = None
+            self.send_json(200, {"ok": True, "reload": rc, "mtime": nm})
         elif path == "/api/bind":
             cfg = ib.load_config(self.cfg_path())
             if not body.get("ifname"):
@@ -1127,7 +1131,11 @@ class Handler(BaseHTTPRequestHandler):
                 entry.setdefault("iprule", {})["gateway"] = gw or "auto"
             ib.save_config(self.cfg_path(), cfg)
             rc = {} if not body.get("reload") else signal_master()
-            self.send_json(200, {"ok": True, "entry": entry, "reload": rc})
+            try:
+                nm = os.stat(self.cfg_path()).st_mtime
+            except OSError:
+                nm = None
+            self.send_json(200, {"ok": True, "entry": entry, "reload": rc, "mtime": nm})
         elif path == "/api/routes":
             self.send_json(200, rt_edit(body))
         elif path == "/api/reload":
