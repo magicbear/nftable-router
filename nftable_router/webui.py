@@ -22,7 +22,7 @@ main{padding:10px 14px;max-width:1500px}
 section{display:none}section.sel{display:block}
 table{border-collapse:collapse;width:100%}
 th,td{padding:2px 8px;border-bottom:1px solid #202532;text-align:left;white-space:nowrap}
-th{color:var(--dim);font-weight:normal;position:sticky;top:41px;background:var(--bg)}
+th{color:var(--dim);font-weight:normal;position:sticky;top:0;background:var(--bg);z-index:2;box-shadow:0 1px 0 var(--line)}
 #flowwrap{height:calc(100vh - 150px);overflow:auto;border:1px solid var(--line);border-radius:6px}
 .bar{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
 input,select,textarea{background:#0c0f14;color:var(--fg);border:1px solid var(--line);
