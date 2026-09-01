@@ -7,3 +7,8 @@ nftable_router/markexec.so
 ._*
 .idea/
 .DS_Store
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+.markexec.so

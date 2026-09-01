@@ -1,2 +1,0 @@
-[console_scripts]
-nft-router = nftable_router.router:main
