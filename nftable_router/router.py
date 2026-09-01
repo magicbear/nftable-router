@@ -1469,6 +1469,23 @@ def clearRules():
     print("[*] clear rules finished")
 
 
+def stop_all_executors(grace=2.5):
+    """two-phase: signal ALL workers first, then join+harvest (total ~grace,
+    not per worker). Used by reload and shutdown paths."""
+    global g_runner
+    for run_p in g_runner:
+        try:
+            run_p.terminate()
+        except OSError:
+            pass
+    for run_p in g_runner:
+        run_p.join(grace)
+        if run_p.is_alive():
+            print("[-] force kill %d" % run_p.worker_id)
+            run_p.kill()
+            run_p.join(0.5)
+
+
 def quit(signum, sigframe):
     if is_master:
         print("[*] clear rules by received signal %d" % (signum))
@@ -1518,37 +1535,32 @@ class NFQUEUE_Executeor(Process):
         super().__init__()
         self.worker_id = worker_id
 
-    def release_process(self) -> None:
-        # Ask the worker to exit its own loop first (checked in
-        # NFQUEUE_Executeor.run() after nfqueue.run() returns/raises).
-        self.terminate()
-
-        # Only release locks we actually acquired -- acquire() can time out
-        # if a worker was killed mid critical-section in a previous call,
-        # and blindly releasing here would corrupt state for every other
-        # process still waiting on the lock.
-        got_lock = g_lock.acquire(timeout=2.0)
-        got_io_lock = g_io_lock.acquire(timeout=2.0)
+    def release_process(self, grace=2.5) -> None:
+        """terminate -> the worker's SIGTERM handler raises SystemExit and it
+        dies within ~ms. join, force-kill only on the rare miss. The previous
+        version acquired g_lock/g_io_lock (2s timeouts each) and polled
+        is_alive 2s PER worker -> 38 workers * ~2.2s = 60-90s reloads."""
         try:
-            deadline = time.time() + 2.0
-            while self.is_alive() and time.time() < deadline:
-                time.sleep(0.05)
-        finally:
-            if got_io_lock:
-                g_io_lock.release()
-            if got_lock:
-                g_lock.release()
-
+            self.terminate()
+        except OSError:
+            pass
+        self.join(grace)
         if self.is_alive():
             print("[-] force kill %d" % self.worker_id)
-            if not got_lock:
-                print("[-] %d did not release g_lock in time before kill, state may be inconsistent" % self.worker_id)
             self.kill()
+            self.join(1.0)
+
 
     @staticmethod
     def quit(signum, sigframe):
         global process_term
         process_term = True
+        # the worker's life is spent blocked inside nfqueue.run() (C recv,
+        # auto-retried after EINTR per PEP475) -> a mere flag would NEVER be
+        # observed. raise SystemExit: it propagates out of the C call, the
+        # timed_lock finallys unwind (g_lock/ct state stay clean) and the
+        # child exits immediately on SIGTERM.
+        raise SystemExit(0)
 
     def run(self):
         global ecmp_thread, is_master, worker_id, process_term, nfu
@@ -2071,14 +2083,23 @@ if __name__ == "__main__":
                         str(e), '  '.join(traceback.format_tb(e.__traceback__))))
                 # egress/chain/proxy/webadmin reconcile piggybacks on pending:
                 g_proxy_pending.value = True
-                # restart NFQUEUE workers (was in the signal handler -> caused
-                # recursive reload storms; serialized here, USR1 during this
-                # just re-arms g_reload_flag for the NEXT iteration)
+                # restart NFQUEUE workers: signal ALL at once, then harvest +
+                # respawn. (Was: in signal handler -> recursive reload storms;
+                # and per-worker 2s lock/deadline polls -> 60-90s reloads.)
+                t_reload_workers = time.time()
+                for run_p in g_runner:
+                    try:
+                        run_p.terminate()
+                    except OSError:
+                        pass
                 for np_id in range(len(g_runner)):
                     try:
-                        print("[*] %s" % tf.format("{msg:s,yellow,bold}", msg="rebooting executer %d  " % np_id))
                         run_p = g_runner[np_id]
-                        run_p.release_process()
+                        run_p.join(3.0)
+                        if run_p.is_alive():
+                            print("[-] force kill %d" % np_id)
+                            run_p.kill()
+                            run_p.join(0.5)
                         nq = NFQUEUE_Executeor(np_id)
                         nq.start()
                         g_runner[np_id] = nq
@@ -2087,7 +2108,8 @@ if __name__ == "__main__":
                         print(''.join(traceback.format_tb(e.__traceback__)))
                         syslog.syslog(syslog.LOG_CRIT, "Reload Process Error: %s\n  %s" % (
                             str(e), '  '.join(traceback.format_tb(e.__traceback__))))
-                print("[+] %s" % tf.format("{msg:s,green,bold}", msg="reboot executer done"))
+                print("[+] %s (%.2fs)" % (tf.format("{msg:s,green,bold}", msg="reboot executer done"),
+                                           time.time() - t_reload_workers))
 
             if g_proxy_pending.value:
                 g_proxy_pending.value = False
@@ -2223,8 +2245,7 @@ if __name__ == "__main__":
             if g_proxy_sup:
                 g_proxy_sup.stop_all()   # before rules are cleared & master SIGKILLs itself
             clearRules()
-            for run_p in g_runner:
-                run_p.release_process()
+            stop_all_executors()
             print("[*] system exit")
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
             os.kill(os.getpid(), signal.SIGKILL)
