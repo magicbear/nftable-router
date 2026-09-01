@@ -196,6 +196,7 @@ def test_server_e2e():
             # save new valid config (no reload -> no pidfile so would error anyway)
             newcfg = json.loads(json.dumps(cfg))
             newcfg["egress_marks"] = []
+            # missing base_mtime -> 428 (stale/cached clients locked out)
             payload = json.dumps({"config": newcfg, "reload": False})
             s = socket.create_connection(("127.0.0.1", port), timeout=3)
             s.sendall(("POST /api/config HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
@@ -204,10 +205,42 @@ def test_server_e2e():
             while b"\r\n\r\n" not in head:
                 head += s.recv(4096)
             h, r2 = head.split(b"\r\n\r\n", 1)
-            res = json.loads(read_http_body(s, h, r2))
-            check("save ok (reload suppressed)", res.get("ok") is True and res.get("reload", {}).get("ok") is None)
+            res = json.loads(read_http_body(s, h, r2)); s.close()
+            check("save without base_mtime -> 428", b"428" in h and res.get("ok") is False
+                  and "base_mtime" in res.get("error",""))
+            # fresh mtime -> ok
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            s.sendall(("GET /api/config HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += s.recv(4096)
+            h, r2 = head.split(b"\r\n\r\n", 1)
+            got = json.loads(read_http_body(s, h, r2)); s.close()
+            mt = got["mtime"]
+            payload = json.dumps({"config": newcfg, "reload": False, "base_mtime": mt})
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            s.sendall(("POST /api/config HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
+                       "\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(payload), payload)).encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += s.recv(4096)
+            h, r2 = head.split(b"\r\n\r\n", 1)
+            res = json.loads(read_http_body(s, h, r2)); s.close()
+            check("save ok with fresh base_mtime (reload suppressed)",
+                  res.get("ok") is True and res.get("reload", {}).get("ok") is None)
             check("config file rewritten", json.load(open(cpath))["egress_marks"] == [])
-            s.close()
+            # stale mtime -> 409
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            time.sleep(0.02)
+            payload = json.dumps({"config": newcfg, "base_mtime": mt - 5})
+            s.sendall(("POST /api/config HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
+                       "\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(payload), payload)).encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                head += s.recv(4096)
+            h, r2 = head.split(b"\r\n\r\n", 1)
+            res = json.loads(read_http_body(s, h, r2)); s.close()
+            check("stale base_mtime -> 409 stale:true", res.get("stale") is True)
             # bind API
             bpayload = json.dumps({"ifname": "ppp0", "dynamic": True, "mark": 51,
                                    "gateway": "auto", "reload": False})

@@ -931,6 +931,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store, must-revalidate")
             self.end_headers()
             self.wfile.write(body)
         elif path == "/ws/stream":
@@ -1036,8 +1037,13 @@ class Handler(BaseHTTPRequestHandler):
             if errors:
                 self.send_json(422, {"ok": False, "errors": errors})
                 return
-            # optimistic lock: refuse silent overwrite of externally-changed file
+            # every UI save must carry base_mtime (stale/cached clients are
+            # rejected loudly instead of clobbering via the back door)
             base_mtime = body.get("base_mtime")
+            if base_mtime is None and not body.get("force"):
+                self.send_json(428, {"ok": False,
+                                     "error": "缺少 base_mtime: 页面缓存过旧，请刷新页面（或 Ctrl+Shift+R 强刷）后重新编辑保存"})
+                return
             try:
                 cur_mtime = os.stat(self.cfg_path()).st_mtime
             except OSError:
