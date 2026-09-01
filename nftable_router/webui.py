@@ -1041,7 +1041,7 @@ function logView(key){
     box.textContent=r.ok?((r.size>r.text.length?("...(截断,全文件 "+r.size+" 字节)\\n"):"")+r.text):("(无日志文件: "+(r.error||"")+")");
     box.scrollTop=box.scrollHeight;
     var a=document.getElementById("lg_auto");
-    if(logTimer&&(!a||!a.checked)){clearInterval(logTimer);logTimer=null}})}}
+    if(logTimer&&(!a||!a.checked)){clearInterval(logTimer);logTimer=null}})}
   fetchLog();
   if(logTimer)clearInterval(logTimer);
   logTimer=setInterval(function(){var a=document.getElementById("lg_auto");
