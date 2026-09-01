@@ -298,7 +298,7 @@ def validate_config(cfg):
         else:
             marks.setdefault(m, []).append(name)
         if "ipv4" not in line and "ipv6" not in line:
-            errors.append("proxy %s: missing family flags (ipv4/ipv6 must be set explicitly)" % name)
+            errors.append("proxy %s: 缺少 ipv4/ipv6 标记（若你并未编辑过该线路，多半是页面快照过旧：先点 刷新/读取配置 再试）" % name)
         p = line.get("port")
         if p is not None and not (isinstance(p, int) and 1 <= p <= 65535):
             errors.append("proxy %s: invalid port %r" % (name, p))
@@ -1033,25 +1033,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": not validate_config(cfg), "errors": validate_config(cfg)})
         elif path == "/api/config":
             cfg = body.get("config")
-            errors = validate_config(cfg)
-            if errors:
-                self.send_json(422, {"ok": False, "errors": errors})
-                return
-            # every UI save must carry base_mtime (stale/cached clients are
-            # rejected loudly instead of clobbering via the back door)
+            # FRESHNESS FIRST: an outdated page snapshot normally fails content
+            # validation for keys the user never edited -> say "stale" not ghost
+            # errors (CPE5G family-flags confusion root cause)
             base_mtime = body.get("base_mtime")
-            if base_mtime is None and not body.get("force"):
-                self.send_json(428, {"ok": False,
-                                     "error": "缺少 base_mtime: 页面缓存过旧，请刷新页面（或 Ctrl+Shift+R 强刷）后重新编辑保存"})
-                return
             try:
                 cur_mtime = os.stat(self.cfg_path()).st_mtime
             except OSError:
                 cur_mtime = None
+            if base_mtime is None and not body.get("force"):
+                self.send_json(428, {"ok": False,
+                                     "error": "缺少 base_mtime: 页面缓存过旧，请刷新页面（或 Ctrl+Shift+R 强刷）后重新编辑保存"})
+                return
             if (base_mtime is not None and cur_mtime is not None
                     and abs(cur_mtime - float(base_mtime)) > 0.001 and not body.get("force")):
                 self.send_json(409, {"ok": False, "stale": True, "server_mtime": cur_mtime,
-                                     "error": "配置文件在本页面加载之后被外部修改过，已阻止覆盖"})
+                                     "error": "配置文件在本页面加载后被外部修改过，已阻止覆盖 —— 请点『刷新/读取配置』重新加载最新内容后再编辑保存"})
+                return
+            errors = validate_config(cfg)
+            if errors:
+                self.send_json(422, {"ok": False, "errors": errors})
                 return
             try:
                 ib.save_config(self.cfg_path(), cfg)          # atomic + .bak
