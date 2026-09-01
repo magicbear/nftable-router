@@ -101,6 +101,7 @@ g_runner = []
 g_proxy_sup = None            # ProxySupervisor instance (master only)
 g_proxy_pending = Value('b', False)   # SIGUSR1 -> incremental reconfigure in main loop
 g_proxy_restart_all = Value('b', False)  # SIGUSR2 -> restart ALL managed proxies
+g_reload_flag = Value('b', False)        # SIGUSR1 -> FULL reload done in MAIN LOOP (never in signal context)
 g_webadmin = None                         # WebadminService instance (master child proc)
 
 
@@ -1489,42 +1490,14 @@ def load_executor():
 
 
 def reload_queue(signum, sigframe):
-    global ecmp_thread, test_thread, g_runner
-
+    """SIGUSR1 = FULL reload. FLAG ONLY -- the actual work (load_config, nft
+    rule re-apply, worker restart, proxy reconcile, webadmin reconcile) runs
+    SERIALIZED in the main loop. Doing it inside a signal handler let a second
+    USR1 recursively re-enter mid-restart; production incident: nested
+    reload_queue -> release_process storm froze the router 30+ minutes."""
     if not is_master:
-        sys.exit(0)
-
-    print("[*] loading configure")
-
-    # nfqueue.unbind()
-    load_config()
-    test_thread.last_check = 0
-    # SIGUSR1: egress rules + chain rules + managed proxies are ALL handled
-    # from the MAIN loop (g_proxy_pending): nfu.nft json_cmd is not reentrant,
-    # and this handler can interrupt the main loop mid-json_cmd; spawn/fork
-    # must not happen inside signal handler context either.
-    g_proxy_pending.value = True
-    # tp.lock.acquire()
-    # tp.device_list = None
-    # tp.lock.release()
-
-    # nfqueue.bind(4, ip_mark, mode=netfilterqueue.COPY_PACKET)
-
-    for np_id in range(len(g_runner)):
-        try:
-            print("[*] %s" % tf.format("{msg:s,yellow,bold}", msg="rebooting executer %d  " % np_id))
-            run_p = g_runner[np_id]
-            run_p.release_process()
-            nq = NFQUEUE_Executeor(np_id)
-            nq.start()
-            g_runner[np_id] = nq
-        except Exception as e:
-            print(tf.format("{msg:s,bg_red,black}", msg="[-] Reload Error: %s" % e))
-            print(''.join(traceback.format_tb(e.__traceback__)))
-
-            syslog.syslog(syslog.LOG_CRIT, "Reload Process Error: %s\n  %s" % (
-                 str(e), '  '.join(traceback.format_tb(e.__traceback__))))
-    print("[+] %s" % tf.format("{msg:s,green,bold}", msg="reboot executer done"))
+        return
+    g_reload_flag.value = True
 
 
 class NFQUEUE_Executeor(Process):
@@ -1574,6 +1547,8 @@ class NFQUEUE_Executeor(Process):
 
         signal.signal(signal.SIGTERM, self.quit)
         signal.signal(signal.SIGQUIT, self.quit)
+        signal.signal(signal.SIGUSR1, signal.SIG_IGN)   # reload is master-only
+        signal.signal(signal.SIGUSR2, signal.SIG_IGN)
 
         is_master = False
 
@@ -2071,6 +2046,36 @@ if __name__ == "__main__":
                         tty.setcbreak(sys.stdin.fileno())
                 else:
                     queue_stdin = queue_stdin[1:]
+
+            if g_reload_flag.value:
+                g_reload_flag.value = False
+                print("[*] loading configure")
+                try:
+                    load_config()
+                    test_thread.last_check = 0
+                except Exception as e:
+                    print(tf.format("{msg:s,bg_red,black}", msg="[-] reload load_config error: %s" % e))
+                    syslog.syslog(syslog.LOG_CRIT, "reload load_config error: %s\n  %s" % (
+                        str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+                # egress/chain/proxy/webadmin reconcile piggybacks on pending:
+                g_proxy_pending.value = True
+                # restart NFQUEUE workers (was in the signal handler -> caused
+                # recursive reload storms; serialized here, USR1 during this
+                # just re-arms g_reload_flag for the NEXT iteration)
+                for np_id in range(len(g_runner)):
+                    try:
+                        print("[*] %s" % tf.format("{msg:s,yellow,bold}", msg="rebooting executer %d  " % np_id))
+                        run_p = g_runner[np_id]
+                        run_p.release_process()
+                        nq = NFQUEUE_Executeor(np_id)
+                        nq.start()
+                        g_runner[np_id] = nq
+                    except Exception as e:
+                        print(tf.format("{msg:s,bg_red,black}", msg="[-] Reload Error: %s" % e))
+                        print(''.join(traceback.format_tb(e.__traceback__)))
+                        syslog.syslog(syslog.LOG_CRIT, "Reload Process Error: %s\n  %s" % (
+                            str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+                print("[+] %s" % tf.format("{msg:s,green,bold}", msg="reboot executer done"))
 
             if g_proxy_pending.value:
                 g_proxy_pending.value = False
