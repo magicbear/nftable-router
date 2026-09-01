@@ -31,15 +31,21 @@ skuid identity rules (one set per LINE that has a run-user; comment-tagged,
 managed entirely here -- INSERT at HEAD of nat_OUTPUT for verdict rules so
 they run BEFORE the policy NFQUEUE; mark stamps go into the iface_bind
 TYPE-ROUTE output chain because a mark set after the routing decision never
-steers egress):
+steers egress). A stamp's VALUE IS ALWAYS THE LINE'S OWN MARK -- the rule is
+the line's global identity binding (every process under that uid egresses via
+that line), never the upstream's. Process-side chaining to a mark upstream
+works via SETUID-to-upstream-user (identity_line) + the upstream line's own
+stamp rule, NOT via consumer-keyed mark rules:
   managed, upstream = port-line B : skuid A, tcp, daddr != @local,
                                    dport != port(B) -> redirect :port(B)
-  managed, upstream = mark-line M : skuid A -> meta mark set M (+ct save)
-                                   [skipped when M has its own run-user: the
-                                    process then runs as M's user and M's own
-                                    stamp rule covers it]
+                                   (+ own-mark stamp if the line has a mark)
+  managed, upstream = mark-line M : skuid A -> meta mark set A.mark (+ct save)
+                                   [line without own mark falls back to M.mark]
   managed, direct, line has mark  : skuid A -> meta mark set own mark (+ct)
   managed, direct, no mark        : skuid A, daddr != @local -> accept
+  (UDP LOOP GUARD: a stamp on a line's own mark is skipped when the process
+   runs under that SAME uid while udp_tproxy capture exists on the mark --
+   the stamp would feed the proxy's own udp egress back into its listener.)
   plain mark line w/ run-user     : skuid X -> meta mark set own mark (+ct)
 Self-loop / cycle / missing-upstream / unmanaged-upstream / duplicate uid are
 rejected at plan time; chain start order is topological (deepest dependency
@@ -449,44 +455,57 @@ def plan_proxy_chain_rules(proxy_cfgs, uid_cache, family="ip"):
                 rules.append(_stamp_rule(family, uid, mark))
             continue
         up_name = upstream_of(cfg)
-        if up_name and upstream_kind(proxy_cfgs, up_name) == "port":
-            up_port = int(proxy_cfgs[up_name]["port"])
-            expr = [
-                skuid,
-                {"match": {"left": {"meta": {"key": "l4proto"}}, "op": "==", "right": "tcp"}},
-                not_local,
-            ]
-            # belt & braces: never redirect a flow whose dport already IS the
-            # upstream port (would re-enter the same listener forever)
-            expr.append({"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}},
-                                   "op": "!=", "right": up_port}})
-            expr += [
-                {"counter": {"bytes": 0, "packets": 0}},
-                {"redirect": {"port": up_port}},
-            ]
-            rules.append({"family": family, "table": "policy_route", "chain": "nat_OUTPUT",
-                          "comment": CHAIN_CMT, "expr": expr})
-            continue
-        up_mark = None
         if up_name:
             up_cfg = proxy_cfgs.get(up_name) or {}
-            up_mark = up_cfg.get("mark")
-        if up_mark is not None:
-            # ip-rule upstream: stamp OUR egress with the UPSTREAM line's mark
-            # (own skuid wins; a line that left uid empty never gets here --
-            # identity_line runs it as the upstream's user and the upstream's
-            # own stamp covers it). Never stamp our OWN line mark: for udp
-            # tproxy lines re-marking our egress with the capture mark would
-            # feed it back into our own listener.
-            rules.append(_stamp_rule(family, uid, up_mark))
-        else:
-            # direct managed proxy: its upstream egress must never re-enter
-            # the policy queue / its own tproxy capture (covers tcp AND udp)
-            rules.append({"family": family, "table": "policy_route", "chain": "nat_OUTPUT",
-                          "comment": CHAIN_CMT, "expr": [
-                              skuid, not_local,
-                              {"counter": {"bytes": 0, "packets": 0}},
-                              {"accept": None}]})
+            up_kind = upstream_kind(proxy_cfgs, up_name)
+            if up_kind == "port":
+                up_port = int(up_cfg["port"])
+                expr = [
+                    skuid,
+                    {"match": {"left": {"meta": {"key": "l4proto"}}, "op": "==", "right": "tcp"}},
+                    not_local,
+                    # belt & braces: never redirect a flow whose dport already
+                    # IS the upstream port (would re-enter it forever)
+                    {"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}},
+                               "op": "!=", "right": up_port}},
+                    {"counter": {"bytes": 0, "packets": 0}},
+                    {"redirect": {"port": up_port}},
+                ]
+                rules.append({"family": family, "table": "policy_route",
+                              "chain": "nat_OUTPUT", "comment": CHAIN_CMT, "expr": expr})
+                if mark is not None:
+                    rules.append(_stamp_rule(family, uid, mark))
+                continue
+            if mark is not None:
+                # THE STAMP VALUE IS THE LINE'S OWN MARK (global skuid binding:
+                # every process under this uid egresses via THIS line), never
+                # the upstream's -- chained traffic is delivered into the
+                # upstream by the redirect/mark logic keyed on the PROCESS
+                # identity (see identity_line), not on this rule.
+                # LOOP GUARD: if the managed process runs under THIS line's own
+                # uid (upstream has no run-user -> no inheritance) AND the line
+                # has udp_tproxy capture on its own mark, stamping would feed
+                # its udp egress back into its own listener -> skip the stamp.
+                own_ident = uid_cache.get(up_name) is None
+                if not (own_ident and (cfg.get("udp_v4") or cfg.get("udp_v6"))):
+                    rules.append(_stamp_rule(family, uid, mark))
+            elif up_cfg.get("mark") is not None:
+                # line carries no mark of its own: fall back to chaining via
+                # the upstream ip-rule line's mark
+                rules.append(_stamp_rule(family, uid, up_cfg.get("mark")))
+            continue
+        # direct managed proxy: accept-guard exempts its upstream egress from
+        # policy marking (covers tcp AND udp); if the line also has a mark the
+        # global skuid stamp applies (route chain runs BEFORE nat, stamping
+        # then accepting is consistent) UNLESS udp capture exists on this
+        # line's own mark (process runs under its own uid -> udp loop guard).
+        if mark is not None and not (cfg.get("udp_v4") or cfg.get("udp_v6")):
+            rules.append(_stamp_rule(family, uid, mark))
+        rules.append({"family": family, "table": "policy_route", "chain": "nat_OUTPUT",
+                      "comment": CHAIN_CMT, "expr": [
+                          skuid, not_local,
+                          {"counter": {"bytes": 0, "packets": 0}},
+                          {"accept": None}]})
     return rules
 
 

@@ -491,8 +491,9 @@ def test_mark_upstream_chain():
     m_rules = expr_of(1211)
     check("M has exactly one rule", len(m_rules) == 1)
     e = m_rules[0]
-    check("M stamps upstream line mark 903",
-          {"mangle": {"key": {"meta": {"key": "mark"}}, "value": 903}} in e)
+    check("M stamps its OWN line mark 41 (global skuid identity, never upstream's)",
+          {"mangle": {"key": {"meta": {"key": "mark"}}, "value": 41}} in e
+          and {"mangle": {"key": {"meta": {"key": "mark"}}, "value": 903}} not in e)
     check("M saves into ct mark (session affinity)",
           {"mangle": {"key": {"ct": {"key": "mark"}}, "value": {"meta": {"key": "mark"}}}} in e)
     check("M has NO redirect/verdict",
