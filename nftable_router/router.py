@@ -859,6 +859,20 @@ def install_proxy_chain_rules():
                           "proxy %s chained to port-upstream %s without own run-user (not started)" % (name, up))
             managed.pop(name)
             chain_disabled.add(name)
+    # LOOP check (the user's rule): walk each line's upstream/skuid chain -- a
+    # repeated LINE or UID along the walk = loop (traffic would ping-pong
+    # forever). Quarantine the involved lines only (not started; their chain
+    # verdict rules are still inert -- a redirect toward a dead listener);
+    # everything else keeps working.
+    loops = pmm.find_chain_loops(config["proxy"])
+    for name in sorted(loops):
+        print(tf.format("{msg:s,bg_red,black}",
+                        msg="[-] proxy %s chain loop: %s -- line quarantined (not started)"
+                            % (name, loops[name])))
+        syslog.syslog(syslog.LOG_CRIT, "proxy chain loop: %s: %s (quarantined, others unaffected)"
+                      % (name, loops[name]))
+        managed.pop(name, None)
+        chain_disabled.add(name)
     print("[*] managed proxies, start order (deepest dependency first):")
     for n, cfg in config["proxy"].items():
         if n not in managed:

@@ -123,17 +123,19 @@ def test_chain_validation():
     check("independent line kept", "D" in order)
 
     cfgs["A"]["upstream"] = "A"
-    check("self-loop rejected", _raises(pm.validate_chain, cfgs))
+    check("self-loop NO longer fatal (quarantine model)", not _raises(pm.validate_chain, cfgs))
+    check("self-loop detected by chain walk", "A" in pm.find_chain_loops(cfgs))
     cfgs["A"]["upstream"] = "B"
     cfgs["B"]["upstream"] = "A"
-    try:
-        pm.validate_chain(cfgs)
-        check("cycle A->B->A rejected", False)
-    except ValueError as e:
-        check("cycle A->B->A rejected", True)
-        msg = str(e)
-        check("cycle message shows full loop",
-              ("A -> B -> A" in msg) or ("B -> A -> B" in msg), msg)
+    loops = pm.find_chain_loops(cfgs)
+    check("cycle A->B->A detected, both members flagged", {"A", "B"} <= set(loops), str(loops))
+    msg = loops.get("A") or ""
+    check("cycle message shows full loop",
+          ("A -> B -> A" in msg) or ("B -> A -> B" in msg), msg)
+    _, lB = pm.skuid_chain(cfgs, "B")
+    check("B walk repeats too", lB and "B -> A -> B" in lB, str(lB))
+    check("validate_chain tolerates cycles (no global disable)",
+          not _raises(pm.validate_chain, cfgs))
 
     cfgs["B"]["upstream"] = "C"
     cfgs["C"]["upstream"] = "ghost"
@@ -321,8 +323,8 @@ def test_uid_optional_and_identity():
     check("mark-line stamp generated and targets the route chain",
           len(plan) == 1 and plan[0]["chain"] == ib.CHAIN_ROUTE
           and {"mangle": {"key": {"meta": {"key": "mark"}}, "value": 126}} in plan[0]["expr"], str(plan))
-    # DECOUPLED semantics (hkvmiss/shadowsocks-sshk -> hkfib/shadowsocks-hk):
-    # the managed PROCESS inherits the mark-upstream's user (hkfib's stamp
+    # DECOUPLED semantics (consumer uid-A -> mark-upstream uid-B):
+    # the managed PROCESS inherits the mark-upstream's user (upstream's stamp
     # steers it), while EACH line's own run-user still gets its OWN rule.
     cfgs = {"M": {"mark": 60, "uid": 1260}, "A": _cfg(upstream="M", uid=1200)}
     check("identity_line: mark-upstream user is inherited (hijacks even own uid) -> M",
@@ -408,12 +410,22 @@ def test_reconfigure_diff():
     check("new chained C spawned once", spawned.count("10509") == 1)
     check("others untouched by add", len(spawned) == spawned_n + 1, str(spawned[spawned_n:]))
 
-    # case 4: reconfigure with a CYCLE raises and leaves everything running
+    # case 4: reconfigure with a CYCLE no longer aborts the reload (quarantine
+    # model: the ROUTER excludes loop lines first; even fed a raw cycle the
+    # supervisor must not disturb live processes -- they simply defer)
+    spawned_n4 = len(spawned)
     bad = {k: dict(v) for k, v in new3.items()}
     bad["C"]["upstream"] = "A"; bad["A"]["upstream"] = "C"
-    check("cyclic reconfigure rejected", _raises(pm.ProxySupervisor.reconfigure, sup, bad))
-    check("live set intact after rejection", set(sup.proxies) == {"A", "B", "C"} and
+    try:
+        sup.reconfigure(bad)
+        check("cyclic reconfigure survives (no raise)", True)
+    except ValueError as e:
+        check("cyclic reconfigure survives (no raise)", False, str(e))
+    check("live set intact after cyclic reconfigure", set(sup.proxies) == {"A", "B", "C"} and
           sup.get("B").proc.poll() is None)
+    check("no spurious spawns on cyclic reconfigure", len(spawned) == spawned_n4, str(spawned[spawned_n4:]))
+    # restore the acyclic graph so dependency-gated restart_all works below
+    sup.reconfigure(new3)
 
     # case 5: restart_all -> every proxy stopped+started, gaveup state cleared
     sup.get("C").state = "gaveup"     # simulate rate-limited one
@@ -530,7 +542,8 @@ def test_mark_upstream_chain():
     # cycle through a mark line still detected
     cyc = {"X": {"daemon": "custom", "port": 1, "cmd": ["/bin/x"], "uid": 1, "upstream": "Y"},
            "Y": {"mark": 60, "ipv4": True, "upstream": "X"}}
-    check("cycle via mark line caught", _raises(pm.validate_chain, cyc))
+    check("cycle via mark line caught by chain walk",
+          {"X", "Y"} <= set(pm.find_chain_loops(cyc)), str(pm.find_chain_loops(cyc)))
 
 
 

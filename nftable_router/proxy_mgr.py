@@ -138,9 +138,9 @@ def identity_line(proxy_cfgs, name, uid_cache=None):
     decoupled from the per-uid nft rules (plan_proxy_chain_rules emits those
     for every line that has its own run-user, keyed on skuid, independent of
     this choice):
-      mark-type upstream WITH a run-user  -> inherit IT (hkvmiss/ss-redir runs
-          as hkfib's user and hkfib's own stamp steers the egress; 'managed
-          only by the upstream line's skuid')
+      mark-type upstream WITH a run-user  -> inherit IT (the consumer's daemon
+          runs as the upstream's user; the upstream's own stamp steers egress
+          -- 'managed only by the upstream line's skuid')
       otherwise                           -> the line keeps its own identity
     uid_cache (resolved name->int|None) guards against adopting an upstream
     whose account fails to resolve (would silently run the process as its own
@@ -349,18 +349,64 @@ def duplicate_users(proxy_cfgs):
     return names, msgs
 
 
+def skuid_chain(proxy_cfgs, name, uid_cache=None):
+    """Walk the upstream/skuid chain of one line -- the user's check: follow
+    upstream links collecting each hop's run-user; if any LINE or UID repeats
+    along the way, the chain is a loop (traffic would ping-pong between two
+    lines forever). -> (steps, loop) where steps=[(line, uid|None), ...] and
+    loop is 'A -> B -> A' or None."""
+    steps = []
+    seen_lines, seen_uids = set(), {}
+    cur = name
+    while cur is not None:
+        if cur in seen_lines:
+            return steps, " -> ".join(s[0] for s in steps) + " -> " + cur
+        cfg = proxy_cfgs.get(cur)
+        if cfg is None:
+            break  # unknown line: validate_chain reports it as a config error
+        uid = uid_cache.get(cur) if uid_cache else None
+        if uid is None:
+            try:
+                uid = get_uid(cfg, cur)
+            except ValueError:
+                uid = None
+        if uid is not None:
+            if uid in seen_uids:
+                return steps, " -> ".join(s[0] for s in steps) + \
+                       " -> %s(shadow of %s, uid %s)" % (cur, seen_uids[uid], uid)
+            seen_uids[uid] = cur
+        steps.append((cur, uid))
+        seen_lines.add(cur)
+        cur = upstream_of(cfg)
+    return steps, None
+
+
+def find_chain_loops(proxy_cfgs):
+    """{line: walk-path} for every line whose upstream/skuid chain repeats a
+    line or uid. Callers QUARANTINE just those lines (start them not at all
+    and skip their chain verdict rules); validate_chain deliberately no longer
+    raises for cycles so one bad 'upstream' cannot disable every managed
+    proxy (a leftover from the global fail-closed era)."""
+    out = {}
+    for name in proxy_cfgs:
+        _, loop = skuid_chain(proxy_cfgs, name)
+        if loop:
+            out[name] = loop
+    return out
+
+
 def validate_chain(proxy_cfgs):
-    """Returns ordered list [deepest dependency first]. Raises ValueError
-    describing the first problem found (unknown/unmanaged/self/cycle).
-    NOTE: run-user uniqueness is checked by duplicate_users() separately so a
-    collision can quarantine just the involved lines instead of disabling
-    every managed proxy at once."""
+    """Returns ordered list [deepest dependency first]. Raises ValueError for
+    structural config errors (unknown/unmanaged/un-chainable upstream).
+    Cycles/loops are NOT raised here -- see find_chain_loops, which lets the
+    router quarantine only the involved lines instead of disabling everything.
+    Also enforces GLOBAL skuid uniqueness: one run-user == one line."""
     for name, cfg in proxy_cfgs.items():
         up = upstream_of(cfg)
         if up is None:
             continue
         if up == name:
-            raise ValueError("%s: upstream points to itself" % name)
+            continue  # self-cycle: reported by find_chain_loops as 'A -> A'
         if up not in proxy_cfgs:
             raise ValueError("%s: unknown upstream %r" % (name, up))
         kind = upstream_kind(proxy_cfgs, up)
@@ -370,7 +416,8 @@ def validate_chain(proxy_cfgs):
         if kind == "port" and not is_managed(proxy_cfgs[up]):
             raise ValueError("%s: upstream %s has 'port' but no 'daemon' -- "
                              "cannot guarantee the listener is up" % (name, up))
-    # DFS with colors for cycle + topo
+    # DFS with colors for topo order; GRAY back-edges are loops -> skipped
+    # (never recursed), members handled by find_chain_loops, not fatal here.
     WHITE, GRAY, BLACK = 0, 1, 2
     color = {n: WHITE for n in proxy_cfgs}
     order, stack_path = [], []
@@ -379,12 +426,8 @@ def validate_chain(proxy_cfgs):
         color[node] = GRAY
         stack_path.append(node)
         up = upstream_of(proxy_cfgs[node])
-        if up is not None:
-            if color[up] == GRAY:
-                cyc = stack_path[stack_path.index(up):] + [up]
-                raise ValueError("proxy chain loop: %s" % " -> ".join(cyc))
-            if color[up] == WHITE:
-                visit(up)
+        if up is not None and up in color and color[up] == WHITE:
+            visit(up)
         color[node] = BLACK
         stack_path.pop()
         order.append(node)   # post-order: dependencies first
@@ -448,7 +491,7 @@ def plan_proxy_chain_rules(proxy_cfgs, uid_cache, family="ip"):
                                "op": "!=", "right": "@local"}}
         mark = cfg.get("mark") if isinstance(cfg.get("mark"), int) and cfg["mark"] > 0 else None
         if not is_managed(cfg):
-            # pure identity line (an ip-rule upstream like hkfib, or any
+            # pure identity line (an ip-rule upstream, or any
             # mark line the admin gave a run-user): everything it runs egresses
             # through its own fwmark
             if mark is not None:

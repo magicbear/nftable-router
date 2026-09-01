@@ -340,6 +340,11 @@ def validate_config(cfg):
         _dup_names, dup_msgs = pmm.duplicate_users(proxy)
         for m in dup_msgs:
             errors.append("proxy chain: %s" % m)
+        # loops are a hard SAVE error here (validate_chain no longer raises for
+        # them, so one bad 'upstream' cannot disable the whole router at boot);
+        # the runtime still quarantines a leftover loop by line.
+        for name, path in sorted(pmm.find_chain_loops(proxy).items()):
+            errors.append("proxy chain loop: %s (%s) -- 回源链成环,请修正 upstream" % (name, path))
     return errors
 
 
