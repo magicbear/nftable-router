@@ -373,9 +373,11 @@ def validate_chain(proxy_cfgs):
 # loop-guard / chain nft rules (pure dicts; committed by router.py via nfu)
 # ---------------------------------------------------------------------------
 
-# iface_bind's generic type-route OUTPUT chain (mark changes there actually
-# re-trigger the routing decision; test_iface_bind asserts the constants match)
-ROUTE_OUT_CHAIN = "mangle_EGRESS_RESTORE"
+# iface_bind's DEDICATED type-route OUTPUT chain (CHAIN_ROUTE) -- skuid->mark
+# stamps live here because only a route-type chain re-triggers the FIB lookup
+# after a mark change. NOT the connmark RESTORE chain (that is type filter and
+# must stay so). test asserts ROUTE_OUT_CHAIN == iface_bind.CHAIN_ROUTE.
+ROUTE_OUT_CHAIN = "mangle_EGRESS_ROUTE"
 
 
 def _stamp_rule(family, uid, mark):

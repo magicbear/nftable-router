@@ -225,9 +225,16 @@ def test_rules_safety_and_shape():
           set4["type"] == "nat" and set4["hook"] == "prerouting")
     check("setter prio after conntrack(-200) before policy queue(-90)",
           -200 < set4["prio"] < -90)
-    check("restore chain: type route, hook output (mark change reroutes)",
-          res4["type"] == "route" and res4["hook"] == "output")
-    check("restore prio is mangle class (-150)", res4["prio"] == -150)
+    check("restore chain: type FILTER, hook output (connmark restore, not steering)",
+          res4["type"] == "filter" and res4["hook"] == "output")
+    check("restore prio after conntrack(-200) before policy queue(-90)",
+          -200 < res4["prio"] < -90)
+    check("restore prio back at -120 (not the route chain's -150)", res4["prio"] == -120)
+    # the skuid->mark STAMP chain is a SEPARATE type-route chain
+    rspec = ib.route_chain_spec("ip")
+    check("route chain is its OWN chain (name != restore)", rspec["name"] == ib.CHAIN_ROUTE != ib.CHAIN_RESTORE)
+    check("route chain: type route, hook output", rspec["type"] == "route" and rspec["hook"] == "output")
+    check("route chain: mangle prio -150", rspec["prio"] == -150 == ib.ROUTE_PRIO)
     check("ip rules safe", ib.rules_are_safe(rules4))
     check("ip6 rules safe", ib.rules_are_safe(rules6))
 
@@ -388,26 +395,30 @@ def test_clear_egress_rules():
 
 
 def test_restore_json_detection():
-    print("[14] restore_in_ruleset: only TYPE ROUTE output chains count (reroute works)")
+    print("[14] restore_in_ruleset: ct->meta restore in an OUTPUT chain counts (filter OK)")
+    # connmark restore is legitimate in a plain FILTER output chain (it is NOT
+    # the egress-steering job -- that is the separate CHAIN_ROUTE). Respect a
+    # manually deployed Src-Policy so we do not double-add.
     rs = {"nftables": [
-        {"chain": {"family": "ip", "table": "mangle", "name": "ROUTE_OUT", "type": "route",
-                   "hook": {"hook": "output", "priority": -150, "policy": "accept"}}},
-        {"rule": {"family": "ip", "table": "mangle", "chain": "ROUTE_OUT", "expr": [
+        {"chain": {"family": "ip", "table": "mangle", "name": "OUTPUT", "type": "filter",
+                   "hook": {"hook": "output", "priority": -120, "policy": "accept"}}},
+        {"rule": {"family": "ip", "table": "mangle", "chain": "OUTPUT", "expr": [
             {"match": {"left": {"ct": {"key": "mark"}}, "op": "!=", "right": 0}},
             {"match": {"left": {"meta": {"key": "mark"}}, "op": "==", "right": 0}},
             {"mangle": {"key": {"meta": {"key": "mark"}}, "value": {"ct": {"key": "mark"}}}}]}},
     ]}
-    check("restore inside type-route output chain -> True (ip)", ib.restore_in_ruleset(rs, "ip"))
+    check("restore in FILTER output chain -> True (ip)", ib.restore_in_ruleset(rs, "ip"))
     check("other family -> False", not ib.restore_in_ruleset(rs, "ip6"))
     check("bare rule list also accepted", ib.restore_in_ruleset(rs["nftables"], "ip"))
-    rs_f = {"nftables": [
-        {"chain": {"family": "ip", "table": "mangle", "name": "OUTPUT", "type": "filter",
-                   "hook": {"hook": "output", "priority": -120, "policy": "accept"}}},
-        {"rule": {"family": "ip", "table": "mangle", "chain": "OUTPUT", "expr": [
+    # same expr but in a NON-output chain (prerouting) must NOT be treated as
+    # the OUTPUT restore, else we would wrongly skip installing ours
+    rs_p = {"nftables": [
+        {"chain": {"family": "ip", "table": "mangle", "name": "PREROUTING", "type": "filter",
+                   "hook": {"hook": "prerouting", "priority": -100, "policy": "accept"}}},
+        {"rule": {"family": "ip", "table": "mangle", "chain": "PREROUTING", "expr": [
             {"mangle": {"key": {"meta": {"key": "mark"}}, "value": {"ct": {"key": "mark"}}}}]}},
     ]}
-    check("same rule in FILTER chain does NOT count (no reroute, production bug)",
-          not ib.restore_in_ruleset(rs_f, "ip"))
+    check("restore in PREROUTING chain does NOT count", not ib.restore_in_ruleset(rs_p, "ip"))
     check("garbage -> False", not ib.restore_in_ruleset("no restore here", "ip"))
 
 

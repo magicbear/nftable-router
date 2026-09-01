@@ -59,14 +59,23 @@ EGRESS_MARKS_KEY = "egress_marks"
 #            generic, ONE rule per family -- skipped if the running ruleset
 #            already contains an equivalent (manually maintained ones survive
 #            clearRules because of a different comment tag).
+#            This is CONNMARK restore for already-tracked flows -- its natural
+#            home is a FILTER output chain (it must NOT be a route chain).
+#   ROUTE    output (type ROUTE, prio -150 mangle class): holds ONLY the
+#            skuid->meta-mark identity STAMP rules built by proxy_mgr. A mark
+#            set here actually re-triggers the FIB lookup (a filter OUTPUT
+#            chain runs AFTER the routing decision, so marks set there never
+#            steer egress -- the production bug this split fixes). It is a
+#            SEPARATE chain from RESTORE because a single chain cannot be both
+#            filter and route.
 CHAIN_SET = "nat_EGRESS_SET"
 CHAIN_RESTORE = "mangle_EGRESS_RESTORE"
+CHAIN_ROUTE = "mangle_EGRESS_ROUTE"
 SET_PRIO = -95
-# type route chain MUST run before the (re)routing decision -- mangle class.
-# A type FILTER OUTPUT chain cannot influence local routing: the kernel picks
-# the route BEFORE netfilter output runs; only "type route" re-triggers the
-# fib lookup after a meta mark change (nftables' answer to iptables MARK).
-RESTORE_PRIO = -150
+RESTORE_PRIO = -120
+# the type-route output chain MUST run at mangle class, before the routing
+# decision, for skuid marks to steer local egress.
+ROUTE_PRIO = -150
 DANGEROUS_VERDICTS = {"accept", "drop", "queue", "redirect", "tproxy", "reject"}
 RESTORE_SIGNATURE = "meta mark set ct mark"
 
@@ -359,7 +368,7 @@ def plan_rules(cfg, family="ip", restore_exists=None):
         ]})
     if not restore_exists:
         chains.append({"family": family, "table": "policy_route", "name": CHAIN_RESTORE,
-                       "type": "route", "hook": "output", "prio": RESTORE_PRIO, "policy": "accept"})
+                       "type": "filter", "hook": "output", "prio": RESTORE_PRIO, "policy": "accept"})
         rules.append({"family": family, "table": "policy_route", "chain": CHAIN_RESTORE, "expr": [
             _match({"ct": {"key": "mark"}}, "!=", 0),
             _match({"meta": {"key": "mark"}}, "==", 0),
@@ -391,14 +400,12 @@ def clear_egress_rules(nfu, family, comment):
 
 
 def restore_in_ruleset(ruleset, family="ip"):
-    """Detect an equivalent generic ct->meta restore that ACTUALLY works:
-    the rule must live in a TYPE ROUTE output chain. A type filter chain
-    sets the skb mark only AFTER the routing decision -> ip rule fwmark
-    never sees it (production incident: proxy upstream traffic marked in
-    ct, but every flow egressed via the main default route).
-    Accepts either the nft JSON ruleset dict / list or raw text (substring
-    fallback -- type cannot be verified there, e.g. the manual 'Src-Route
-    Policy' deployments)."""
+    """Detect a generic `ct mark -> meta mark` OUTPUT restore already deployed
+    (e.g. the manual 'Src-Route Policy'), so we do not add a duplicate. The
+    RESTORE lives in an OUTPUT chain of ANY type (it is connmark restore for
+    tracked flows -- egress steering is NOT its job; see CHAIN_ROUTE for that),
+    so match on the expression regardless of filter/route. Accepts the nft JSON
+    ruleset dict/list or raw text (substring fallback)."""
     if isinstance(ruleset, str):
         try:
             ruleset = json.loads(ruleset)
@@ -410,28 +417,43 @@ def restore_in_ruleset(ruleset, family="ip"):
         items = list(ruleset)
     else:
         items = []
-    route_chains = set()
+    output_chains = set()
+    has_chain_objs = False
     for item in items:
         ch = item.get("chain") if isinstance(item, dict) else None
-        if not isinstance(ch, dict) or ch.get("type") != "route":
+        if not isinstance(ch, dict):
             continue
+        has_chain_objs = True
         hook = ch.get("hook")
         hook = hook.get("hook") if isinstance(hook, dict) else hook
         if hook not in (None, "output") or ch.get("family") not in (family, "inet"):
             continue
-        route_chains.add((ch.get("family"), ch.get("table"), ch.get("name")))
+        output_chains.add((ch.get("family"), ch.get("table"), ch.get("name")))
     for item in items:
         rule = item.get("rule") if isinstance(item, dict) else None
         # an inet-family table covers both ip and ip6 hooks
         if not rule or rule.get("family") not in (family, "inet"):
             continue
-        if (rule.get("family"), rule.get("table"), rule.get("chain")) not in route_chains:
-            continue
-        for e in rule.get("expr", []):
-            m = e.get("mangle", {}) if isinstance(e, dict) else {}
-            if m.get("key") == {"meta": {"key": "mark"}} and m.get("value") == {"ct": {"key": "mark"}}:
-                return True
+        fam, tab, cname = rule.get("family"), rule.get("table"), rule.get("chain")
+        known = (fam, tab, cname) in output_chains
+        # strict when chain objects were provided (a prerouting-only chain then
+        # must NOT count); lenient only for ruleset exports with no chain meta
+        if known or not has_chain_objs:
+            for e in rule.get("expr", []):
+                m = e.get("mangle", {}) if isinstance(e, dict) else {}
+                if m.get("key") == {"meta": {"key": "mark"}} and m.get("value") == {"ct": {"key": "mark"}}:
+                    return True
     return False
+
+
+def route_chain_spec(family):
+    """The type-route OUTPUT chain that hosts skuid->mark identity stamps.
+    Created ONLY when such stamps exist (proxy_mgr.plan_proxy_chain_rules);
+    a mark set in a plain FILTER output chain never re-triggers the FIB lookup,
+    which is exactly the 'marked but egressed via default route' bug this
+    dedicated chain fixes."""
+    return {"family": family, "table": "policy_route", "name": CHAIN_ROUTE,
+            "type": "route", "hook": "output", "prio": ROUTE_PRIO, "policy": "accept"}
 
 
 def rules_are_safe(rules):

@@ -679,10 +679,11 @@ def apply_egress_rules(nfu, ip_family):
         syslog.syslog(syslog.LOG_WARNING, "egress ruleset inspect failed: %s" % e)
         restore_exists = False
     if not restore_exists:
-        # recreate our named restore chain: deployments made before the
-        # rerouting fix have it as 'type filter @ -120' which CANNOT be
-        # altered into 'type route @ -150' (mark changes there are applied
-        # AFTER the route lookup -- no fwmark policy effect). Delete+re-add.
+        # force-recreate our named RESTORE chain with the CURRENT spec: a
+        # transient buggy build registered it as 'type route @ -150'; RESTORE
+        # is connmark restore and MUST be a plain 'type filter @ -120' chain
+        # (steering egress is the SEPARATE CHAIN_ROUTE's job). Delete-then-add
+        # (deleting a non-existent chain is a harmless no-op).
         nfu.nft.json_cmd({"nftables": [{"delete": {"chain": {
             "family": ip_family, "table": "policy_route", "name": ib.CHAIN_RESTORE}}}]})
     chains, rules = ib.plan_rules(config, ip_family, restore_exists=restore_exists)
@@ -880,19 +881,18 @@ def install_proxy_chain_rules():
     n_ok = 0
     for ip_family in ("ip", "ip6"):
         planned = pmm.plan_proxy_chain_rules(config["proxy"], uid_cache, ip_family)
-        stamps = [r for r in planned if r["chain"] == ib.CHAIN_RESTORE]
-        verdicts = [r for r in planned if r["chain"] != ib.CHAIN_RESTORE]
+        stamps = [r for r in planned if r["chain"] == ib.CHAIN_ROUTE]
+        verdicts = [r for r in planned if r["chain"] != ib.CHAIN_ROUTE]
         if stamps:
-            # guarantee the type-route chain with the CURRENT spec: iface
-            # bindings may be absent entirely, or the chain may predate the
-            # rerouting fix (filter @ -120) and nobody recreates it then.
-            spec = {"family": ip_family, "table": "policy_route", "name": ib.CHAIN_RESTORE,
-                    "type": "route", "hook": "output",
-                    "prio": ib.RESTORE_PRIO, "policy": "accept"}
+            # guarantee the DEDICATED type-route chain (skuid marks only live
+            # here so they actually re-trigger the FIB lookup). It is separate
+            # from the connmark RESTORE filter chain. Spec-match check avoids
+            # churning; a stale/foreign chain of the same name is rebuilt.
+            spec = ib.route_chain_spec(ip_family)
             try:
                 rq, ro, _ = nfu.nft.json_cmd({"nftables": [
                     {"list": {"chain": {"family": ip_family, "table": "policy_route",
-                                        "name": ib.CHAIN_RESTORE}}}]})
+                                        "name": ib.CHAIN_ROUTE}}}]})
             except Exception:
                 rq, ro = 1, None
             cur = None
@@ -907,14 +907,14 @@ def install_proxy_chain_rules():
                 hk = cur.get("hook") if isinstance(cur.get("hook"), dict) else {}
                 prio_val = cur.get("prio", hk.get("priority"))
                 if cur.get("type") not in (None, "route") or (
-                        prio_val is not None and prio_val != ib.RESTORE_PRIO):
+                        prio_val is not None and prio_val != ib.ROUTE_PRIO):
                     nfu.nft.json_cmd({"nftables": [{"delete": {"chain": {
                         "family": ip_family, "table": "policy_route",
-                        "name": ib.CHAIN_RESTORE}}}]})
+                        "name": ib.CHAIN_ROUTE}}}]})
                     nfu.add_chain(spec)
                     syslog.syslog(syslog.LOG_NOTICE,
-                                  "route chain %s/%s recreated (type/prio upgrade)"
-                                  % (ip_family, ib.CHAIN_RESTORE))
+                                  "route chain %s/%s recreated (type/prio mismatch)"
+                                  % (ip_family, ib.CHAIN_ROUTE))
         # INSERT at the head of nat_OUTPUT: the policy queue rule verdicts
         # (queue) before appended rules would ever run, so appended skuid
         # rules are dead code exactly when the policy engine marks a proxy's

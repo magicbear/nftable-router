@@ -316,10 +316,14 @@ def test_uid_optional_and_identity():
     check("numeric uid passes through", pm.get_uid(_cfg(uid=1207), "A") == 1207)
     check("string int uid parsed", pm.get_uid(_cfg(uid="1208"), "A") == 1208)
 
-    # stamp rules target iface_bind's generic type-route output chain
-    check("ROUTE_OUT_CHAIN == iface_bind.CHAIN_RESTORE", pm.ROUTE_OUT_CHAIN == ib.CHAIN_RESTORE)
-    check("iface_bind restore chain is TYPE ROUTE",
-          any(c["name"] == ib.CHAIN_RESTORE and c["type"] == "route"
+    # stamp rules target iface_bind's DEDICATED type-route output chain, which
+    # is SEPARATE from the (filter) connmark restore chain
+    check("ROUTE_OUT_CHAIN == iface_bind.CHAIN_ROUTE", pm.ROUTE_OUT_CHAIN == ib.CHAIN_ROUTE)
+    check("route chain name differs from restore", ib.CHAIN_ROUTE != ib.CHAIN_RESTORE)
+    rs = ib.route_chain_spec("ip")
+    check("skuid stamp chain is TYPE ROUTE", rs["type"] == "route" and rs["name"] == pm.ROUTE_OUT_CHAIN)
+    check("iface_bind RESTORE chain is TYPE FILTER (connmark, not steering)",
+          any(c["name"] == ib.CHAIN_RESTORE and c["type"] == "filter"
               for c in ib.plan_rules({"egress_marks": [{"iface": "ppp0", "mark": 51, "dynamic": True}]},
                                      "ip", restore_exists=False)[0]))
     # a mark-type upstream WITH its own run-user -> our process adopts ITS skuid
