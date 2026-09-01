@@ -166,10 +166,20 @@ function applySel(){
  var ids=[];document.querySelectorAll("#colsbox input:checked").forEach(function(cb){ids.push(cb.dataset.id)});
  localStorage.setItem("nft_cols",JSON.stringify(ids));
  buildHead();buildColsBox();rerender()}
+function visNow(r){
+ var q=($("f-text").value||"").toLowerCase();
+ return rowMatch(r,q)&&(! $("f-new").checked || r.sess==0)}
+function trim(){
+ // cap 1000 with filter-aware eviction: non-visible (old, filtered-out) rows
+ // go first; visible (matching) rows are kept unless the WHOLE buffer matches
+ var i=0;
+ while(rows.length>MAXROWS&&i<rows.length){if(!visNow(rows[i]))rows.splice(i,1);else i++}
+ var dropped=0;
+ while(rows.length>MAXROWS){rows.shift();dropped++}   // all-visible: oldest yields
+ var b=$("flowbody");
+ for(var k=0;k<dropped&&b.firstChild;k++)b.removeChild(b.firstChild)}
 function push(r){
- rows.push(r);evtTotal++;
- if(rows.length>MAXROWS){var n=rows.length-MAXROWS;rows.splice(0,n);
-  var b=$("flowbody");for(var i=0;i<n&&b.firstChild;i++)b.removeChild(b.firstChild)}
+ rows.push(r);evtTotal++;trim();
  if(paused)return;
  var q=($("f-text").value||"").toLowerCase();
  if(!rowMatch(r,q))return;
