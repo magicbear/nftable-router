@@ -35,6 +35,7 @@ from nftable_router.dns import *
 from nftable_router.fullcone_nat import *
 from nftable_router import netinfo
 from nftable_router import iface_bind as ib
+from nftable_router import proxy_mgr as pmm
 from pytput import TputFormatter
 import subprocess, urllib, psutil
 from queue import Queue, Empty
@@ -96,6 +97,8 @@ g_proxy_index = []
 g_dead_proxy_ipv4 = {}
 g_dead_proxy_ipv6 = {}
 g_runner = []
+g_proxy_sup = None            # ProxySupervisor instance (master only)
+g_proxy_pending = Value('b', False)   # reload -> rebuild chain rules in main loop
 is_master = True
 worker_id = 0  # Modified by Process
 process_term = False  # Modified by Process
@@ -577,6 +580,87 @@ def apply_egress_rules(nfu, ip_family):
             syslog.syslog(syslog.LOG_CRIT, "add egress rule failed %s: %s" % (ip_family, rc))
     print("[+] egress marks (%s): %d/%d rules, restore %s" % (
         ip_family, n_ok, len(rules), "already deployed" if restore_exists else "auto-added"))
+
+
+def install_proxy_chain_rules():
+    """(Re)build proxy-chain nft rules and the process supervisor from the
+    current config. Master process only; safe to call on boot and reload.
+    On chain config errors: logs CRIT and DISABLES management (existing
+    manual proxy processes and traffic keep working untouched)."""
+    global g_proxy_sup
+    managed = {k: v for k, v in config["proxy"].items() if pmm.is_managed(v)}
+    try:
+        nfu.delete_rules(comment=pmm.CHAIN_CMT, family=None)
+    except Exception as e:
+        syslog.syslog(syslog.LOG_WARNING, "clear proxy-chain rules failed: %s" % e)
+    if not managed:
+        if g_proxy_sup:
+            g_proxy_sup.stop_all()
+            g_proxy_sup = None
+        return
+    try:
+        order = pmm.validate_chain(config["proxy"])
+    except ValueError as e:
+        print(tf.format("{msg:s,bg_red,black}", msg="[-] proxy chain config error, management DISABLED: %s" % e))
+        syslog.syslog(syslog.LOG_CRIT, "proxy chain config error, management disabled: %s" % e)
+        return
+    uid_cache = {}
+    for name in list(managed):
+        try:
+            uid_cache[name] = pmm.get_uid(managed[name], name)
+        except ValueError as e:
+            if pmm.upstream_of(managed[name]) or any(
+                    pmm.upstream_of(c) == name for n, c in managed.items()):
+                # uid is mandatory for chained proxies (skuid rules)
+                print(tf.format("{msg:s,bg_red,black}", msg="[-] %s" % e))
+                syslog.syslog(syslog.LOG_CRIT, "proxy chain disabled for %s: %s" % (name, e))
+                managed.pop(name)
+            else:
+                uid_cache[name] = None
+    print("[*] managed proxies, start order (deepest dependency first):")
+    for n, cfg in config["proxy"].items():
+        if n not in managed:
+            continue
+        up = pmm.upstream_of(cfg)
+        try:
+            argv = pmm.build_cmd(n, cfg)
+        except ValueError as e:
+            print("      [%s] BUILD ERROR: %s" % (n, e))
+            continue
+        where = ("via -> %s" % up) if up else ("direct: %s:%s" % (cfg.get("server") or cfg.get("proxy_ip"),
+                                                                  cfg.get("server_port", "-")))
+        print("      [%-12s] %-8s :%-6s %s  uid=%s  cmd=%s" % (
+            n, cfg.get("daemon"), cfg.get("port"), where,
+            uid_cache.get(n), " ".join(pmm.redact(argv))))
+        if cfg.get("password"):
+            print("      [!] %s: inline password visible in /proc cmdline; prefer 'password_file'" % n)
+    n_ok = 0
+    for ip_family in ("ip", "ip6"):
+        for r in pmm.plan_proxy_chain_rules(config["proxy"], uid_cache, ip_family):
+            rc = nfu.add_rule(dict(r))
+            if rc[0] != 0:
+                print(tf.format("{msg:s,bg_red,black}", msg="[-] add proxy-chain rule failed (%s): %s" % (ip_family, rc)))
+                syslog.syslog(syslog.LOG_CRIT, "add proxy-chain rule failed %s: %s" % (ip_family, rc))
+            else:
+                n_ok += 1
+    print("[+] proxy-chain skuid rules: %d installed" % n_ok)
+    if g_proxy_sup:
+        print("[*] restarting proxy supervisor (config changed)")
+        g_proxy_sup.stop_all()
+
+    def on_status(name, state, pid):
+        msg = "proxy %s: %s%s" % (name, state, (" pid=%s" % pid) if pid else "")
+        print("    " + msg)
+        syslog.syslog(syslog.LOG_NOTICE, msg)
+
+    try:
+        g_proxy_sup = pmm.ProxySupervisor(config["proxy"], on_status=on_status,
+                                          log=lambda m: syslog.syslog(syslog.LOG_NOTICE, "proxyd: %s" % m))
+        g_proxy_sup.start()
+    except ValueError as e:
+        g_proxy_sup = None
+        print(tf.format("{msg:s,bg_red,black}", msg="[-] proxy supervisor config error: %s" % e))
+        syslog.syslog(syslog.LOG_CRIT, "proxy supervisor config error: %s" % e)
 
 
 def get_term_width():
@@ -1216,6 +1300,9 @@ def reload_queue(signum, sigframe):
     # nfqueue.unbind()
     load_config()
     test_thread.last_check = 0
+    # rebuild proxy chain rules + supervisor from the MAIN loop (spawns fork
+    # must not happen inside signal handler context)
+    g_proxy_pending.value = True
 
     # re-apply egress mark rules on reload (non-interactive; new unbound
     # public egress IPs/interfaces are logged, wizard runs only at boot)
@@ -1673,6 +1760,8 @@ if __name__ == "__main__":
         # egress return-path marking (prerouting setter + generic ct->meta restore)
         apply_egress_rules(nfu, ip_family)
 
+    # managed proxy processes + skuid anti-loop/chain rules (after all families installed)
+    install_proxy_chain_rules()
     nfqueue = netfilterqueue.NetfilterQueue()
     nfqueue.bind(4, ip_mark, mode=netfilterqueue.COPY_PACKET)
 
@@ -1752,6 +1841,10 @@ if __name__ == "__main__":
                         print("[+] Process %02d process: %d" % (n, g_worker_process_connections[n].value))
                 else:
                     queue_stdin = queue_stdin[1:]
+
+            if g_proxy_pending.value:
+                g_proxy_pending.value = False
+                install_proxy_chain_rules()
 
             if time.time() - t_dns_clean > 15:
                 t_dns_clean = time.time()
@@ -1840,6 +1933,8 @@ if __name__ == "__main__":
                     # g_io_lock.release()
         except KeyboardInterrupt:
             term.value = True
+            if g_proxy_sup:
+                g_proxy_sup.stop_all()   # before rules are cleared & master SIGKILLs itself
             clearRules()
             for run_p in g_runner:
                 run_p.release_process()
