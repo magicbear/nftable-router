@@ -1,2 +1,9 @@
 __pycache__
 nftable_router/markexec.so
+
+*.bak
+*.bak-*
+.AppleDouble/
+._*
+.idea/
+.DS_Store
