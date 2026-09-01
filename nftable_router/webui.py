@@ -3,13 +3,13 @@
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260901-2320"
+UI_VERSION = "20260902-0010"
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nft-route 管理台</title>
-<script>var UI_VER="20260901-2320";</script>
+<script>var UI_VER="20260902-0010";</script>
 <style>
 :root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
 --green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
@@ -426,7 +426,7 @@ function proxyReferrers(name){
  return refs}
 function renderProxy(){
  var box=$("ptable");box.innerHTML="";if(!CFG)return;
- var t=el("table");t.innerHTML="<thead><tr><th>线路</th><th>mark</th><th>端口/ip-rule</th><th>托管</th><th>上游链</th><th>能力</th><th>bind</th><th>测试</th><th>引用</th><th></th></tr></thead>";
+ var t=el("table");t.innerHTML="<thead><tr><th>线路</th><th>mark</th><th>端口/ip-rule</th><th>托管</th><th>上游链</th><th>能力</th><th>测试</th><th>引用</th><th></th></tr></thead>";
  var tb=document.createElement("tbody");
  Object.keys(CFG.proxy||{}).forEach(function(name){
   var c=CFG.proxy[name]||{};var tr=el("tr");
@@ -437,7 +437,7 @@ function renderProxy(){
   tr.appendChild(el("td","dim",c.upstream?("→ "+c.upstream):""));
   var caps=[];["ipv4","ipv6","udp_v4","udp_v6","fullcone"].forEach(function(k){if(c[k])caps.push(k.replace("_"," "))});
   tr.appendChild(el("td","dim",caps.join(" ")));
-  tr.appendChild(el("td","dim",c.bind||""));
+
   tr.appendChild(el("td","dim",c.test_url?"ok":"-"));
   var refs=proxyReferrers(name);
   tr.appendChild(el("td","dim",refs.length+"" ));
@@ -495,7 +495,7 @@ function editProxy(name){
  var cur={name:name||"",mark:c.mark,weight:c.weight,port:c.port,upstream:c.upstream,daemon:c.daemon,
   uid:c.uid,server:c.server||c.proxy_ip,server_port:c.server_port,cipher:c.cipher,password:c.password,
   password_file:c.password_file,plugin:c.plugin,plugin_opts:c.plugin_opts,bind_addr:c.bind_addr,
-  mode:c.mode,bind:c.bind,test_url:c.test_url,
+  mode:c.mode,test_url:c.test_url,
   test_dns:(c.test_dns instanceof Array)?c.test_dns.join(", "):(c.test_dns||""),
   restart_max:(c.restart||{}).max,restart_window:(c.restart||{}).window};
   var lines=Object.keys(CFG.proxy||{}).filter(function(x){return x!=name});
@@ -600,8 +600,7 @@ function editProxy(name){
    mbools(g,["ipv4","ipv6","udp_v4","udp_v6","fullcone"],c,CAP_LABELS);
    mfields(mgrid(g),[
     ["test_url","探测 URL (test_url)","text",null,"http://connectivitycheck.../generate_204"],
-    ["test_dns","探测 DNS (逗号分隔)","text",null,"116.228.111.118, 223.5.5.5"],
-    ["bind","探测源 ip:port(bind)","text",null,"192.168.200.2:10051"]],cur);
+    ["test_dns","探测 DNS (逗号分隔)","text",null,"116.228.111.118, 223.5.5.5"]],cur);
    g=mgrid(mgroup(body,"重启抑制"));
    mfields(g,[["restart_max","重启上限","num"],["restart_window","重启窗口(秒)","num"]],cur);
    var ig=mgroup(body,"连接参数（实例制：每实例=一个进程，参数自包含；线路级不再保留协议字段）");
@@ -625,7 +624,8 @@ function editProxy(name){
   var dn=g("daemon");
   if(dn&&!g("uid"))return toast("托管进程必须填写『运行用户』(uid)——进程降权与防环都依赖它","bad");
   if(dn)out.daemon=dn;else delete out.daemon;
-  ["uid","bind","test_url"].forEach(function(f){var v=g(f);if(v)out[f]=v;else delete out[f]});
+  ["uid","test_url"].forEach(function(f){var v=g(f);if(v)out[f]=v;else delete out[f]});
+  delete out.bind;   // legacy alive-check bind ip:port -- dead since SO_MARK probes
   if(g("test_dns"))out.test_dns=g("test_dns").split(/[,，\s]+/).filter(function(x){return x.length});
   else if("test_dns" in out&&!g("test_dns"))delete out.test_dns;
   ["ipv4","ipv6","udp_v4","udp_v6","fullcone"].forEach(function(f){
@@ -968,11 +968,14 @@ function loadInfo(){api("/api/health").then(function(d){
  var names={};Object.keys(t.v4||{}).forEach(function(k){names[k]=1});Object.keys(t.v6||{}).forEach(function(k){names[k]=1});
  var rows=[];Object.keys(names).sort().forEach(function(k){
   var v4=(t.v4||{})[k],v6=(t.v6||{})[k];
+  function tb(pr){var bt=el("button","dim",pr);bt.style.padding="0 8px";
+   bt.onclick=function(){testLine(k,pr.toLowerCase(),bt)};return bt}
   function fmt(ms){return ms==null||isNaN(ms)?"⚫":(ms<0?"失败":(ms<10?Math.round(ms*1000)+"ms":ms.toFixed(1)+"s"))}
   rows.push([k,v4?el("span","",lvl(v4.ms)+" "+fmt(v4.ms)):"⚫",
    v6?el("span","",lvl(v6.ms)+" "+fmt(v6.ms)):"⚫",
-   (v4&&v4.ip)||"",v6&&v6.ip&&v6.ip!==v4.ip?v6.ip:"",ago(t.round_at)])});
- if(rows.length)putRows(lt,["线路","IPv4","IPv6","探测IP(v4)","探测IP(v6)","时间"],rows);
+   (v4&&v4.ip)||"",v6&&v6.ip&&v6.ip!==v4.ip?v6.ip:"",ago(t.round_at),
+   (function(){var c=el("td");c.appendChild(tb("TCP"));c.appendChild(document.createTextNode(" "));c.appendChild(tb("UDP"));return c})()])});
+ if(rows.length)putRows(lt,["线路","IPv4","IPv6","探测IP(v4)","探测IP(v6)","时间","测试"],rows);
  else lt.appendChild(el("div","dim","无测试数据(线路缺少test_url或router未跑过测试轮)"));
  // managed proxies
  var mp=(d.proxies&&d.proxies.managed)||[];
@@ -1002,6 +1005,17 @@ function loadInfo(){api("/api/health").then(function(d){
  else $("i-ext").innerHTML="";
  if(d.error){var er=el("div","bad","health: "+d.error);$("i-master").appendChild(er)}
  }).catch(function(e){$("i-round").textContent="health 加载失败: "+e})}
+function testLine(name,proto,btn){
+ var old=btn?btn.textContent:"";
+ if(btn){btn.disabled=true;btn.textContent="⋯"}
+ var done=function(fn){return function(x){if(btn){btn.disabled=false;btn.textContent=old}return fn(x)}};
+ api("/api/test_line",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({line:name,proto:proto,family:4})})
+ .then(done(function(r){
+   var det=(r.steps||[]).map(function(s){return s.name+" "+(s.ok?("✓ "+s.ms+"ms"):"✗")}).join(" · ");
+   if(r.error)toast(name+" "+proto+" ✗ "+r.error,"bad");
+   else toast((r.ok?"✓ ":"✗ ")+name+" "+proto.toUpperCase()+": "+det+(r.note?("　"+r.note):""),r.ok?"good":"bad");
+   loadInfo()})).catch(done(function(e){toast(name+" 请求失败 "+e,"bad")})); }
 $("i-refresh").onclick=loadInfo;
 $("i-reload").onclick=function(){
  if(!confirm("向主进程发送 SIGUSR1 执行完整重载？\\n(重读配置:egress/链/规则/worker全部重启)"))return;

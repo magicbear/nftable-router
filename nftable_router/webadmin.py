@@ -39,7 +39,7 @@ import time
 from collections import deque
 from queue import Queue, Empty
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 module_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(module_dir))
@@ -884,6 +884,104 @@ def rt_edit(body):
     return {"ok": rc == 0, "rc": rc, "cmd": " ".join(["ip"] + args), "out": out.strip()[:400]}
 
 
+
+
+# ---------------------------------------------------------------------------
+# single-line manual test (TCP/UDP), same SO_MARK routing as TestThread probes
+# ---------------------------------------------------------------------------
+def test_line(cfg_path, name, proto="tcp", family=4, target=None):
+    cfg = ib.load_config(cfg_path)
+    p = (cfg.get("proxy") or {}).get(name)
+    if p is None:
+        return {"ok": False, "error": "未知线路 %s" % name}
+    if proto not in ("tcp", "udp"):
+        proto = "tcp"
+    family = int(family)
+    out = {"line": name, "proto": proto, "family": family,
+           "mark": p.get("mark"), "steps": []}
+    env, err = pmm.probe_env(p.get("mark")) if pmm else (dict(os.environ), "proxy_mgr unavailable")
+    if err:
+        out["mark_err"] = err
+    try:
+        netloc = urlparse(p.get("test_url", "")).netloc if p.get("test_url") else ""
+    except ValueError:
+        netloc = ""
+    qname = target or netloc or "example.com"
+    dns_servers = []
+    if p.get("test_dns"):
+        dns_servers = [p["test_dns"]] if isinstance(p["test_dns"], str) else list(p["test_dns"])
+    rtype = "AAAA" if family == 6 else "A"
+    ips = []
+    if not dns_servers:
+        dns_servers = [None]   # system resolver; honest label so the note is visible
+    for srv in dns_servers[:3]:
+        args = ["dig", "-%d" % family, "+time=2", "+tries=1", "+short"]
+        if proto == "tcp":
+            args.append("+tcp")
+        if srv:
+            args.append("@%s" % srv)
+        args += [qname, rtype]
+        t0 = time.time()
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=8, env=env)
+            got = [x for x in r.stdout.split()
+                   if _isver(x, family)]
+        except (subprocess.TimeoutExpired, OSError):
+            got = []
+        ms = round((time.time() - t0) * 1000, 1)
+        out["steps"].append({"name": "dig %s %s%s" % (rtype, ("@" + srv) if srv else "(系统DNS,不验证线路解析)", proto.upper()),
+                             "ok": bool(got), "ms": ms, "out": " ".join(got)[:80]})
+        if got:
+            ips = got
+            break
+    final_ok = bool(ips)
+    final_ms = out["steps"][-1]["ms"] if out["steps"] else None
+    if proto == "tcp" and p.get("test_url") and ips:
+        parse_path = urlparse(p["test_url"])
+        hport = 443 if parse_path.scheme == "https" else 80
+        probe_ip = ips[0]
+        curl = ["curl", "-%d" % family, "-s", "-k", "-m", "3", "-o", "/dev/null"]
+        if p.get("port"):
+            curl += ["--resolve", "%s:%d:%s" % (netloc, hport, probe_ip), p["test_url"]]
+        else:
+            xp = probe_ip if family == 4 else "[%s]" % probe_ip
+            curl += ["-x", "%s:%d" % (xp, hport), p["test_url"]]
+        curl += ["-w", "%{time_total} %{http_code}"]
+        t0 = time.time()
+        try:
+            r = subprocess.run(curl, capture_output=True, text=True, timeout=8, env=env)
+            parts = (r.stdout or "").split()
+            code_, t_ = (parts[-1], parts[-2]) if len(parts) >= 2 else ("000", "0")
+        except (subprocess.TimeoutExpired, OSError):
+            code_, t_ = "000", "0"
+        cok = code_ in ("200", "204", "301", "302")
+        final_ok = cok
+        try:
+            final_ms = round(float(t_) * 1000, 1)
+        except ValueError:
+            final_ms = round((time.time() - t0) * 1000, 1)
+        out["steps"].append({"name": "curl -%d %s %s" % (family, ("--resolve" if p.get("port") else "-x"), code_),
+                             "ok": cok, "ms": final_ms})
+    out["ok"] = final_ok
+    # mirror into redis so the status table reflects the manual test too
+    try:
+        rr = redis.Redis(host="127.0.0.1", port=6379, db=1, socket_timeout=2, socket_connect_timeout=2)
+        if final_ok:
+            rr.hset("test_v%d" % family, name, "%.3f %s" % ((final_ms or 0) / 1000.0, ips[0] if ips else ""))
+        else:
+            rr.hset("test_v%d" % family, name, "-1 manual %s" % proto)
+        rr.set("test_at", "%.3f" % time.time())
+    except Exception:
+        pass
+    return out
+
+
+def _isver(ip, family):
+    try:
+        return ipaddress.ip_address(ip).version == family
+    except ValueError:
+        return False
+
 # ---------------------------------------------------------------------------
 # HTTP + WS handler
 # ---------------------------------------------------------------------------
@@ -1217,6 +1315,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 cfg = ib.load_config(self.cfg_path())
                 self.send_json(200, mtr_start(body, cfg))
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+        elif path == "/api/test_line":
+            try:
+                self.send_json(200, test_line(self.cfg_path(),
+                                              str(body.get("line") or ""),
+                                              str(body.get("proto") or "tcp"),
+                                              int(body.get("family") or 4),
+                                              (body.get("target") or None) and str(body.get("target")) or None))
             except Exception as e:
                 self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
         elif path == "/api/test_now":

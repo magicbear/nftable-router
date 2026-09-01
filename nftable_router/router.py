@@ -36,6 +36,7 @@ from nftable_router.fullcone_nat import *
 from nftable_router import netinfo
 from nftable_router import iface_bind as ib
 from nftable_router import proxy_mgr as pmm
+from nftable_router import udp_tproxy as utp
 from nftable_router.webadmin_svc import WebadminService
 from pytput import TputFormatter
 import subprocess, urllib, psutil
@@ -187,11 +188,23 @@ class TestThread(threading.Thread):
                         dig_result.remove(dig_result[di])
             if len(dig_result) > 0:
                 probe_ip = dig_result[i % len(dig_result)].strip()
-                curl_args = ["curl", "-%d" % ip_version, "-s", "-k", "-m", "1",
-                             "-o", "/dev/null",
-                             "-x", "%s:%d" % (probe_ip if ip_version == 4 else "[%s]" % probe_ip,
-                                              80 if parse_path.scheme == 'http' else 443),
-                             proxy['test_url'], '-w', '%{time_total} %{http_code}']
+                hport = 443 if parse_path.scheme == 'https' else 80
+                if proxy.get("port"):
+                    # tproxy line: DO NOT use -x. our own nat_OUTPUT redirect
+                    # rule (mark==X && tcp) will DNAT this marked connection
+                    # into the line's ss-redir -> real upstream chain (that IS
+                    # the honest e2e test). -x here would speak HTTP-CONNECT
+                    # into a shadowsocks listener = guaranteed fail.
+                    curl_args = ["curl", "-%d" % ip_version, "-s", "-k", "-m", "2",
+                                 "-o", "/dev/null",
+                                 "--resolve", "%s:%d:%s" % (parse_path.netloc, hport, probe_ip),
+                                 proxy['test_url'], '-w', '%{time_total} %{http_code}']
+                else:
+                    curl_args = ["curl", "-%d" % ip_version, "-s", "-k", "-m", "1",
+                                 "-o", "/dev/null",
+                                 "-x", "%s:%d" % (probe_ip if ip_version == 4 else "[%s]" % probe_ip,
+                                                  hport),
+                                 proxy['test_url'], '-w', '%{time_total} %{http_code}']
                 tquery = run_cmd_capture(curl_args, 5, env=env).split(" ")
                 while len(tquery) < 2:
                     tquery.append("000")
@@ -433,13 +446,12 @@ class ECMPThread(threading.Thread):
 
 
 def load_config():
-    global config, test_mapping, g_dead_proxy_ipv4, g_dead_proxy_ipv6, g_proxy_index
+    global config, g_dead_proxy_ipv4, g_dead_proxy_ipv6, g_proxy_index
 
     ptr_records = []
     with open('nft_route.json', 'rb') as f:
         try:
             new_config = json.load(f)
-            test_mapping = {}
             for priority in range(0, len(new_config["rules"])):
                 for tun_id, rule_cfg in new_config["rules"][priority].items():
                     for geo_k, geo_list in rule_cfg.items():
@@ -460,9 +472,6 @@ def load_config():
                     ip_ptr.reverse()
                     ptr_records.append(
                         "ptr-record=%s.in-addr.arpa.,\"%s.proxy.nft-route.\"" % (".".join(ip_ptr), pxy_id))
-                if "bind" in pxy:
-                    pxy['proxy_id'] = pxy_id
-                    test_mapping[pxy['bind']] = pxy
 
             if os.path.exists("/etc/dnsmasq.d"):
                 fptr = open("/etc/dnsmasq.d/nft_route.conf", "w")
@@ -737,6 +746,38 @@ def sync_iprules(reason=""):
     return dirty
 
 
+def _sync_udp_tproxy_loop(marks_by_family):
+    """ip rule/route side of the local-UDP-output -> loopback -> TPROXY loop
+    (see udp_tproxy.py). marks_by_family: {4: {mark,...}, 6: {...}}. Always
+    called (even with empty sets) so removed/disabled lines get their
+    leftover ip rules swept, not just their nft rules."""
+    try:
+        from pyroute2 import IPRoute
+    except ImportError:
+        return
+    try:
+        ipr = IPRoute()
+    except Exception as e:
+        syslog.syslog(syslog.LOG_WARNING, "udp_tproxy: IPRoute open failed: %s" % e)
+        return
+    try:
+        for ver in (4, 6):
+            marks = marks_by_family.get(ver) or set()
+            try:
+                res = utp.sync(ipr, marks, ver,
+                               log=lambda m: syslog.syslog(syslog.LOG_NOTICE, "udp_tproxy: %s" % m))
+            except Exception as e:
+                print(tf.format("{msg:s,bg_red,black}", msg="[-] udp local-output tproxy sync failed (v%d): %s" % (ver, e)))
+                syslog.syslog(syslog.LOG_CRIT, "udp local-output tproxy sync failed (v%d): %s" % (ver, e))
+                continue
+            if res["rules_added"] or res["rules_removed"] or res["route_added"]:
+                print("[*] udp local-output tproxy (v%d): table=%d +%s -%s%s" % (
+                    ver, res["table_id"], res["rules_added"] or "-", res["rules_removed"] or "-",
+                    " route" if res["route_added"] else ""))
+    finally:
+        ipr.close()
+
+
 def install_proxy_chain_rules():
     """(Re)build proxy-chain nft rules and the process supervisor from the
     current config. Master process only; safe to call on boot and reload.
@@ -752,6 +793,7 @@ def install_proxy_chain_rules():
         if g_proxy_sup:
             g_proxy_sup.stop_all()
             g_proxy_sup = None
+        _sync_udp_tproxy_loop({4: set(), 6: set()})
         return
     try:
         order = pmm.validate_chain(config["proxy"])
@@ -820,6 +862,46 @@ def install_proxy_chain_rules():
             else:
                 n_ok += 1
     print("[+] proxy-chain skuid rules: %d installed" % n_ok)
+
+    # local (router-self) UDP output -> loopback -> TPROXY, only for lines
+    # that have BOTH udp_v{4,6}+port AND a resolvable managed uid: the
+    # self-loop guard is the skuid accept-guard rule just installed above
+    # (proxy_mgr.plan_proxy_chain_rules' "direct" branch), which needs a
+    # known uid to exist at all -- without it this loop is NOT safe to
+    # enable, so lines with an unresolved uid are skipped here too.
+    udp_lines_by_family = {4: set(), 6: set()}
+    for n, cfg in config["proxy"].items():
+        if n not in managed or uid_cache.get(n) is None:
+            continue
+        port, mark = cfg.get("port"), cfg.get("mark")
+        if not port or mark is None:
+            continue
+        for ver in (4, 6):
+            if cfg.get("udp_v%d" % ver):
+                udp_lines_by_family[ver].add((int(mark), int(port)))
+    n_udp = 0
+    for ip_family, ver in (("ip", 4), ("ip6", 6)):
+        for mark, port in sorted(udp_lines_by_family[ver]):
+            rc = nfu.add_rule(
+                {'family': ip_family, 'chain': ['mangle_TPROXY_PREROUTING'], 'table': 'policy_route',
+                 'comment': pmm.CHAIN_CMT,
+                 'expr': [{'match': nfu.match_iifname('lo')},
+                          {'match': nfu.match_mark(mark)},
+                          {'match': nfu.match_l4proto(17)},
+                          {'counter': {'bytes': 0, 'packets': 0}},
+                          # Force Traffic to Local -- same convention as the
+                          # existing LAN-forwarded UDP tproxy rule
+                          {'mangle': {'key': {'meta': {'key': 'mark'}}, 'value': 0x100}},
+                          {'tproxy': {'addr': '127.0.0.1', 'port': port}}]
+                 })
+            if rc[0] != 0:
+                print(tf.format("{msg:s,bg_red,black}", msg="[-] add udp local-output tproxy rule failed (%s): %s" % (ip_family, rc)))
+                syslog.syslog(syslog.LOG_CRIT, "add udp local-output tproxy rule failed %s: %s" % (ip_family, rc))
+            else:
+                n_udp += 1
+    if n_udp:
+        print("[+] udp local-output tproxy (iif lo): %d rules installed" % n_udp)
+    _sync_udp_tproxy_loop({ver: {m for m, p in udp_lines_by_family[ver]} for ver in (4, 6)})
 
     def on_status(name, state, pid):
         msg = "proxy %s: %s%s" % (name, state, (" pid=%s" % pid) if pid else "")
@@ -1160,7 +1242,7 @@ class PrintResultThread(threading.Thread):
 
 
 def ip_mark(packet):
-    global ecmp_thread, config, test_mapping, worker_id
+    global ecmp_thread, config, worker_id
 
     t1 = time.time()
 
@@ -1216,15 +1298,7 @@ def ip_mark(packet):
 
             process_fullcone = (proto == 17 and port in [3478, 3479]) or (proto == 6 and port in [3478, 3479, 3480])
 
-            src_mtx = "%s:%d" % (src, sport)
-            if src_mtx in test_mapping:
-                test_info = test_mapping[src_mtx]
-                mark = test_info['mark']
-                packet.set_mark(mark)
-                packet.repeat()
-                test_session = 1
-                out_interface = test_info['proxy_id']
-            elif not allow_ecmp and dst in ecmp_thread.ip_list:
+            if not allow_ecmp and dst in ecmp_thread.ip_list:
                 # Use Cached ECMP
                 cache_ecmp = ecmp_thread.ip_list[dst]
                 if ecmp_thread.now - cache_ecmp.last_active >= 1:
