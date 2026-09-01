@@ -58,20 +58,49 @@
          "test_dns": ["116.228.111.118", "180.168.255.18", "223.5.5.5"],
          "test_url": "http://connect.rom.miui.com/generate_204"
       },
-      "line3-proxy": {
-         "ipv4": true,
-         "ipv6": true,
-         "port": 506,
-         "mark": 35,
-         "udp_v4": false,
-         "udp_v6": false,
-         "weight":1,
-         "proxy_ip": "12.34.56.78",
-         "bind": "192.168.200.2:10506",
-         "test_dns": "1.1.1.1",
-         "test_url": "http://www.google.com/generate_204"
-      }
-   },
+       "line3-proxy": {
+          "ipv4": true,
+          "ipv6": true,
+          "port": 506,
+          "mark": 35,
+          "udp_v4": false,
+          "udp_v6": false,
+          "weight":1,
+          "proxy_ip": "12.34.56.78",
+          "bind": "192.168.200.2:10506",
+          "test_dns": "1.1.1.1",
+          "test_url": "http://www.google.com/generate_204",
+          "_doc_daemon": "以下字段:由 router 接管该 ss-redir 进程(启动/崩溃重启/防环)。去掉 daemon 即恢复为手工外部进程模式",
+          "daemon": "ss-redir",
+          "uid": "nobody",
+          "autostart": false,
+          "cipher": "aes-256-gcm",
+          "password": "DEMO-change-me-inline-password-visible-in-proc",
+          "mode": "tcp",
+          "restart": { "max": 5, "window": 300 }
+       },
+       "line4-chain": {
+          "ipv4": true,
+          "ipv6": false,
+          "port": 507,
+          "mark": 60,
+          "weight": 1,
+          "udp_v4": false,
+          "udp_v6": false,
+          "proxy_ip": "203.0.113.9",
+          "server": "203.0.113.9",
+          "server_port": 8388,
+          "_doc_chain": "链式代理示例:本线路自己的上游流量经 line3-proxy 的透明端口(506)出去;upstream 目标必须是托管且有 port 的线路,否则保存被拒;A->B->A 环会被拒绝启动",
+          "upstream": "line3-proxy",
+          "daemon": "ss-redir",
+          "uid": "nobody",
+          "autostart": false,
+          "cipher": "chacha20-ietf-poly1305",
+          "password_file": "/etc/nft-route/line4.pw",
+          "mode": "tcp_and_udp",
+          "restart": { "max": 5, "window": 300 }
+       }
+    },
    "rules": [
       {
          "line1": {
