@@ -449,6 +449,14 @@ def health_snapshot(app):
         except Exception:
             pass
     # --- test results from redis
+    caps = {}
+    try:
+        if cfg:
+            for nmc, c in (cfg.get("proxy") or {}).items():
+                caps[nmc] = {"v4": bool(c.get("ipv4")), "v6": bool(c.get("ipv6")),
+                             "mark": c.get("mark"), "tproxy": bool(c.get("port"))}
+    except Exception:
+        pass
     try:
         r = redis.Redis(host=app.args.redis_host, port=app.args.redis_port, db=app.args.redis_db,
                         socket_timeout=2, socket_connect_timeout=2)
@@ -467,10 +475,10 @@ def health_snapshot(app):
                 out[k] = {"ms": ms, "ip": parts[1].strip() if len(parts) > 1 else ""}
             return out
         res["test"] = {"round_at": (float(at) if at else None),
-                       "pending_now": bool(pend),
+                       "pending_now": bool(pend), "caps": caps,
                        "v4": parse("test_v4"), "v6": parse("test_v6")}
     except Exception as e:
-        res["test"] = {"error": str(e)}
+        res["test"] = {"error": str(e), "caps": caps}
     return res
 
 
@@ -915,7 +923,11 @@ def test_line(cfg_path, name, proto="tcp", family=4, target=None):
     if not dns_servers:
         dns_servers = [None]   # system resolver; honest label so the note is visible
     for srv in dns_servers[:3]:
-        args = ["dig", "-%d" % family, "+time=2", "+tries=1", "+short"]
+        args = ["dig", "+time=2", "+tries=1", "+short"]
+        if family == 6 and srv and ":" in srv:
+            args.append("-6")          # v6 server reachable only via v6 transport
+        elif family == 4:
+            args.append("-4")
         if proto == "tcp":
             args.append("+tcp")
         if srv:

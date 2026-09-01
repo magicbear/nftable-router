@@ -3,13 +3,13 @@
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260902-0010"
+UI_VERSION = "20260902-0130"
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nft-route 管理台</title>
-<script>var UI_VER="20260902-0010";</script>
+<script>var UI_VER="20260902-0130";</script>
 <style>
 :root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
 --green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
@@ -968,13 +968,21 @@ function loadInfo(){api("/api/health").then(function(d){
  var names={};Object.keys(t.v4||{}).forEach(function(k){names[k]=1});Object.keys(t.v6||{}).forEach(function(k){names[k]=1});
  var rows=[];Object.keys(names).sort().forEach(function(k){
   var v4=(t.v4||{})[k],v6=(t.v6||{})[k];
-  function tb(pr){var bt=el("button","dim",pr);bt.style.padding="0 8px";
-   bt.onclick=function(){testLine(k,pr.toLowerCase(),bt)};return bt}
+  function tb(label,fam,pr){var bt=el("button","dim",label);bt.style.padding="0 6px";bt.style.fontSize="11px";
+   bt.onclick=function(){testLine(k,pr,fam,bt)};return bt}
   function fmt(ms){return ms==null||isNaN(ms)?"⚫":(ms<0?"失败":(ms<10?Math.round(ms*1000)+"ms":ms.toFixed(1)+"s"))}
-  rows.push([k,v4?el("span","",lvl(v4.ms)+" "+fmt(v4.ms)):"⚫",
-   v6?el("span","",lvl(v6.ms)+" "+fmt(v6.ms)):"⚫",
-   (v4&&v4.ip)||"",v6&&v6.ip&&v6.ip!==v4.ip?v6.ip:"",ago(t.round_at),
-   (function(){var c=el("td");c.appendChild(tb("TCP"));c.appendChild(document.createTextNode(" "));c.appendChild(tb("UDP"));return c})()])});
+  var caps=(t.caps||{})[k]||{v4:true,v6:!!(v6)};
+  var v4cell=!caps.v4?el("span","dim","未启用"):(v4?el("span","",lvl(v4.ms)+" "+fmt(v4.ms)):el("span","","⚫"));
+  var v6cell=!caps.v6?el("span","dim","未启用"):(v6?el("span","",lvl(v6.ms)+" "+fmt(v6.ms)):el("span","","⚫"));
+  rows.push([k,v4cell,v6cell,
+   caps.v4?(((v4&&v4.ip)||"")):"—",
+   caps.v6?((v6&&v6.ip)||""):"—",ago(t.round_at),
+   (function(){var c=el("td");var any=false;
+    if(caps.v4){c.appendChild(tb("v4·T",4,"tcp"));c.appendChild(document.createTextNode(" "));c.appendChild(tb("v4·U",4,"udp"));any=true}
+    if(caps.v6){if(any)c.appendChild(document.createTextNode(" "));
+     c.appendChild(tb("v6·T",6,"tcp"));c.appendChild(document.createTextNode(" "));c.appendChild(tb("v6·U",6,"udp"))}
+    if(!any)c.appendChild(el("span","dim","-"));
+    return c})()])});
  if(rows.length)putRows(lt,["线路","IPv4","IPv6","探测IP(v4)","探测IP(v6)","时间","测试"],rows);
  else lt.appendChild(el("div","dim","无测试数据(线路缺少test_url或router未跑过测试轮)"));
  // managed proxies
@@ -1005,16 +1013,16 @@ function loadInfo(){api("/api/health").then(function(d){
  else $("i-ext").innerHTML="";
  if(d.error){var er=el("div","bad","health: "+d.error);$("i-master").appendChild(er)}
  }).catch(function(e){$("i-round").textContent="health 加载失败: "+e})}
-function testLine(name,proto,btn){
+function testLine(name,proto,family,btn){
  var old=btn?btn.textContent:"";
  if(btn){btn.disabled=true;btn.textContent="⋯"}
  var done=function(fn){return function(x){if(btn){btn.disabled=false;btn.textContent=old}return fn(x)}};
  api("/api/test_line",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({line:name,proto:proto,family:4})})
+  body:JSON.stringify({line:name,proto:proto,family:family})})
  .then(done(function(r){
    var det=(r.steps||[]).map(function(s){return s.name+" "+(s.ok?("✓ "+s.ms+"ms"):"✗")}).join(" · ");
    if(r.error)toast(name+" "+proto+" ✗ "+r.error,"bad");
-   else toast((r.ok?"✓ ":"✗ ")+name+" "+proto.toUpperCase()+": "+det+(r.note?("　"+r.note):""),r.ok?"good":"bad");
+   else toast((r.ok?"✓ ":"✗ ")+name+" v"+family+" "+proto.toUpperCase()+": "+det+(r.note?("　"+r.note):""),r.ok?"good":"bad");
    loadInfo()})).catch(done(function(e){toast(name+" 请求失败 "+e,"bad")})); }
 $("i-refresh").onclick=loadInfo;
 $("i-reload").onclick=function(){

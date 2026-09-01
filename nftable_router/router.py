@@ -883,7 +883,7 @@ def install_proxy_chain_rules():
     for ip_family, ver in (("ip", 4), ("ip6", 6)):
         for mark, port in sorted(udp_lines_by_family[ver]):
             rc = nfu.add_rule(
-                {'family': ip_family, 'chain': ['mangle_TPROXY_PREROUTING'], 'table': 'policy_route',
+                {'family': ip_family, 'chain': 'mangle_TPROXY_PREROUTING', 'table': 'policy_route',
                  'comment': pmm.CHAIN_CMT,
                  'expr': [{'match': nfu.match_iifname('lo')},
                           {'match': nfu.match_mark(mark)},
