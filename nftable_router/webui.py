@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """Embedded single-page UI for webadmin (no external assets / CDN)."""
 
+# bump on every UI behaviour change: /api/config refuses saves from older
+# cached pages (they may reconstruct payloads with missing keys)
+UI_VERSION = "20260901-2140"
+
 INDEX_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nft-route 管理台</title>
+<script>var UI_VER="20260901-2140";</script>
 <style>
 :root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
 --green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
@@ -362,7 +367,7 @@ function updateDirtyUI(){
  var d=localStorage.getItem("nft_dirty")==="1";
  var dot=document.getElementById("nav-dirty");if(dot)dot.style.display=d?"inline":"none"}
 function pushCfg(cb){
- var payload={config:CFG,reload:false,base_mtime:CFG_MTIME};
+ var payload={config:CFG,reload:false,base_mtime:CFG_MTIME,ui_ver:(typeof UI_VER!=="undefined"?UI_VER:"")};
  var force=(cb===true); if(force)payload.force=true; else if(typeof cb!=="function")cb=null;
  return api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},
   body:JSON.stringify(payload)}).then(function(r){
@@ -568,31 +573,46 @@ function editProxy(name){
  isNew?"创建":"保存线路",function(body){
   function g(k){var x=body.querySelector('[data-fk="'+k+'"]');return x?(x.value||"").trim():""}
   function gi(k){var v=g(k);return v===""?null:parseInt(v,10)}
-  var out={};
+  // MERGE onto the existing entry: keys the form does not own (ipv4/ipv6/
+  // udp_*/owner extras/anything hand-added) survive untouched. Only fields
+  // bound to controls are overwritten.
+  var out=isNew?{}:JSON.parse(JSON.stringify(c));
   out.mark=gi("mark");out.weight=gi("weight");
-  var p=gi("port");if(p!=null)out.port=p;
-  if(g("upstream"))out.upstream=g("upstream");
-  if(g("daemon"))out.daemon=g("daemon");
-  ["uid","bind","test_url"].forEach(function(f){if(g(f))out[f]=g(f)});
+  var p=gi("port");if(p!=null)out.port=p;else delete out.port;
+  if(g("upstream"))out.upstream=g("upstream");else delete out.upstream;
+  var dn=g("daemon");
+  if(dn)out.daemon=dn;else delete out.daemon;
+  ["uid","bind","test_url"].forEach(function(f){var v=g(f);if(v)out[f]=v;else delete out[f]});
   if(g("test_dns"))out.test_dns=g("test_dns").split(/[,，\s]+/).filter(function(x){return x.length});
-  inst_commit();
-  var inames={};
-  for(var ii=0;ii<insts.length;ii++){
-   var it0=insts[ii];
-   if(!it0.name)return toast("实例缺少名字","bad");
-   if(inames[it0.name])return toast("实例名重复: "+it0.name,"bad");
-   inames[it0.name]=1;
-   if(out.daemon==="ss-redir"&&(!it0.server||(!it0.password&&!it0.password_file)))
-    return toast("实例 "+it0.name+": ss-redir 需要 server 和 password(或 password_file)","bad")}
-  out.instances=insts;
-  if(insts[0].server)out.proxy_ip=insts[0].server;   // mirror for ip-rule/test tooling
-  if(insts.length===1&&insts[0].name==="main"){
-   // single-process compat: mirror scoped fields onto the line entry so a
-   // router build WITHOUT instances support keeps working after restart
-   ["mode","plugin","plugin_opts","bind_addr","server","cipher","password","password_file"].forEach(function(k){
-    if(insts[0][k]!=null&&insts[0][k]!=="")out[k]=insts[0][k]});
-   if(insts[0].server_port!=null)out.server_port=insts[0].server_port;
-   if(insts[0].port!=null)out.port=insts[0].port}
+  else if("test_dns" in out&&!g("test_dns"))delete out.test_dns;
+  ["ipv4","ipv6","udp_v4","udp_v6","fullcone"].forEach(function(f){
+   var e=body.querySelector('[data-fk="'+f+'"]');if(e)out[f]=!!e.checked});
+  var rmx=gi("restart_max"),rmw=gi("restart_window");
+  if(rmx!=null||rmw!=null)out.restart={max:rmx==null?5:rmx,window:rmw==null?300:rmw};
+  if(dn){
+   // ---- instances / protocol fields: managed lines ONLY ----
+   inst_commit();
+   var inames={};
+   for(var ii=0;ii<insts.length;ii++){
+    var it0=insts[ii];
+    if(!it0.name)return toast("实例缺少名字","bad");
+    if(inames[it0.name])return toast("实例名重复: "+it0.name,"bad");
+    inames[it0.name]=1;
+    if(dn==="ss-redir"&&(!it0.server||(!it0.password&&!it0.password_file)))
+     return toast("实例 "+it0.name+": ss-redir 需要 server 和 password(或 password_file)","bad")}
+   out.instances=insts;
+   out.autostart=g("autostart_x")==="true";
+   if(insts[0].server)out.proxy_ip=insts[0].server;
+   if(insts.length===1&&insts[0].name==="main"){
+    ["mode","plugin","plugin_opts","bind_addr","server","cipher","password","password_file"].forEach(function(k){
+     if(insts[0][k]!=null&&insts[0][k]!=="")out[k]=insts[0][k]});
+    if(insts[0].server_port!=null)out.server_port=insts[0].server_port;
+    if(insts[0].port!=null)out.port=insts[0].port}
+  }else{
+   // unmanaged (ip-rule / external process) line: never write instances,
+   // never mirror protocol fields, never autostart/restart semantics
+   delete out.instances;
+  }
   var adv;try{adv=JSON.parse(body.querySelector(".padv").value||"{}")}catch(e){return toast("高级字段不是合法JSON","bad")}
   for(var ak in adv)out[ak]=adv[ak];
   if(out.mark==null)return toast("mark 必填","bad");
@@ -603,8 +623,7 @@ function editProxy(name){
   CFG.proxy=CFG.proxy||{};CFG.proxy[newName]=out;
   closeModal();
   pushCfg(function(){renderProxy();renderRules()})})}
-function nextMark(){var used={};Object.keys(CFG.proxy||{}).forEach(function(k){used[(CFG.proxy[k]||{}).mark]=1});
- var m=1;while(used[m]||m===0x99||m===0x100)m++;return m}
+
 function delProxy(name){
  var refs=proxyReferrers(name);
  if(refs.length)return toast("无法删除: 被 "+refs.join(", ")+" 引用（先改上游/规则）","bad");
@@ -712,8 +731,9 @@ $("c-check").onclick=function(){var cfg;try{cfg=JSON.parse($("c-box").value)}cat
   $("c-msg").innerHTML=r.ok?"<span class=good>校验通过</span>":("<span class=bad>错误:</span><br>"+r.errors.map(function(x){return "· "+x}).join("<br>"))})};
 $("c-save").onclick=function(){var cfg;try{cfg=JSON.parse($("c-box").value)}catch(e){return toast("JSON 错误: "+e,"bad")}
  if(!confirm("保存整份配置到 nft_route.json？(仅写文件，不通知主进程)"))return;
- api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg,reload:false,base_mtime:CFG_MTIME})}).then(function(r){
+ api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({config:cfg,reload:false,base_mtime:CFG_MTIME,ui_ver:(typeof UI_VER!=="undefined"?UI_VER:"")})}).then(function(r){
   if(r.stale){toast("配置已被外部修改，请先点『读取配置』重新加载","bad");return}
+  if(r.outdated_ui){toast(String(r.error),"bad");return}
   if(r.ok){toast("已保存(未重载) — 到 状态 页点『重载主进程』生效","good");markDirty();loadCfg()}
   else{var msg=(r.errors||[r.error||JSON.stringify(r)]).join("\\n");toast("拒绝保存:\\n"+msg,"bad");$("c-msg").innerHTML="<span class=bad>"+msg.replace(/\\n/g,"<br>")+"</span>"}})};
 loadCfg();

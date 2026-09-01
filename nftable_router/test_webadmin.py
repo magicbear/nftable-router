@@ -13,6 +13,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import webadmin as wa
+wa.current_ui_version = lambda: "test"
 
 PASS = 0
 FAIL = 0
@@ -197,7 +198,7 @@ def test_server_e2e():
             newcfg = json.loads(json.dumps(cfg))
             newcfg["egress_marks"] = []
             # missing base_mtime -> 428 (stale/cached clients locked out)
-            payload = json.dumps({"config": newcfg, "reload": False})
+            payload = json.dumps({"config": newcfg, "reload": False, "ui_ver": "test"})
             s = socket.create_connection(("127.0.0.1", port), timeout=3)
             s.sendall(("POST /api/config HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
                        "\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(payload), payload)).encode())
@@ -217,7 +218,7 @@ def test_server_e2e():
             h, r2 = head.split(b"\r\n\r\n", 1)
             got = json.loads(read_http_body(s, h, r2)); s.close()
             mt = got["mtime"]
-            payload = json.dumps({"config": newcfg, "reload": False, "base_mtime": mt})
+            payload = json.dumps({"config": newcfg, "reload": False, "base_mtime": mt, "ui_ver": "test"})
             s = socket.create_connection(("127.0.0.1", port), timeout=3)
             s.sendall(("POST /api/config HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
                        "\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(payload), payload)).encode())
@@ -232,7 +233,7 @@ def test_server_e2e():
             # stale mtime -> 409
             s = socket.create_connection(("127.0.0.1", port), timeout=3)
             time.sleep(0.02)
-            payload = json.dumps({"config": newcfg, "base_mtime": mt - 5})
+            payload = json.dumps({"config": newcfg, "base_mtime": mt - 5, "ui_ver": "test"})
             s.sendall(("POST /api/config HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
                        "\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(payload), payload)).encode())
             head = b""
@@ -241,9 +242,20 @@ def test_server_e2e():
             h, r2 = head.split(b"\r\n\r\n", 1)
             res = json.loads(read_http_body(s, h, r2)); s.close()
             check("stale base_mtime -> 409 stale:true", res.get("stale") is True)
+            # old/cached UI build -> 428 outdated_ui
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            oldpayload = json.dumps({"config": newcfg, "base_mtime": mt, "ui_ver": "20200101-0000"})
+            s.sendall(("POST /api/config HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
+                       "\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(oldpayload), oldpayload)).encode())
+            oh = b""
+            while b"\r\n\r\n" not in oh:
+                oh += s.recv(4096)
+            hh, rr = oh.split(b"\r\n\r\n", 1)
+            ores = json.loads(read_http_body(s, hh, rr)); s.close()
+            check("old ui_ver -> 428 outdated_ui", b"428" in hh and ores.get("outdated_ui") is True)
             # bind API
             bpayload = json.dumps({"ifname": "ppp0", "dynamic": True, "mark": 51,
-                                   "gateway": "auto", "reload": False})
+                                   "gateway": "auto", "reload": False, "ui_ver": "test"})
             s = socket.create_connection(("127.0.0.1", port), timeout=3)
             s.sendall(("POST /api/bind HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
                        "\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(bpayload), bpayload)).encode())

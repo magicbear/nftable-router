@@ -888,12 +888,38 @@ class App:
         self.last_reload = None   # ts of last explicit /api/reload from this UI
 
 
+_ui_cache = {"mtime": None, "html": None, "ver": None}
+
+
 def _load_ui():
+    """hot reload of webui.py (mtime tracked) so committed UI changes take
+    effect without restarting this child, plus a per-read UI_VERSION gate."""
+    path = os.path.join(module_dir, "webui.py")
     try:
-        from nftable_router.webui import INDEX_HTML
-    except ImportError:
-        from webui import INDEX_HTML
-    return INDEX_HTML
+        mt = os.stat(path).st_mtime
+    except OSError:
+        mt = None
+    if mt is not None and _ui_cache["mtime"] == mt and _ui_cache["html"]:
+        return _ui_cache["html"]
+    ns = {"__name__": "webui_hot"}
+    try:
+        exec(compile(open(path, encoding="utf-8").read(), path, "exec"), ns)
+    except Exception:
+        if _ui_cache["html"]:
+            return _ui_cache["html"]
+        raise
+    _ui_cache.update(mtime=mt, html=ns["INDEX_HTML"], ver=ns.get("UI_VERSION"))
+    return ns["INDEX_HTML"]
+
+
+def current_ui_version():
+    try:
+        path = os.path.join(module_dir, "webui.py")
+        src = open(path, encoding="utf-8").read(2048)
+        m = re.search(r'^UI_VERSION\s*=\s*"([^"]+)"', src, re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1033,6 +1059,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": not validate_config(cfg), "errors": validate_config(cfg)})
         elif path == "/api/config":
             cfg = body.get("config")
+            # hard-fail saves from older cached UI builds: they may rebuild
+            # entries without keys the current form owns (flags were lost once)
+            want_ver = current_ui_version()
+            if want_ver and str(body.get("ui_ver") or "") != want_ver and not body.get("force"):
+                self.send_json(428, {"ok": False, "outdated_ui": True,
+                                     "error": "页面脚本版本过旧(%s -> 需 %s)，请 Ctrl+Shift+R 强制刷新后重新编辑保存" % (body.get("ui_ver") or "无版本", want_ver)})
+                return
             # FRESHNESS FIRST: an outdated page snapshot normally fails content
             # validation for keys the user never edited -> say "stale" not ghost
             # errors (CPE5G family-flags confusion root cause)
