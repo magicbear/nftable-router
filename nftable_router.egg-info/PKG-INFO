@@ -1,0 +1,111 @@
+Metadata-Version: 2.1
+Name: nftable-router
+Version: 0.1.0
+Summary: Software Policy Router for nftables
+Home-page: https://github.com/magicbear/nftable-router
+Author: MagicBear
+Author-email: MagicBear <magicbearmo@gmail.com>
+License: MIT License
+        
+        Copyright (c) 2024 MagicBear
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Project-URL: Homepage, https://github.com/magicbear/nftable-router
+Project-URL: Issues, https://github.com/magicbear/nftable-router/issues
+Keywords: nftable
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: ipip-ipdb
+Requires-Dist: scapy
+Requires-Dist: NetfilterQueue
+Requires-Dist: emoji-country-flag
+Requires-Dist: python-iptables
+Requires-Dist: pyroute2
+Requires-Dist: netifaces
+Requires-Dist: pytput
+Requires-Dist: redis
+Requires-Dist: nftables
+
+# nftable-router
+Software Policy Router for nftables
+
+# Icon Means
+## Status ICON
+### ALIVE:
+> 🟩   - Global Lock Idle
+>
+> 🔴   - Process Dead
+>
+> 🟡   - Process Busying
+>
+> 🟩   - Process Idle > 30s
+>
+> 🟢   - Process Idle
+
+### Proxy Test Status:
+> ⚫ for Line
+>
+> ⬛ for Proxy
+>
+> ⚫   - N/A
+>
+> 🔴   - Failed
+>
+> 🟢   - <= 100ms
+>
+> 🔵   - <= 200ms
+>
+> 🟣   - <= 400ms
+>
+> 🟡   - <= 600ms
+>
+> 🟠   - <= 800ms
+>
+> 🟤   - > 800ms
+
+# Config.json
+
+- `ipdb_v4`				- Path for IPDB IPv4
+- `ipdb_v6`				- Path for IPDB IPv6
+- `nat_interfaces` 		- Interface for internal network (from this interfaces will be nat)
+- `tunnel_ip`			- Tunnel IP, would be ignore to software router
+- `allow_ecmp`			- Allow Equal Cost multi-path CIDR (TODO)
+- `allow_ecmp_port` 	- Allow Equal Cost multi-path Ports (TODO)
+- `ignore_print_domain`	- No output for Print domain
+- `ignore_list`			- Ignore source CIDR for software router (such as internal router)
+- `proxy`				- Line List
+- `rules`				- Rules array for process (array for priority)
+	- `from`			- match by source ip (highest priority)
+	- `any`				- match any traffic
+	- `resolve`			- match by resolved domain name
+	- `cidr`			- match by target ip CIDR
+	- `country_name`	- match by country name
+	- `region_name`		- match by region name (such as `ALIDNS.COM`)
+	- `city_name`		- match by city
+	- `owner_domain`	- match by owner domain (such as `github.com`, `twitter.com`)
+	- `isp_domain`		- match by ISP (such as `阿里云`, `阿里云/电信/联通/移动/教育网`)
+	- `country_code`	- match by 2 char country code (such as `CN`)
+	- `anycast`			- match by is anycast ip (only `` or `ANYCAST`)
+	- `idc`				- match by is idc ip (only `` or `IDC`)
+	- `base_station`	- match by is base_station ip

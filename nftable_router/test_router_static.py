@@ -52,6 +52,21 @@ def check_file(path):
         if name not in defined and (st is None or st > ln):
             errors.append("'%s' first READ at line %d but first assignment at %s" % (
                 name, ln, st))
+
+    # structure guard: install_proxy_chain_rules must itself build+start the
+    # supervisor and must not END on a nested def. A module-level block once
+    # got pasted INTO the middle of this function, silently absorbing its tail
+    # into the new def -> supervisor never started, proxies never spawned.
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "install_proxy_chain_rules":
+            if isinstance(node.body[-1], ast.FunctionDef):
+                errors.append("install_proxy_chain_rules ends on nested def '%s' (dead tail?)"
+                              % node.body[-1].name)
+            code = ast.dump(node)
+            if "ProxySupervisor" not in code:
+                errors.append("install_proxy_chain_rules no longer references ProxySupervisor")
+            if "attr='start'" not in code:
+                errors.append("install_proxy_chain_rules never calls supervisor .start()")
     return errors
 
 

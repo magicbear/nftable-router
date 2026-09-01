@@ -1,0 +1,10 @@
+ipip-ipdb
+scapy
+NetfilterQueue
+emoji-country-flag
+python-iptables
+pyroute2
+netifaces
+pytput
+redis
+nftables

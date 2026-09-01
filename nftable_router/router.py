@@ -909,6 +909,28 @@ def install_proxy_chain_rules():
         syslog.syslog(syslog.LOG_NOTICE, msg)
         proxy_state_update(name, state, pid)
 
+    # chained proxies whose uid could not be resolved must not run (their
+    # traffic would silently bypass the chain) -> supervise but never start
+    sup_cfgs = {k: (dict(v, autostart=False) if k in chain_disabled else v)
+                for k, v in config["proxy"].items()}
+    if g_proxy_sup is not None:
+        # SIGUSR1 reload path: diff start/stop only (unchanged processes stay up)
+        try:
+            g_proxy_sup.reconfigure(sup_cfgs)
+            print("[*] proxy supervisor reconfigured (incremental)")
+        except ValueError as e:
+            print(tf.format("{msg:s,bg_red,black}", msg="[-] proxy reconfigure failed, running set kept: %s" % e))
+            syslog.syslog(syslog.LOG_CRIT, "proxy reconfigure failed, running set kept: %s" % e)
+        return
+    try:
+        g_proxy_sup = pmm.ProxySupervisor(sup_cfgs, on_status=on_status,
+                                          log=lambda m: syslog.syslog(syslog.LOG_NOTICE, "proxyd: %s" % m))
+        g_proxy_sup.start()
+    except ValueError as e:
+        g_proxy_sup = None
+        print(tf.format("{msg:s,bg_red,black}", msg="[-] proxy supervisor config error: %s" % e))
+        syslog.syslog(syslog.LOG_CRIT, "proxy supervisor config error: %s" % e)
+
 
 PROXY_STATE_FILE = "/run/nft_route_proxies.json"
 
@@ -937,28 +959,6 @@ def proxy_state_update(key, state, pid=None):
             pass
     except OSError:
         pass
-
-    # chained proxies whose uid could not be resolved must not run (their
-    # traffic would silently bypass the chain) -> supervise but never start
-    sup_cfgs = {k: (dict(v, autostart=False) if k in chain_disabled else v)
-                for k, v in config["proxy"].items()}
-    if g_proxy_sup is not None:
-        # SIGUSR1 reload path: diff start/stop only (unchanged processes stay up)
-        try:
-            g_proxy_sup.reconfigure(sup_cfgs)
-            print("[*] proxy supervisor reconfigured (incremental)")
-        except ValueError as e:
-            print(tf.format("{msg:s,bg_red,black}", msg="[-] proxy reconfigure failed, running set kept: %s" % e))
-            syslog.syslog(syslog.LOG_CRIT, "proxy reconfigure failed, running set kept: %s" % e)
-        return
-    try:
-        g_proxy_sup = pmm.ProxySupervisor(sup_cfgs, on_status=on_status,
-                                          log=lambda m: syslog.syslog(syslog.LOG_NOTICE, "proxyd: %s" % m))
-        g_proxy_sup.start()
-    except ValueError as e:
-        g_proxy_sup = None
-        print(tf.format("{msg:s,bg_red,black}", msg="[-] proxy supervisor config error: %s" % e))
-        syslog.syslog(syslog.LOG_CRIT, "proxy supervisor config error: %s" % e)
 
 
 def get_term_width():
