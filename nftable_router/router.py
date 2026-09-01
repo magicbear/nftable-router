@@ -290,8 +290,20 @@ class TestThread(threading.Thread):
                 self.r.hset("test_v%d" % ip_version, proxy_id, rc)
 
             self.last_check = time.time()
+            try:
+                self.r.set("test_at", "%.3f" % time.time())
+            except Exception:
+                pass
             while not term.value and time.time() - self.last_check < 60:
                 time.sleep(1)
+                # webadmin 立即测试 trigger (cross-process via redis, cheap poll)
+                try:
+                    if self.r.get("test_now"):
+                        self.r.delete("test_now")
+                        syslog.syslog(syslog.LOG_NOTICE, "test_now requested, running round")
+                        break
+                except Exception:
+                    pass
 
 
 class ECMPCacheItem:

@@ -58,6 +58,11 @@ except Exception:
         pmm = None
 
 try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
     import redis
 except ImportError:
     print("redis python package is required", file=sys.stderr)
@@ -317,6 +322,130 @@ def validate_config(cfg):
     return errors
 
 
+def health_snapshot(app):
+    """read-only process + line-test state; never raises (errors -> fields)"""
+    res = {"ts": round(time.time(), 1), "master": None, "workers": [], "dns": None,
+           "webadmin": {"pid": os.getpid(), "uptime": round(time.time() - app.started),
+                        "ring": len(app.ring), "ws_clients": app.hub.count(),
+                        "redis_stream": app.streamer.alive},
+           "proxies": {"managed": [], "external": []}, "test": None, "error": None}
+    if psutil is None:
+        res["error"] = "python3-psutil not installed on this host"
+    cfg = None
+    try:
+        cfg = ib.load_config(app.args.config)
+    except Exception as e:
+        res["error"] = (res["error"] or "") + " load config: %s" % e
+    # --- master + children
+    procs = {}
+    if psutil is not None:
+        pidfile = app.args.pidfile or MASTER_PID_FILE
+        mpid = None
+        try:
+            mpid = int(open(pidfile).read().strip())
+            mp = psutil.Process(mpid)
+            with mp.oneshot():
+                res["master"] = {"pid": mpid, "status": mp.status(),
+                                 "cmdline": " ".join(mp.cmdline())[:120],
+                                 "uptime": round(time.time() - mp.create_time()),
+                                 "rss_mb": round(mp.memory_info().rss / 1e6, 1),
+                                 "threads": mp.num_threads()}
+            kids = mp.children(recursive=False)
+            res["master"]["children"] = len(kids)
+        except Exception as e:
+            res["master"] = {"pid": mpid, "status": "down", "error": str(e)}
+            kids = []
+        for p in kids:
+            procs[p.pid] = p
+            cl = []
+            try:
+                with p.oneshot():
+                    cl = p.cmdline()
+                    label = " ".join(cl)[:60] if cl else p.name()
+                    ent = {"pid": p.pid, "name": label, "status": p.status(),
+                           "cpu": round(p.cpu_percent(interval=0.05), 1),
+                           "rss_mb": round(p.memory_info().rss / 1e6, 1),
+                           "uptime": round(time.time() - p.create_time())}
+            except Exception as e:
+                ent = {"pid": p.pid, "name": "?", "status": "error", "error": str(e)}
+            label_l = ent["name"]
+            if "webadmin.py" in label_l or p.pid == os.getpid():
+                res["webadmin"]["name"] = label_l
+            elif "Route - DNS" in label_l:
+                res["dns"] = ent
+            elif "Policy Route - W" in label_l:
+                res["workers"].append(ent)
+            else:
+                base = os.path.basename(cl[0]) if cl else ""
+                if base in ("ss-redir", "ss-local", "v2ray", "sing-box"):
+                    ent["kind"] = "proxy"          # managed/adopted child proxy
+                res["workers"].append(ent)
+    # --- managed proxies expected from config
+    if cfg and psutil is not None and pmm is not None:
+        managed = {k: v for k, v in cfg.get("proxy", {}).items() if pmm.is_managed(v)}
+        for name, c in managed.items():
+            want = {"managed": name, "daemon": c.get("daemon"), "port": c.get("port"),
+                    "upstream": c.get("upstream"), "autostart": c.get("autostart", True),
+                    "pid": None, "state": "not running", "uptime": None, "cpu": None}
+            if c.get("autostart", True) is False:
+                want["state"] = "autostart off"
+            for p in procs.values():
+                try:
+                    cl = p.cmdline()
+                except Exception:
+                    continue
+                if not cl:
+                    continue
+                port_i = cl.index("-l") + 1 if "-l" in cl else None
+                if (os.path.basename(cl[0]) in ("ss-redir", "v2ray", "sing-box", str(c.get("binary") or ""))
+                        and port_i and port_i < len(cl) and str(c.get("port")) == cl[port_i]):
+                    try:
+                        with p.oneshot():
+                            want.update({"pid": p.pid, "state": "running" if p.status() == psutil.STATUS_RUNNING
+                                         or p.is_running() else p.status(),
+                                         "uptime": round(time.time() - p.create_time()),
+                                         "cpu": round(p.cpu_percent(0.05), 1)})
+                    except Exception as e:
+                        want["state"] = "error %s" % e
+                    break
+            res["proxies"]["managed"].append(want)
+        # external proxy-ish procs NOT under the router master
+        try:
+            for p in psutil.process_iter(["pid", "name", "cmdline", "ppid", "username"]):
+                cl = p.info.get("cmdline") or []
+                if cl and os.path.basename(cl[0]) in ("ss-redir", "ss-local", "v2ray", "sing-box") \
+                        and p.info["pid"] not in procs:
+                    res["proxies"]["external"].append({"pid": p.info["pid"], "ppid": p.info["ppid"],
+                                                       "user": p.info.get("username"),
+                                                       "cmd": " ".join(cl)[:100]})
+        except Exception:
+            pass
+    # --- test results from redis
+    try:
+        r = redis.Redis(host=app.args.redis_host, port=app.args.redis_port, db=app.args.redis_db,
+                        socket_timeout=2, socket_connect_timeout=2)
+        at = r.get("test_at")
+        pend = r.exists("test_now")
+        def parse(hashname):
+            out = {}
+            for k, v in (r.hgetall(hashname) or {}).items():
+                k = k.decode() if isinstance(k, bytes) else str(k)
+                v = v.decode() if isinstance(v, bytes) else str(v)
+                parts = v.split(" ", 1)
+                try:
+                    ms = float(parts[0])
+                except ValueError:
+                    ms = None
+                out[k] = {"ms": ms, "ip": parts[1].strip() if len(parts) > 1 else ""}
+            return out
+        res["test"] = {"round_at": (float(at) if at else None),
+                       "pending_now": bool(pend),
+                       "v4": parse("test_v4"), "v6": parse("test_v6")}
+    except Exception as e:
+        res["test"] = {"error": str(e)}
+    return res
+
+
 # ---------------------------------------------------------------------------
 # HTTP + WS handler
 # ---------------------------------------------------------------------------
@@ -404,6 +533,11 @@ class Handler(BaseHTTPRequestHandler):
                                      "proxy_lines": {k: v.get("mark") for k, v in cfg.get("proxy", {}).items()}})
             except Exception as e:
                 self.send_json(500, {"error": "%s" % e})
+        elif path == "/api/health":
+            try:
+                self.send_json(200, health_snapshot(self.app))
+            except Exception as e:
+                self.send_json(500, {"error": "%s: %s" % (type(e).__name__, e)})
         elif path == "/api/status":
             st = {}
             try:
@@ -487,6 +621,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"ok": True, "entry": entry, "reload": rc})
         elif path == "/api/reload":
             self.send_json(200, signal_master())
+        elif path == "/api/test_now":
+            try:
+                r = redis.Redis(host=self.app.args.redis_host, port=self.app.args.redis_port,
+                                db=self.app.args.redis_db, socket_timeout=2, socket_connect_timeout=2)
+                r.set("test_now", "1")
+                self.send_json(200, {"ok": True,
+                                     "note": "已置 redis test_now 标志; 主进程 TestThread 轮询到即开测 (需已加载带该支持的router代码)"})
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": str(e)})
         else:
             self.send_json(404, {"error": "not found"})
 

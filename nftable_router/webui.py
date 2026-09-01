@@ -41,8 +41,17 @@ td.ell.wrap{white-space:normal;word-break:break-all;text-overflow:clip}
 #colsbox{margin:0 0 8px}#colsbox label{display:inline-block;margin:2px 12px 2px 0;color:var(--fg);cursor:pointer;user-select:none}
 #colsbox label input{vertical-align:-2px}#colsbox button{margin-left:10px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;display:flex;align-items:flex-start;justify-content:center;overflow:auto}
-.modalcard{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:5vh auto;max-width:1000px;width:92vw}
+.modalcard{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:5vh auto;max-width:1000px;width:92vw;box-shadow:0 8px 30px rgba(0,0,0,.45)}
 .modalcard .bar{margin:0}
+.msec{margin-top:14px}
+.msec>b{display:block;color:var(--cyan);font-size:12px;border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:8px}
+.mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:8px 14px}
+.mfield{display:flex;flex-direction:column;gap:3px;min-width:0}
+.mfield label{font-size:11px}
+.mfield input,.mfield select{width:100%;min-width:0}
+.mchips{display:flex;flex-wrap:wrap;gap:6px 16px}
+.mchips label{color:var(--fg)}
+.mchips input{vertical-align:-2px}
 #toast{position:fixed;right:14px;bottom:14px;max-width:420px}
 #toast div{margin-top:6px;padding:8px 12px;border-radius:8px;background:#20283a;border:1px solid var(--line)}
 label{color:var(--dim)}
@@ -112,7 +121,16 @@ label{color:var(--dim)}
  <div class=card id=c-msg></div>
 </section>
 
-<section id=s-info><div class=card><pre id=info-box class=dim>loading...</pre></div></section>
+<section id=s-info>
+ <div class=bar><button id=i-refresh>刷新</button><button id=i-testnow class=good>▶ 立即测试线路</button>
+  <span class=dim id=i-round></span><span class=dim>状态每4秒自动刷新</span></div>
+ <div class=card id=i-master></div>
+ <div class=card><b>线路测试状态</b><div style=overflow:auto><table id=i-lines></table></div></div>
+ <div class=card><b>托管代理进程</b><div style=overflow:auto><table id=i-prox></table></div></div>
+ <div class=card><b>进程 (router master 子进程树)</b><div style=overflow:auto><table id=i-procs></table></div></div>
+ <div class=card id=i-extwrap style="display:none"><b>外部代理进程 (非router托管: supervisord/手工)</b><div style=overflow:auto><table id=i-ext></table></div></div>
+ <div class=card><details><summary class=dim>原始JSON</summary><pre id=info-box class=dim></pre></details></div>
+</section>
 </main>
 <div id=toast></div>
 <script>
@@ -362,10 +380,12 @@ function openModal(title,buildFn,okLabel,onSave){
  document.onkeydown=function(e){if(e.key==="Escape")closeModal()};
  if(buildFn)buildFn(body);
  return body}
+function mgroup(body,title){var s=el("div","msec");s.appendChild(el("b","",title));body.appendChild(s);return s}
+function mgrid(parent){var g=el("div","mgrid");parent.appendChild(g);return g}
 function mfields(body,defs,cur){
  defs.forEach(function(d){
-  var k=d[0];var row=el("div");row.style.cssText="display:inline-block;margin:3px 14px 3px 0";
-  row.appendChild(el("label","dim",(d[1]||k)+" "));
+  var k=d[0];var row=el("div","mfield");
+  row.appendChild(el("label","dim",d[1]||k));
   var inp;
   if(d[2]=="select"){inp=document.createElement("select");
    var e0=el("option","","(无)");e0.value="";inp.appendChild(e0);
@@ -376,12 +396,12 @@ function mfields(body,defs,cur){
   else{inp=document.createElement("input");inp.type=d[2]=="num"?"number":"text";
    inp.value=cur[k]==null?"":String(cur[k]);if(d[4])inp.placeholder=d[4]}
   inp.dataset.fk=k;row.appendChild(inp);body.appendChild(row)})}
-function mbools(body,keys,cur){
- var row=el("div");row.style.marginTop="6px";
- keys.forEach(function(k){var lb=el("label");lb.style.marginRight="14px";
+function mbools(parent,keys,cur,labels){
+ var row=el("div","mchips");
+ keys.forEach(function(k){var lb=el("label");
   var cb=document.createElement("input");cb.type="checkbox";cb.dataset.fk=k;cb.checked=!!cur[k];
-  lb.appendChild(cb);lb.appendChild(document.createTextNode(" "+k));row.appendChild(lb)});
- body.appendChild(row)}
+  lb.appendChild(cb);lb.appendChild(document.createTextNode(" "+((labels&&labels[k])||k)));row.appendChild(lb)});
+ parent.appendChild(row);return row}
 function editProxy(name){
  var isNew=!name;
  var src=(CFG.proxy||{})[name]||{mark:nextMark(),weight:1,ipv4:true,ipv6:false};
@@ -390,25 +410,35 @@ function editProxy(name){
   uid:c.uid,server:c.server||c.proxy_ip,server_port:c.server_port,cipher:c.cipher,password:c.password,
   password_file:c.password_file,mode:c.mode,bind:c.bind,test_url:c.test_url,
   restart_max:(c.restart||{}).max,restart_window:(c.restart||{}).window};
- var lines=Object.keys(CFG.proxy||{}).filter(function(x){return x!=name});
- openModal(isNew?"新增线路":"编辑线路: "+name,function(body){
-  mfields(body,[
-   ["name","线路名","text"],["mark","fwmark","num"],["weight","权重","num"],
-   ["port","透明端口(空=ip-rule)","num"],
-   ["upstream","上游线路(chaining)","select",lines],
-   ["daemon","托管进程","select",["ss-redir","v2ray","sing-box","custom"]],
-   ["uid","运行用户","text"],["server","服务器地址","text"],["server_port","服务器端口","num"],
-   ["cipher","加密算法","text"],["password","密码(内联,ps可见慎用)","text"],
-   ["password_file","密码文件","text"],["mode","模式","select",["tcp","tcp_and_udp"]],
-   ["bind","bind ip:port","text"],["test_url","test_url","text"],
-   ["restart_max","重启上限","num"],["restart_window","重启窗口(秒)","num"]],cur);
-  mbools(body,["ipv4","ipv6","udp_v4","udp_v6","fullcone"],c);
-  mfields(body,[["autostart_x","托管自动启动","select",["true","false"]]],{autostart_x:String(c.autostart!==false)});
-  var adv=document.createElement("details");adv.style.marginTop="8px";
-  adv.appendChild(el("summary","dim","高级字段(其余键保留，可直接编辑JSON)"));
-  var ta=document.createElement("textarea");ta.className="padv";
-  ta.value=JSON.stringify(knownOnly(c,PROXY_COLS),null,2);ta.style.height="150px";
-  adv.appendChild(ta);body.appendChild(adv)},
+  var lines=Object.keys(CFG.proxy||{}).filter(function(x){return x!=name});
+  cur.autostart_x=String(c.autostart!==false);
+  var CAP_LABELS={ipv4:"IPv4",ipv6:"IPv6",udp_v4:"UDP v4",udp_v6:"UDP v6",fullcone:"FullCone"};
+  openModal(isNew?"新增线路":"编辑线路: "+name,function(body){
+   var g=mgrid(mgroup(body,"基本信息"));
+   mfields(g,[
+    ["name","线路名","text"],["mark","fwmark","num"],["weight","权重","num"],
+    ["port","透明端口(空=ip-rule)","num"],
+    ["upstream","上游线路(chaining)","select",lines]],cur);
+   g=mgrid(mgroup(body,"托管进程"));
+   mfields(g,[
+    ["daemon","托管进程","select",["ss-redir","v2ray","sing-box","custom"]],
+    ["uid","运行用户","text"],["autostart_x","自动启动","select",["true","false"]]],cur);
+   g=mgrid(mgroup(body,"服务端 / 协议"));
+   mfields(g,[
+    ["server","服务器地址","text"],["server_port","服务器端口","num"],
+    ["cipher","加密算法","text"],["password","密码(内联,ps可见慎用)","text"],
+    ["password_file","密码文件","text"],["mode","模式","select",["tcp","tcp_and_udp"]],
+    ["bind","bind ip:port","text"]],cur);
+   g=mgroup(body,"能力 / 探测");
+   mbools(g,["ipv4","ipv6","udp_v4","udp_v6","fullcone"],c,CAP_LABELS);
+   mfields(mgrid(g),[["test_url","探测 URL (test_url)","text"]],cur);
+   g=mgrid(mgroup(body,"重启抑制"));
+   mfields(g,[["restart_max","重启上限","num"],["restart_window","重启窗口(秒)","num"]],cur);
+   var adv=document.createElement("details");adv.style.marginTop="14px";
+   adv.appendChild(el("summary","dim","高级字段(其余键保留，可直接编辑JSON)"));
+   var ta=document.createElement("textarea");ta.className="padv";
+   ta.value=JSON.stringify(knownOnly(c,PROXY_COLS),null,2);ta.style.height="150px";
+   adv.appendChild(ta);body.appendChild(adv)},
  isNew?"创建":"保存线路",function(body){
   function g(k){var x=body.querySelector('[data-fk="'+k+'"]');return x?(x.value||"").trim():""}
   function gi(k){var v=g(k);return v===""?null:parseInt(v,10)}
@@ -496,15 +526,23 @@ function editCond(pi,line){
  var curf={any:cur.any?"true":""};
  LIST.forEach(function(k){curf[k]=(cur[k]||[]).join(", ")});
  openModal("条件编辑: 优先级 "+pi+" · "+line,function(body){
-  mfields(body,[["any","any(匹配全部)","select",["true"]]].concat(
-   LIST.map(function(k){return [k,k,"text",null,"逗号分隔多值"]})), curf);
-  var trow=el("div");trow.style.marginTop="8px";
+  var COND_LABELS={from:"源地址/网段 (from)",cidr:"目的网段 (cidr)",resolve:"域名 (resolve)",
+   country_code:"国家代码",country_name:"国家名",region_name:"省份/地区",city_name:"城市",
+   owner_domain:"归属域",isp_domain:"运营商域"};
+  function flds(arr,parent){mfields(parent,arr.map(function(k){
+   return [k,COND_LABELS[k]||k,"text",null,"逗号分隔多值"]}),curf)}
+  var g=mgrid(mgroup(body,"总控"));
+  mfields(g,[["any","any(匹配全部)","select",["true"]]],curf);
+  g=mgrid(mgroup(body,"地理匹配"));flds(["country_code","country_name","region_name","city_name"],g);
+  g=mgrid(mgroup(body,"网络匹配"));flds(["from","cidr","resolve"],g);
+  g=mgrid(mgroup(body,"域名匹配"));flds(["owner_domain","isp_domain"],g);
+  g=mgroup(body,"节点标签");var trow=el("div","mchips");
   [["anycast","ANYCAST"],["idc","IDC"],["base_station","基站"]].forEach(function(t){
-   var lb=el("label");lb.style.marginRight="16px";
+   var lb=el("label");
    var cb=document.createElement("input");cb.type="checkbox";cb.dataset.key=t[0];
    cb.checked=!!(cur[t[0]]&&cur[t[0]].length);
    lb.appendChild(cb);lb.appendChild(document.createTextNode(" "+t[0]+" ("+t[1]+")"));trow.appendChild(lb)});
-  body.appendChild(trow)},
+  g.appendChild(trow)},
  "保存条件",function(body){
   function g(k){var x=body.querySelector('[data-fk="'+k+'"]');return x?(x.value||"").trim():""}
   var out={};
@@ -541,11 +579,77 @@ $("c-save").onclick=function(){var cfg;try{cfg=JSON.parse($("c-box").value)}catc
 loadCfg();
 
 // ---------- status ----------
-function loadInfo(){api("/api/status").then(function(d){$("info-box").textContent=JSON.stringify(d,null,2)}).catch(function(e){$("info-box").textContent=e})}
+function lvl(v){if(v==null||isNaN(v))return"⚫";if(v<0)return"🔴";if(v<=0)return"⚫";
+ if(v<=0.1)return"🟢";if(v<=0.2)return"🔵";if(v<=0.4)return"🟣";if(v<=0.6)return"🟡";if(v<=0.8)return"🟠";return"🟤"}
+function ago(t){if(t==null)return"-";var s=Math.max(0,Date.now()/1000-t);
+ return s<90?Math.round(s)+"s前":s<5400?Math.round(s/60)+"m前":Math.round(s/3600)+"h前"}
+function tdTb(tbl,rows){var t=$(tbl);t.innerHTML="";if(t.tHead)t.tHead.remove();return t}
+function putRows(t,cols,rows){
+ var th=document.createElement("thead");var tr=document.createElement("tr");
+ cols.forEach(function(c){tr.appendChild(el("th","",c))});th.appendChild(tr);t.appendChild(th);
+ var tb=document.createElement("tbody");
+ rows.forEach(function(r){var tr=el("tr");r.forEach(function(c){
+   if(c&&c.nodeType)tr.appendChild(c);else tr.appendChild(el("td","",c==null?"":String(c)))});tb.appendChild(tr)});
+ t.appendChild(tb)}
+function loadInfo(){api("/api/health").then(function(d){
+ $("info-box").textContent=JSON.stringify(d,null,2);
+ var m=d.master||{};
+ var mw=$("i-master");mw.innerHTML="";
+ var line1=el("div");line1.appendChild(el("b","",(m.status==="down"||!m.pid)?"主进程: 未运行":"主进程运行中"));
+ line1.appendChild(el("span","dim","  pid="+(m.pid||"-")+" state="+(m.status||"-")+
+   " uptime="+Math.round((m.uptime||0)/60)+"min rss="+(m.rss_mb||"?")+"MB threads="+(m.threads||"?")+" 子进程="+(m.children||"?")));
+ mw.appendChild(line1);
+ var w=d.webadmin||{};
+ var line2=el("div","dim","webadmin: pid "+w.pid+" · 运行 "+Math.round((w.uptime||0)/60)+"min · WS客户端 "+(w.ws_clients||0)+
+  " · 环形 "+(w.ring||0)+"/1000 · redis流:"+(w.redis_stream?"连接":"断开"));
+ line2.style.color="var(--dim)";mw.appendChild(line2);
+ // test tab
+ var t=d.test||{};
+ $("i-round").textContent=t.round_at?("上轮测试 "+ago(t.round_at)):(t.error?("test读取失败:"+t.error):"暂无测试数据");
+ if(t.pending_now){var pn=el("span","warn"," ⏳ 测试请求已提交，等待主进程...");pn&&($("i-round").appendChild(pn))}
+ var lt=$("i-lines");lt.innerHTML="";
+ var proxy_cfg={};(d.proxies&&d.proxies.managed||[]).forEach(function(p){proxy_cfg[p.managed]=p});
+ var names={};Object.keys(t.v4||{}).forEach(function(k){names[k]=1});Object.keys(t.v6||{}).forEach(function(k){names[k]=1});
+ var rows=[];Object.keys(names).sort().forEach(function(k){
+  var v4=(t.v4||{})[k],v6=(t.v6||{})[k];
+  function fmt(ms){return ms==null||isNaN(ms)?"⚫":(ms<0?"失败":(ms<10?Math.round(ms*1000)+"ms":ms.toFixed(1)+"s"))}
+  rows.push([k,v4?el("span","",lvl(v4.ms)+" "+fmt(v4.ms)):"⚫",
+   v6?el("span","",lvl(v6.ms)+" "+fmt(v6.ms)):"⚫",
+   (v4&&v4.ip)||"",v6&&v6.ip&&v6.ip!==v4.ip?v6.ip:"",ago(t.round_at)])});
+ if(rows.length)putRows(lt,["线路","IPv4","IPv6","探测IP(v4)","探测IP(v6)","时间"],rows);
+ else lt.appendChild(el("div","dim","无测试数据(线路缺少test_url或router未跑过测试轮)"));
+ // managed proxies
+ var mp=(d.proxies&&d.proxies.managed)||[];
+ var pr=$("i-prox");pr.innerHTML="";
+ var prows=mp.map(function(p){var st=p.state||"-";
+  return [p.managed,p.daemon||"",(p.port?(":"+p.port):"ip-rule"),p.upstream?("→ "+p.upstream):"",
+   el("span",st.indexOf("running")>=0?"good":(st==="not running"?"bad":"dim"),st),
+   p.pid||"",p.uptime!=null?Math.round(p.uptime/60)+"m":"",p.cpu!=null?p.cpu+"%":""]});
+ if(prows.length)putRows(pr,["线路","daemon","端口","上游","状态","pid","运行","cpu"],prows);
+ else pr.appendChild(el("div","dim","无托管代理(配置加 daemon 字段后接管)"));
+ // workers tree
+ var wks=d.workers||[];var pt=$("i-procs");pt.innerHTML="";
+ putRows(pt,["类型","pid","状态","cpu","rss MB","运行min","cmd"],
+  [ [ "🅳 DNS", (d.dns&&d.dns.pid)||"-", (d.dns&&d.dns.status)||"missing",
+      (d.dns&&d.dns.cpu!=null)?d.dns.cpu+"%":"", (d.dns&&d.dns.rss_mb)||"",
+      (d.dns&&d.dns.uptime!=null)?Math.round(d.dns.uptime/60):"", (d.dns&&d.dns.name)||"" ] ]
+  .concat(wks.map(function(w){return [w.kind==="proxy"?"🅿 proxy":"🆆 worker",w.pid,w.status,w.cpu!=null?w.cpu+"%":"",
+      w.rss_mb||"",w.uptime!=null?Math.round(w.uptime/60):"",w.name]})));
+ var ext=(d.proxies&&d.proxies.external)||[];
+ $("i-extwrap").style.display=ext.length?"block":"none";
+ if(ext.length)putRows($("i-ext"),["pid","ppid","user","cmd"],ext.map(function(e){return[e.pid,e.ppid,e.user,e.cmd]}));
+ if(d.error){var er=el("div","bad","health: "+d.error);$("i-master").appendChild(er)}
+ }).catch(function(e){$("i-round").textContent="health 加载失败: "+e})}
+$("i-refresh").onclick=loadInfo;
+$("i-testnow").onclick=function(){
+ api("/api/test_now",{method:"POST"}).then(function(r){
+  toast(r.ok?"已请求立即测试线路（轮询周期1s，稍候看结果）":"触发失败: "+(r.error||""),r.ok?"good":"bad");
+  setTimeout(loadInfo,5000);setTimeout(loadInfo,12000);
+ }).catch(function(e){toast("请求失败 "+e,"bad")})};
 setInterval(function(){api("/api/status").then(function(d){
  $("d-master").className="dot "+(d.master&&d.master.alive&&d.master.is_router?"on":"err");
  $("d-redis").className="dot "+(d.redis_stream?"on":"err");
- if($("s-info").classList.contains("sel"))$("info-box").textContent=JSON.stringify(d,null,2)}).catch(function(){})},4000);
+ if($("s-info").classList.contains("sel"))loadInfo()}).catch(function(){})},4000);
 loadBind();
 </script></body></html>
 """
