@@ -173,6 +173,40 @@ def mangle_type(n):
     print("    created:", dump_chain(n))
 
 
+@case
+def ctrl_filter_prio_mangle(n):
+    """CONTROL: a FILTER chain at prio -150 (same number route uses) with
+    policy accept. If this PASSES but route@-150 crashes, the priority value is
+    innocent and the crash is specific to the ROUTE type / its policy field."""
+    mktable(n)
+    rc, _, err = add_chain(n, base(type="filter", hook="output", prio=-150, policy="accept"))
+    assert rc == 0, "filter@-150 control failed: %s" % err
+    print("    created:", dump_chain(n))
+
+
+@case
+def route_flat_no_policy(n):
+    """PRIME HYPOTHESIS: the crash is the `policy` key on a ROUTE chain (a route
+    chain has no accept/drop verdict semantics; the parser may NULL-deref while
+    resolving it). Create route WITHOUT the policy field, everything else
+    identical to the crashing form. If THIS passes, the fix is: drop policy=accept."""
+    mktable(n)
+    rc, _, err = add_chain(n, {"family": FAMILY, "table": TABLE, "name": CHAIN,
+                               "type": "route", "hook": "output", "prio": -150})
+    assert rc == 0, "route flat NO-policy failed: %s" % err
+    print("    created:", dump_chain(n))
+
+
+@case
+def route_nested_no_policy(n):
+    mktable(n)
+    rc, _, err = add_chain(n, {"family": FAMILY, "table": TABLE, "name": CHAIN,
+                               "type": "route",
+                               "hook": {"hook": "output", "priority": -150}})
+    assert rc == 0, "route nested NO-policy failed: %s" % err
+    print("    created:", dump_chain(n))
+
+
 # --------------------------------------------------------------------------- #
 # stamp-RULE forms, each first creating a route chain via whichever form works
 # --------------------------------------------------------------------------- #
@@ -180,12 +214,25 @@ def _make_route_chain(n, which="nested"):
     mktable(n)
     if which == "flat":
         rc, _, err = add_chain(n, base(type="route", hook="output", prio=-150, policy="accept"))
+    elif which == "flat_nopolicy":
+        rc, _, err = add_chain(n, {"family": FAMILY, "table": TABLE, "name": CHAIN,
+                                   "type": "route", "hook": "output", "prio": -150})
     else:
         rc, _, err = add_chain(n, base(type="route",
                                        hook={"hook": "output", "priority": -150, "policy": "accept"}))
     if rc != 0:
         raise RuntimeError("route chain (%s) create failed: %s" % (which, err))
     return n
+
+
+@case
+def stamp_in_route_flat_nopolicy(n):
+    """END-TO-END of the fix hypothesis: create route chain WITHOUT policy, then
+    insert the real stamp body. PASS here == ready to merge back."""
+    _make_route_chain(n, "flat_nopolicy")
+    rc, _, err = add_rule(n)
+    assert rc == 0, "stamp into route (flat, no-policy) failed: %s" % err
+    print("    created:", dump_chain(n))
 
 
 @case
