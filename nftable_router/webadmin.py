@@ -538,21 +538,98 @@ def _mtr_parse(text):
     return hops
 
 
-def mtr_job_run(jid, argv, env, hard_to):
-    j = mtr_jobs[jid]
+def _num(tok):
     try:
-        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           env=env, timeout=hard_to)
-        text = p.stdout.decode("utf-8", "replace")
-        j.update({"status": "done", "rc": p.returncode, "raw": text,
-                  "hops": _mtr_parse(text), "ms": int((time.time() - j["started"]) * 1000)})
-    except subprocess.TimeoutExpired:
-        j.update({"status": "timeout", "raw": j.get("raw", "") + "\n[hard timeout]", "hops": []})
+        return float(str(tok).rstrip("%"))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _agg_merge(agg, hops):
+    """merge one pass hop-list into cumulative agg {hop: {...}}"""
+    for h in hops:
+        a = agg.setdefault(h["hop"], {"host": h["host"], "snt": 0, "lost": 0.0,
+                                      "best": 1e9, "wrst": 0.0, "avgw": 0.0, "last": h["last"]})
+        if h["host"] and h["host"] != "???":
+            a["host"] = h["host"]
+        snt = _num(h["snt"])
+        loss = _num(h["loss"])
+        a["snt"] += snt
+        a["lost"] += snt * loss / 100.0
+        last, avg, best, wrst = _num(h["last"]), _num(h["avg"]), _num(h["best"]), _num(h["wrst"])
+        a["avgw"] += avg * snt
+        if 0 < best < a["best"]:
+            a["best"] = best
+        if wrst > a["wrst"]:
+            a["wrst"] = wrst
+        a["last"] = last
+
+
+def _agg_rows(agg):
+    def key(h):
+        try:
+            return int(h)
+        except ValueError:
+            return 999
+    rows = []
+    for hop in sorted(agg, key=key):
+        a = agg[hop]
+        snt = a["snt"] or 1
+        rows.append({"hop": hop, "host": a["host"],
+                     "loss": "%.1f%%" % (100.0 * a["lost"] / snt),
+                     "snt": "%d" % snt, "last": "%.1f" % a["last"],
+                     "avg": "%.1f" % (a["avgw"] / snt),
+                     "best": ("%.1f" % a["best"]) if a["best"] < 1e9 else "0.0",
+                     "wrst": "%.1f" % a["wrst"], "stdev": ""})
+    return rows
+
+
+def _mtr_broadcast(obj):
+    raw = json.dumps(obj).encode("utf-8")
+    _MTR_HUB.broadcast(raw)
+
+
+_MTR_HUB = Hub()
+
+
+def mtr_job_run(jid, base_argv, env, hard_to, total_passes):
+    j = mtr_jobs[jid]
+    agg = {}
+    raw_last = ""
+    t0 = time.time()
+    try:
+        for k in range(1, total_passes + 1):
+            argv = base_argv + ["--report-cycles", "1"]
+            try:
+                p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   env=env, timeout=hard_to)
+                text = p.stdout.decode("utf-8", "replace")
+            except subprocess.TimeoutExpired:
+                text = "[pass %d timeout]" % k
+            except Exception as e:
+                text = "[pass %d error: %s]" % (k, e)
+            raw_last = text
+            hops = _mtr_parse(text)
+            _agg_merge(agg, hops)
+            rows = _agg_rows(agg)
+            j.update({"status": "running", "pass": k, "total": total_passes,
+                      "hops": rows, "raw": raw_last,
+                      "ms": int((time.time() - t0) * 1000)})
+            _mtr_broadcast({"t": "mtr", "id": jid, "status": "running", "pass": k,
+                            "total": total_passes, "hops": rows,
+                            "ms": j["ms"], "target": j["target"], "line": j["line"],
+                            "mark": j["mark"]})
+        j.update({"status": "done", "rc": 0,
+                  "ms": int((time.time() - t0) * 1000)})
     except Exception as e:
-        j.update({"status": "error", "error": str(e), "hops": []})
+        j.update({"status": "error", "error": str(e)})
     finally:
         with MTR_LOCK:
             mtr_running[0] -= 1
+        _mtr_broadcast({"t": "mtr", "id": jid, "status": j["status"],
+                        "pass": j.get("pass", 0), "total": total_passes,
+                        "hops": j.get("hops", []), "ms": j.get("ms"),
+                        "target": j["target"], "line": j["line"], "mark": j["mark"]})
 
 
 def mtr_start(body, cfg):
@@ -571,13 +648,13 @@ def mtr_start(body, cfg):
         mark = lines[line]["mark"]
     binm = mtr_find_bin()
     env = dict(os.environ)
-    argv = [binm, "-n", "--report", "--report-cycles", str(cycles),
-            "-m", str(maxttl), "-i", str(interval), tgt]
+    argv = [binm, "-n", "-r", "-m", str(maxttl), "-i", str(interval), "-G", "2", tgt]
     fam = str(body.get("family", "auto"))
-    if fam == "4" or (fam == "auto" and ":" not in tgt):
-        if fam == "4":
-            argv.insert(1, "-4")
-    if fam == "6" or (fam == "auto" and ":" in tgt):
+    if fam == "4":
+        argv.insert(1, "-4")
+    elif fam == "6":
+        argv.insert(1, "-6")
+    elif ":" in tgt:
         argv.insert(1, "-6")
     if mark:
         so, err = ensure_markso()
@@ -596,9 +673,56 @@ def mtr_start(body, cfg):
             for k in sorted(mtr_jobs, key=lambda x: mtr_jobs[x]["started"])[:len(mtr_jobs) - 50]:
                 if mtr_jobs[k]["status"] != "running":
                     del mtr_jobs[k]
-    hard_to = cycles * interval + maxttl * 3 + 15
-    threading.Thread(target=mtr_job_run, args=(jid, argv, env, hard_to), daemon=True).start()
+    hard_to = maxttl * (interval + 3) + 10
+    threading.Thread(target=mtr_job_run,
+                     args=(jid, argv, env, hard_to, cycles), daemon=True).start()
     return {"ok": True, "id": jid}
+
+
+
+# ---------------------------------------------------------------------------
+# geoip (SAME ipdb library + database as the router policy engine)
+# ---------------------------------------------------------------------------
+_geo = {"db": None, "tried": False, "error": None}
+
+
+def geo_db(cfg_path):
+    if _geo["db"] is not None or _geo["tried"]:
+        return _geo["db"]
+    _geo["tried"] = True
+    try:
+        import ipdb
+        cfg = ib.load_config(cfg_path)
+        path = cfg.get("ipdb_v4")
+        if not path or not os.path.exists(path):
+            _geo["error"] = "ipdb file not found"
+            return None
+        _geo["db"] = ipdb.City(path)
+    except Exception as e:
+        _geo["error"] = str(e)
+        return None
+    return _geo["db"]
+
+
+def geo_lookup(cfg_path, ips):
+    db = geo_db(cfg_path)
+    out = {}
+    if db is None:
+        return {"ok": False, "error": _geo["error"] or "ipdb unavailable", "geo": {}}
+    for ip in ips[:200]:
+        try:
+            g = db.find_map(ip, "CN")
+        except Exception:
+            g = None
+        if not g:
+            out[ip] = None
+            continue
+        out[ip] = {"cc": g.get("country_code") or "", "cn": g.get("country_name") or "",
+                   "rg": g.get("region_name") or "", "ct": g.get("city_name") or "",
+                   "isp": g.get("isp_domain") or "",
+                   "ac": 1 if g.get("anycast") == "ANYCAST" else 0,
+                   "idc": 1 if g.get("idc") == "IDC" else 0}
+    return {"ok": True, "geo": out}
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +824,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200 if jid in mtr_jobs else 404, mtr_jobs.get(jid, {"status": "gone"}))
         elif path == "/api/mtr/jobs":
             self.send_json(200, sorted(mtr_jobs.values(), key=lambda j: -j["started"])[:20])
+        elif path == "/api/geo":
+            q = parse_qs(urlparse(self.path).query)
+            ips = (q.get("ips", [""])[0] or "").replace(",", " ").split()
+            self.send_json(200, geo_lookup(self.cfg_path(), ips))
         elif path == "/api/health":
             try:
                 self.send_json(200, health_snapshot(self.app))
@@ -823,6 +951,7 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         q = Queue(maxsize=CLIENT_QMAX)
         self.app.hub.add(q)
+        _MTR_HUB.add(q)          # live mtr progress frames on the same socket
         parser = WSParser()
         try:
             conn.sendall(ws_encode(json.dumps({"t": "hello", "server": "nft-route webadmin"})))
@@ -857,6 +986,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             self.app.hub.remove(q)
+            _MTR_HUB.remove(q)
             try:
                 conn.sendall(ws_encode(b"", opcode=0x8))
             except OSError:

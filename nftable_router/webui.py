@@ -265,6 +265,9 @@ function connect(){
   var m;try{m=JSON.parse(ev.data)}catch(e){return}
   if(m.t=="snap"){rows=m.rows.slice(-MAXROWS);evtTotal+=rows.length;rerender();
    $("n-evt").textContent=evtTotal;return}
+  if(m.t=="mtr"){if(window.__mtr_id&&String(m.id)===String(window.__mtr_id)){
+    window.__mtr_last=m;renderJob(m);
+    if(m.status!=="running"){if(mtrTimer){clearInterval(mtrTimer);mtrTimer=null}loadJobs()}}return}
   if(m.t=="hello"||!m.dst)return;
   push(m)}}
 connect();
@@ -617,19 +620,36 @@ function loadMtrLines(){api("/api/mtr/lines").then(function(d){
  if(!d.mtr_bin||!d.mtr_bin.length)$("m-err").textContent="mtr 未安装";
  $("m-err").textContent=d.ok===false?("加载失败: "+d.error):"";
 }).catch(function(e){$("m-err").textContent="lines: "+e})}
-function renderJob(j){
+var mtrGeo={},mtrGeoPend={};
+function geoTxt(ip){var g=mtrGeo[ip];if(!g)return g===null?"-":"…";
+ var s=(g.cc?flagOf(g.cc)+" ":"")+(g.cn||"");
+ if(g.rg&&g.rg!==g.cn)s+=" "+g.rg;
+ if(g.isp)s+=" · "+g.isp;
+ if(g.idc)s+=" [IDC]";if(g.ac)s+=" [任播]";
+ return s}
+function ensureGeo(j){
+ var ips=[];(j.hops||[]).forEach(function(h){if(/^\d+\.\d+\.\d+\.\d+$/.test(h.host)&&!(h.host in mtrGeo)&&!(h.host in mtrGeoPend))ips.push(h.host)});
+ if(!ips.length)return;
+ ips.forEach(function(x){mtrGeoPend[x]=1});
+ api("/api/geo?ips="+ips.join(",")).then(function(d){
+  Object.keys(d.geo||{}).forEach(function(k){mtrGeo[k]=d.geo[k];delete mtrGeoPend[k]});
+  if(window.__mtr_last&&String(window.__mtr_last.target)===String(j.target))renderJob(window.__mtr_last,true)
+ }).catch(function(){ips.forEach(function(x){delete mtrGeoPend[x]})})}
+function renderJob(j,nogeo){
+ if(!nogeo&&j.hops)window.__mtr_geojob=j,ensureGeo(j);
  var box=$("m-result");box.innerHTML="";
  var h1=el("div");h1.appendChild(el("b","",(j.line||"")+"  →  "+(j.target||"")+"  "));
- h1.appendChild(el("span","dim","status="+(j.status||"")+(j.ms?(" · "+j.ms+"ms"):"")+(j.mark?(" · mark 0x"+j.mark.toString(16)):"")));
+ h1.appendChild(el("span","dim","status="+(j.status||"")+(j.total?(" · 轮 "+(j.pass||0)+"/"+j.total):"")+(j.ms?(" · "+j.ms+"ms"):"")+(j.mark?(" · mark 0x"+j.mark.toString(16)):"")));
  box.appendChild(h1);
  if(j.error)box.appendChild(el("div","bad",String(j.error)));
- if(j.status==="running"){box.appendChild(el("div","warn","探测运行中..."));return}
  if(j.hops&&j.hops.length){
   var rows=j.hops.map(function(h){var loss=parseFloat(h.loss)||0;
-   return [h.hop,el("span",loss>=100?"bad":(loss>0?"warn":"good"),h.host),h.loss,h.snt,h.last,h.avg,h.best,h.wrst,h.stdev]});
+   return [h.hop,el("span",loss>=100?"bad":(loss>0?"warn":"good"),h.host),
+    el("span","dim",geoTxt(h.host)),h.loss,h.snt,h.last,h.avg,h.best,h.wrst,h.stdev]});
   var t=el("table");t.style.marginTop="6px";
-  putRows(t,["跳","主机","丢包","发","最近","平均","最佳","最差","σ"],rows);
+  putRows(t,["跳","主机","地理","丢包","发","最近","平均","最佳","最差","σ"],rows);
   box.appendChild(t)}
+ else if(j.status==="running"){box.appendChild(el("div","warn","探测运行中..."))}
  if(j.raw){var det=el("details");det.style.marginTop="8px";
   det.appendChild(el("summary","dim","原始输出"));
   det.appendChild(el("pre","dim",j.raw));box.appendChild(det)}}
@@ -642,10 +662,11 @@ $("m-run").onclick=function(){
    interval:parseFloat($("m-int").value)||0.2,family:$("m-fam").value})}).then(function(r){
     if(!r.ok)return toast(String(r.error),"bad");
     toast("MTR任务 #"+r.id+" 已启动","good");
+    window.__mtr_id=r.id;window.__mtr_last=null;
     if(mtrTimer)clearInterval(mtrTimer);
-    mtrTimer=setInterval(function(){
-     api("/api/mtr/job/"+r.id).then(function(j){renderJob(j);
-      if(j.status!=="running"){clearInterval(mtrTimer);mtrTimer=null;loadJobs()}}).catch(function(){})},900)
+    mtrTimer=setInterval(function(){          // fallback when WS silent
+     api("/api/mtr/job/"+r.id).then(function(j){if(!window.__mtr_last)renderJob(j);
+      if(j.status!=="running"){clearInterval(mtrTimer);mtrTimer=null;loadJobs()}}).catch(function(){})},2500)
    }).catch(function(e){toast("请求失败 "+e,"bad")})};
 function loadJobs(){api("/api/mtr/jobs").then(function(list){
  var t=$("m-history");t.innerHTML="";
