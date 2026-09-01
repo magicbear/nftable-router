@@ -772,8 +772,12 @@ def install_proxy_chain_rules():
         except ValueError as e:
             print("      [%s] BUILD ERROR: %s" % (n, e))
             continue
-        where = ("via -> %s" % up) if up else ("direct: %s:%s" % (cfg.get("server") or cfg.get("proxy_ip"),
-                                                                  cfg.get("server_port", "-")))
+        if up:
+            kind = pmm.upstream_kind(config["proxy"], up) if hasattr(pmm, "upstream_kind") else None
+            where = ("via -> %s (%s)" % (up, "tproxy redirect :%s" % config["proxy"][up].get("port")
+                        if kind == "port" else "ip-rule mark %s" % config["proxy"][up].get("mark")))
+        else:
+            where = "direct: %s:%s" % (cfg.get("server") or cfg.get("proxy_ip"), cfg.get("server_port", "-"))
         print("      [%-12s] %-8s :%-6s %s  uid=%s  cmd=%s" % (
             n, cfg.get("daemon"), cfg.get("port"), where,
             uid_cache.get(n), " ".join(pmm.redact(argv))))
@@ -1967,6 +1971,7 @@ if __name__ == "__main__":
     fcnat_cleaner = None
 
     t_dns_clean = 0
+    t_print = 0
     t_iprule = 0
     t_webadmin = 0
     queue_stdin = []
