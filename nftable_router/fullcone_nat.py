@@ -75,7 +75,7 @@ class FullConeNAT_Listener(Process):
         while not self.term.value:
             try:
                 if self.r is None:
-                    self.r = redis.Redis(host='127.0.0.1', port=6379, db=1)
+                    self.r = redis.Redis(host='127.0.0.1', port=6379, db=1, socket_timeout=3, socket_connect_timeout=3)
                     sub = self.r.pubsub()
                 sub.subscribe('fullcone_nat')
                 for message in sub.listen():
@@ -122,7 +122,7 @@ class FullConeNAT_Worker(Process):
         signal.signal(signal.SIGQUIT, self.quit)
         nfu = nftUtils()
         prctl.set_proctitle("Policy Route - Full Cone NAT Cleaner")
-        self.r = redis.Redis(host='127.0.0.1', port=6379, db=1)
+        self.r = redis.Redis(host='127.0.0.1', port=6379, db=1, socket_timeout=3, socket_connect_timeout=3)
         nat_table = self.r.get("fullcone_nat_table")
         if nat_table is None:
             counter_cache = {}

@@ -35,7 +35,8 @@ from nftable_router.dns import *
 from nftable_router.fullcone_nat import *
 from pytput import TputFormatter
 import subprocess, urllib, psutil
-from queue import Queue
+from queue import Queue, Empty
+from contextlib import contextmanager
 import traceback
 import itertools
 import prctl, tty, termios
@@ -55,6 +56,30 @@ if g_parallel_process <= 16:
     g_parallel_process = 16
 g_lock = Lock()
 g_io_lock = Lock()
+
+
+@contextmanager
+def timed_lock(lock, timeout=2.0):
+    got = lock.acquire(timeout=timeout)
+    try:
+        yield got
+    finally:
+        # Only release if we actually acquired it; releasing a lock we do not
+        # own would corrupt the semaphore and break mutual exclusion for every
+        # other process/thread waiting on it.
+        if got:
+            lock.release()
+
+
+def run_cmd_capture(args, timeout):
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, shell=False)
+    try:
+        out = proc.communicate(timeout=timeout)[0]
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out = proc.communicate()[0]
+    return out.decode('utf-8')
+
 g_test_ip = Array(ctypes.c_wchar, 40)
 g_test_proxy_id = Value('i', -1)
 g_running_process = Value('i', 0)
@@ -88,7 +113,7 @@ class TestThread(threading.Thread):
         self.test_mark = None
         self.test_proxy_id = None
         self.last_check = None
-        self.r = redis.Redis(host='127.0.0.1', port=6379, db=1)
+        self.r = redis.Redis(host='127.0.0.1', port=6379, db=1, socket_timeout=3, socket_connect_timeout=3)
 
     def run(self):
         global config, g_test_ip, g_test_proxy_id, g_dead_proxy_ipv4, g_dead_proxy_ipv6
@@ -108,10 +133,9 @@ class TestThread(threading.Thread):
             for proxy_id in config['proxy']:
                 proxy = config['proxy'][proxy_id]
                 if 'test_url' not in proxy:
-                    g_lock.acquire()
-                    g_dead_proxy_ipv4[proxy_id].value = 0
-                    g_dead_proxy_ipv6[proxy_id].value = 0
-                    g_lock.release()
+                    with timed_lock(g_lock):
+                        g_dead_proxy_ipv4[proxy_id].value = 0
+                        g_dead_proxy_ipv6[proxy_id].value = 0
                     continue
 
                 parse_path = urllib.parse.urlparse(proxy['test_url'])
@@ -133,10 +157,9 @@ class TestThread(threading.Thread):
                                 self.test_proxy_id = proxy_id
                                 self.test_mark = proxy['mark']
                                 self.test_ip = pxy_ip
-                                g_lock.acquire()
-                                g_test_ip[0:len(pxy_ip) + 1] = pxy_ip + "\0"
-                                g_test_proxy_id.value = g_proxy_index.index(proxy_id)
-                                g_lock.release()
+                                with timed_lock(g_lock):
+                                    g_test_ip[0:len(pxy_ip) + 1] = pxy_ip + "\0"
+                                    g_test_proxy_id.value = g_proxy_index.index(proxy_id)
 
                             # if "bind" in proxy:
                             #     digParams.append("-b")
@@ -145,8 +168,7 @@ class TestThread(threading.Thread):
 
                             # print(proxy_id, i, " ".join(digParams))
                             # time.sleep(0.1)
-                            pdig = subprocess.Popen(digParams, stdout=subprocess.PIPE, shell=False)
-                            dig_result = pdig.stdout.read().decode('utf-8').split("\n")
+                            dig_result = run_cmd_capture(digParams, 10).split("\n")
                             dig_index = 0
                             while dig_index < len(dig_result):
                                 try:
@@ -163,10 +185,9 @@ class TestThread(threading.Thread):
                             self.test_proxy_id = proxy_id
                             self.test_mark = proxy['mark']
                             self.test_ip = dig_result[i % len(dig_result)].strip()
-                            g_lock.acquire()
-                            g_test_ip[0:len(self.test_ip) + 1] = self.test_ip + "\0"
-                            g_test_proxy_id.value = g_proxy_index.index(proxy_id)
-                            g_lock.release()
+                            with timed_lock(g_lock):
+                                g_test_ip[0:len(self.test_ip) + 1] = self.test_ip + "\0"
+                                g_test_proxy_id.value = g_proxy_index.index(proxy_id)
 
                             curl_args = ["curl", "-%d" % ip_version, "-s", "-k", "-m", "1",
                                          "-o", "/dev/null",
@@ -176,8 +197,9 @@ class TestThread(threading.Thread):
                             # print(" ".join(curl_args))
 
                             # time.sleep(0.1)
-                            pcurl = subprocess.Popen(curl_args, stdout=subprocess.PIPE, shell=False)
-                            tquery = pcurl.stdout.read().decode('utf-8').split(" ")
+                            tquery = run_cmd_capture(curl_args, 5).split(" ")
+                            while len(tquery) < 2:
+                                tquery.append("000")
                             # print(tquery)
                             if tquery[1] == '200' or tquery[1] == '204' or tquery[1] == '301' or tquery[1] == '302':
                                 # print("[+] \033[38;5;157mProxy Check IPv%d %s OK\033[0m, time %s" % (
@@ -185,39 +207,36 @@ class TestThread(threading.Thread):
                                 test_result.append([proxy_id, ip_version, "%s %s" % (tquery[0], self.test_ip)])
                                 flog.write("%s: %s OK %s\n" % (datetime.now().isoformat(), proxy_id, tquery[0]))
                                 self.test_ip = None
-                                g_lock.acquire()
-                                if ip_version == 4:
-                                    g_dead_proxy_ipv4[proxy_id].value = float(tquery[0])
-                                else:
-                                    g_dead_proxy_ipv6[proxy_id].value = float(tquery[0])
-                                g_test_ip[0] = "\0"
-                                g_test_proxy_id.value = -1
-                                g_lock.release()
+                                with timed_lock(g_lock):
+                                    if ip_version == 4:
+                                        g_dead_proxy_ipv4[proxy_id].value = float(tquery[0])
+                                    else:
+                                        g_dead_proxy_ipv6[proxy_id].value = float(tquery[0])
+                                    g_test_ip[0] = "\0"
+                                    g_test_proxy_id.value = -1
                                 break
                             else:
                                 tested_ip.append(self.test_ip)
                                 # print("[-] \033[41mProxy Check IPv%d %s Failed\033[0m" % (ip_version, proxy_id))
                                 self.test_ip = None
-                                g_lock.acquire()
+                                with timed_lock(g_lock):
+                                    if ip_version == 4:
+                                        g_dead_proxy_ipv4[proxy_id].value = -1
+                                    else:
+                                        g_dead_proxy_ipv6[proxy_id].value = -1
+                                    g_test_ip[0] = "\0"
+                                    g_test_proxy_id.value = -1
+                        else:
+                            dig_result = None
+                            # print("[-] \033[41mProxy Check IPv%d %s Failed, DNS Resolve Failed\033[0m" % (ip_version, proxy_id))
+                            self.test_ip = None
+                            with timed_lock(g_lock):
                                 if ip_version == 4:
                                     g_dead_proxy_ipv4[proxy_id].value = -1
                                 else:
                                     g_dead_proxy_ipv6[proxy_id].value = -1
                                 g_test_ip[0] = "\0"
                                 g_test_proxy_id.value = -1
-                                g_lock.release()
-                        else:
-                            dig_result = None
-                            # print("[-] \033[41mProxy Check IPv%d %s Failed, DNS Resolve Failed\033[0m" % (ip_version, proxy_id))
-                            self.test_ip = None
-                            g_lock.acquire()
-                            if ip_version == 4:
-                                g_dead_proxy_ipv4[proxy_id].value = -1
-                            else:
-                                g_dead_proxy_ipv6[proxy_id].value = -1
-                            g_test_ip[0] = "\0"
-                            g_test_proxy_id.value = -1
-                            g_lock.release()
 
                     if dig_result is None:
                         test_result.append([proxy_id, ip_version, "-1 DNS"])
@@ -321,7 +340,7 @@ class ECMPThread(threading.Thread):
         while term.value == False:
             try:
                 if self.r is None:
-                    self.r = redis.Redis(host='127.0.0.1', port=6379, db=1)
+                    self.r = redis.Redis(host='127.0.0.1', port=6379, db=1, socket_timeout=3, socket_connect_timeout=3)
                     sub = self.r.pubsub()
 
                 sub.subscribe('ecmp_list')
@@ -465,7 +484,10 @@ class PrintResultThread(threading.Thread):
 
         self.r = None
         while not term.value:
-            rc = queue.get(True)
+            try:
+                rc = queue.get(True, 1)
+            except Empty:
+                continue
 
             #
             # if g_overload_flag.value:
@@ -485,189 +507,198 @@ class PrintResultThread(threading.Thread):
                 continue
 
             self.lock.acquire()
-            if rc is not None:
-                try:
-                    if self.r is None:
-                        self.r = redis.Redis(host='127.0.0.1', port=6379, db=1)
-
-                    if self.device_list is None:
-                        self.device_list = self.r.keys("MAC::TABLE::*")
-
-                    if rc.process_fullcone:
-                        self.r.publish("fullcone_nat", json.dumps({
-                            "ver": rc.pkt_version,
-                            "proto": rc.proto,
-                            "src": rc.src,
-                            "sport": rc.sport
-                        }))
-                except Exception as e:
-                    print(tf.format("{msg:s,bg_red,black}", msg="[-] PrintResult Thread Error: %s" % e))
-                    self.r = None
-
-                if isinstance(self.filter_ip, ipaddress.IPv4Network) or isinstance(self.filter_ip, ipaddress.IPv6Network):
-                    if (ipaddress.ip_address(rc.src) not in self.filter_ip and
-                            ipaddress.ip_address(rc.dst) not in self.filter_ip):
-                        self.lock.release()
-                        continue
-
-                geodata = rc.geodata
-                if geodata is None:
-                    geodata = db_v6.find_map(rc.dst, "CN")
-
-                if geodata is None:
-                    g_io_lock.acquire()
-                    print("[*] Connect to IP: %s => %15s FROM %s  Resolve: %.06f" % (
-                        rc.dst, rc.out_interface, rc.src, rc.t_total))
-                    g_io_lock.release()
-                else:
-                    if type(protos[rc.proto]) is dict:
-                        proto_str = tf.format("{proto:6s,%s,bold}" % (protos[rc.proto]['color']),
-                                              proto=protos[rc.proto]['name'])
-                    else:
-                        proto_str = protos[rc.proto] if rc.proto in protos else "%d" % rc.proto
-
+            try:
+                if rc is not None:
                     try:
-                        if geodata['anycast'] == "ANYCAST":
-                            flag_str = flag.flag('UN') + " "
-                        elif geodata['country_name'] == "局域网":
-                            flag_str = "💻"
+                        if self.r is None:
+                            self.r = redis.Redis(host='127.0.0.1', port=6379, db=1, socket_timeout=3, socket_connect_timeout=3)
+
+                        if self.device_list is None:
+                            self.device_list = self.r.keys("MAC::TABLE::*")
+
+                        if rc.process_fullcone:
+                            self.r.publish("fullcone_nat", json.dumps({
+                                "ver": rc.pkt_version,
+                                "proto": rc.proto,
+                                "src": rc.src,
+                                "sport": rc.sport
+                            }))
+                    except Exception as e:
+                        print(tf.format("{msg:s,bg_red,black}", msg="[-] PrintResult Thread Error: %s" % e))
+                        self.r = None
+
+                    if isinstance(self.filter_ip, ipaddress.IPv4Network) or isinstance(self.filter_ip, ipaddress.IPv6Network):
+                        if (ipaddress.ip_address(rc.src) not in self.filter_ip and
+                                ipaddress.ip_address(rc.dst) not in self.filter_ip):
+                            continue
+
+                    geodata = rc.geodata
+                    if geodata is None:
+                        try:
+                            geodata = db_v6.find_map(rc.dst, "CN")
+                        except Exception:
+                            geodata = None
+
+                    if geodata is None:
+                        with timed_lock(g_io_lock):
+                            print("[*] Connect to IP: %s => %15s FROM %s  Resolve: %.06f" % (
+                                rc.dst, rc.out_interface, rc.src, rc.t_total))
+                    else:
+                        proto_info = protos.get(rc.proto)
+                        if type(proto_info) is dict:
+                            proto_str = tf.format("{proto:6s,%s,bold}" % (proto_info['color']),
+                                                  proto=proto_info['name'])
                         else:
-                            flag_str = flag.flag(geodata["country_code"]) + " "
-                    except Exception as e:
-                        flag_str = "❌"
-                        pass
+                            proto_str = proto_info if proto_info is not None else "%d" % rc.proto
 
-                    if rc.test_session == 1:
-                        out_interface_color = tf.format("{out_interface:12s,purple,bold,dim}",
-                                                        out_interface=rc.out_interface)
-                    elif rc.test_session == 2:
-                        out_interface_color = tf.format("{out_interface:12s,green,bold,dim}",
-                                                        out_interface=rc.out_interface)
-                    elif rc.test_session == 3:
-                        out_interface_color = tf.format("{out_interface:12s,cyan,bold}",
-                                                        out_interface=rc.out_interface)
-                    else:
-                        out_interface_color = tf.format("{out_interface:12s}", out_interface=rc.out_interface)
-
-                    isp_string = tf.format("{country:3s,%s,bold}{region:s,cyan}{isp:12s,green}" % (
-                        "blue" if geodata["anycast"] == "ANYCAST" else "yellow"),
-                                           country=geodata['country_name'],
-                                           region=geodata["region_name"] if geodata["region_name"] != geodata[
-                                               "country_name"] else "",
-                                           isp=geodata["isp_domain"])
-
-                    try:
-                        resolve = dns_list[rc.dst]
-                    except KeyError:
-                        resolve = None
-
-                    ignorePrint = False
-                    if resolve is not None and 'ignore_print_domain' in config:
-                        for dns_item in resolve:
-                            if dns_item.qname in config['ignore_print_domain']:
-                                ignorePrint = True
-                                break
-
-                    if isinstance(self.filter_ip, str) and self.filter_ip != "":
-                        ignorePrint = True
-                        if resolve is not None:
-                            for dns_item in resolve:
-                                if self.filter_ip in dns_item.qname:
-                                    ignorePrint = False
-
-                    if ignorePrint:
-                        self.lock.release()
-                        continue
-
-                    # extra_string = "%02d:%02d:%02d %.2f ms (%.2f ms) Resolve: %s" % (
-                    #     datetime.now().hour, datetime.now().minute, datetime.now().second, rc.t_total, rc.t_init,
-                    #     ",".join({res.qname for res in resolve}) if resolve is not None else "")
-                    extra_string = "%.2f ms (%.2f ms) Resolve: %s" % (
-                        rc.t_total, rc.t_init,
-                        ",".join({res.qname for res in resolve}) if resolve is not None else "")
-                    try:
-                        if (rc.proto == 6 or rc.proto == 17) and rc.port == 53:
-                            pktObject = IP(rc.payload)
-                            if pktObject.haslayer(DNSQR):
-                                dns = pktObject[DNSQR]
-                                extra_string = "%02d:%02d:%02d %.2f ms (%.2f ms) Query Request: %s %d" % (
-                                    datetime.now().hour, datetime.now().minute, datetime.now().second,
-                                    rc.t_total, rc.t_init,
-                                    dns.qname.decode("utf-8"), dns.qtype)
-                    except Exception as e:
-                        pass
-                    src_interfaces = ""
-                    try:
-                        arp_record = self.r.hget("ARP::MAPPING", rc.src)
-                    except Exception as e:
-                        arp_record = None
-                        src_interfaces = tf.format("{error:30s,red,bold}", error="ERROR " + str(e))
-
-                    try:
-                        if arp_record is not None and self.device_list is not None:
-                            arp_record = json.loads(arp_record)
-                            for dev in self.device_list:
-                                mac_record = self.r.hget(dev, arp_record['mac'])
-                                if mac_record is not None:
-                                    mac_record = json.loads(mac_record)
-                                    if mac_record['ifName'][0:9] != "Eth-Trunk":
-                                        dev = dev[12:]  # len("MAC::TABLE::")
-                                        if re.match(r"^[A-Z]{4}\-[0-9]{2}", dev.decode('utf-8')):
-                                            dev = dev[8:]
-                                        if 'ifDescr' in mac_record and mac_record['ifDescr'] != "":
-                                            if mac_record['ifDescr'][0:3] == "To ":
-                                                mac_record['ifDescr'] = mac_record['ifDescr'][3:]
-                                            desc_len = 29 - len(dev) - int((len(
-                                                mac_record['ifDescr'].encode('utf-8')) - len(
-                                                mac_record['ifDescr'])) / 2)
-                                            if desc_len < 0:
-                                                desc_len = 0
-                                            src_interfaces = tf.format(
-                                                "{dev:s,cyan}:{interface:%ds,green,bold}" % desc_len,
-                                                dev=dev.decode("utf-8"),
-                                                interface=mac_record['ifDescr'][0:29 - len(dev.decode("utf-8"))])
-                                        else:
-                                            mac_record['ifName'] = mac_record['ifName'].replace("GigabitEthernet", "GE")
-                                            src_interfaces = tf.format(
-                                                "{dev:s,cyan}:{interface:%ds,green}" % (29 - len(dev)),
-                                                dev=dev.decode("utf-8"), interface=mac_record['ifName'])
-                        if src_interfaces == "":
-                            if arp_record is not None and 'ifName_L3' in arp_record:
-                                src_interfaces = tf.format("> {interface:28s,purple,bold}",
-                                                           interface=arp_record['ifName_L3'])
+                        try:
+                            if geodata['anycast'] == "ANYCAST":
+                                flag_str = flag.flag('UN') + " "
+                            elif geodata['country_name'] == "局域网":
+                                flag_str = "💻"
                             else:
-                                src_interfaces = " " * 30
-                    except Exception as e:
-                        src_interfaces = tf.format("{error:30s,red,bold}", error="ERROR " + str(e))
+                                flag_str = flag.flag(geodata["country_code"]) + " "
+                        except Exception as e:
+                            flag_str = "❌"
+                            pass
 
-                    if rc.test_session == 1:
-                        src_interfaces = tf.format("{dev:30s,yellow}", dev=" >> Check Alive Connection << ")
-                    if rc.test_session == 2:
-                        with g_cps_dup.get_lock():
-                            g_cps_dup.value += 1
-                    elif rc.test_session == 4:
-                        src_interfaces = tf.format("{dev:30s,cyan}", dev=" >> QoS Test Connection << ")
-                    else:
-                        with g_cps.get_lock():
-                            g_cps.value += 1
+                        if rc.test_session == 1:
+                            out_interface_color = tf.format("{out_interface:12s,purple,bold,dim}",
+                                                            out_interface=rc.out_interface)
+                        elif rc.test_session == 2:
+                            out_interface_color = tf.format("{out_interface:12s,green,bold,dim}",
+                                                            out_interface=rc.out_interface)
+                        elif rc.test_session == 3:
+                            out_interface_color = tf.format("{out_interface:12s,cyan,bold}",
+                                                            out_interface=rc.out_interface)
+                        else:
+                            out_interface_color = tf.format("{out_interface:12s}", out_interface=rc.out_interface)
 
-                    g_io_lock.acquire()
-                    print(
-                        "[*] %-6s: %s %15s [%s] -> %21s => %s\033[0m %1s %3d [%-50s] %2d %s%s" % (
-                            proto_str, flag_str,
-                            rc.src if rc.test_session != 1 else "",
-                            src_interfaces,
-                            tf.format("{dst:21s,cyan}", dst=rc.dst + ":%d" % (rc.port) if (
-                                    rc.proto == 6 or rc.proto == 17) else "") if rc.process_fullcone else "%s%s" % (
-                                rc.dst, ":%d" % (rc.port) if (rc.proto == 6 or rc.proto == 17) else ""),
-                            out_interface_color, "" if rc.matched_priority == -1 else rc.matched_priority, rc.mark,
-                            "", worker_id, extra_string + "\b" * (len(extra_string) + 52 + 3), isp_string))
-                    g_io_lock.release()
+                        isp_string = tf.format("{country:3s,%s,bold}{region:s,cyan}{isp:12s,green}" % (
+                            "blue" if geodata["anycast"] == "ANYCAST" else "yellow"),
+                                               country=geodata['country_name'],
+                                               region=geodata["region_name"] if geodata["region_name"] != geodata[
+                                                   "country_name"] else "",
+                                               isp=geodata["isp_domain"])
 
+                        try:
+                            resolve = dns_list[rc.dst]
+                        except KeyError:
+                            resolve = None
+
+                        ignorePrint = False
+                        if resolve is not None and 'ignore_print_domain' in config:
+                            for dns_item in resolve:
+                                if dns_item.qname in config['ignore_print_domain']:
+                                    ignorePrint = True
+                                    break
+
+                        if isinstance(self.filter_ip, str) and self.filter_ip != "":
+                            ignorePrint = True
+                            if resolve is not None:
+                                for dns_item in resolve:
+                                    if self.filter_ip in dns_item.qname:
+                                        ignorePrint = False
+
+                        if ignorePrint:
+                            continue
+
+                        # extra_string = "%02d:%02d:%02d %.2f ms (%.2f ms) Resolve: %s" % (
+                        #     datetime.now().hour, datetime.now().minute, datetime.now().second, rc.t_total, rc.t_init,
+                        #     ",".join({res.qname for res in resolve}) if resolve is not None else "")
+                        extra_string = "%.2f ms (%.2f ms) Resolve: %s" % (
+                            rc.t_total, rc.t_init,
+                            ",".join({res.qname for res in resolve}) if resolve is not None else "")
+                        try:
+                            if (rc.proto == 6 or rc.proto == 17) and rc.port == 53:
+                                pktObject = IP(rc.payload)
+                                if pktObject.haslayer(DNSQR):
+                                    dns = pktObject[DNSQR]
+                                    extra_string = "%02d:%02d:%02d %.2f ms (%.2f ms) Query Request: %s %d" % (
+                                        datetime.now().hour, datetime.now().minute, datetime.now().second,
+                                        rc.t_total, rc.t_init,
+                                        dns.qname.decode("utf-8"), dns.qtype)
+                        except Exception as e:
+                            pass
+                        src_interfaces = ""
+                        try:
+                            arp_record = self.r.hget("ARP::MAPPING", rc.src)
+                        except Exception as e:
+                            arp_record = None
+                            src_interfaces = tf.format("{error:30s,red,bold}", error="ERROR " + str(e))
+
+                        try:
+                            if arp_record is not None and self.device_list is not None:
+                                arp_record = json.loads(arp_record)
+                                for dev in self.device_list:
+                                    mac_record = self.r.hget(dev, arp_record['mac'])
+                                    if mac_record is not None:
+                                        mac_record = json.loads(mac_record)
+                                        if mac_record['ifName'][0:9] != "Eth-Trunk":
+                                            dev = dev[12:]  # len("MAC::TABLE::")
+                                            if re.match(r"^[A-Z]{4}\-[0-9]{2}", dev.decode('utf-8')):
+                                                dev = dev[8:]
+                                            if 'ifDescr' in mac_record and mac_record['ifDescr'] != "":
+                                                if mac_record['ifDescr'][0:3] == "To ":
+                                                    mac_record['ifDescr'] = mac_record['ifDescr'][3:]
+                                                desc_len = 29 - len(dev) - int((len(
+                                                    mac_record['ifDescr'].encode('utf-8')) - len(
+                                                    mac_record['ifDescr'])) / 2)
+                                                if desc_len < 0:
+                                                    desc_len = 0
+                                                src_interfaces = tf.format(
+                                                    "{dev:s,cyan}:{interface:%ds,green,bold}" % desc_len,
+                                                    dev=dev.decode("utf-8"),
+                                                    interface=mac_record['ifDescr'][0:29 - len(dev.decode("utf-8"))])
+                                            else:
+                                                mac_record['ifName'] = mac_record['ifName'].replace("GigabitEthernet", "GE")
+                                                src_interfaces = tf.format(
+                                                    "{dev:s,cyan}:{interface:%ds,green}" % (29 - len(dev)),
+                                                    dev=dev.decode("utf-8"), interface=mac_record['ifName'])
+                            if src_interfaces == "":
+                                if arp_record is not None and 'ifName_L3' in arp_record:
+                                    src_interfaces = tf.format("> {interface:28s,purple,bold}",
+                                                               interface=arp_record['ifName_L3'])
+                                else:
+                                    src_interfaces = " " * 30
+                        except Exception as e:
+                            src_interfaces = tf.format("{error:30s,red,bold}", error="ERROR " + str(e))
+
+                        if rc.test_session == 1:
+                            src_interfaces = tf.format("{dev:30s,yellow}", dev=" >> Check Alive Connection << ")
+                        if rc.test_session == 2:
+                            with g_cps_dup.get_lock():
+                                g_cps_dup.value += 1
+                        elif rc.test_session == 4:
+                            src_interfaces = tf.format("{dev:30s,cyan}", dev=" >> QoS Test Connection << ")
+                        else:
+                            with g_cps.get_lock():
+                                g_cps.value += 1
+
+                        g_io_lock.acquire()
+                        try:
+                            print(
+                                "[*] %-6s: %s %15s [%s] -> %21s => %s\033[0m %1s %3d [%-50s] %2d %s%s" % (
+                                    proto_str, flag_str,
+                                    rc.src if rc.test_session != 1 else "",
+                                    src_interfaces,
+                                    tf.format("{dst:21s,cyan}", dst=rc.dst + ":%d" % (rc.port) if (
+                                            rc.proto == 6 or rc.proto == 17) else "") if rc.process_fullcone else "%s%s" % (
+                                        rc.dst, ":%d" % (rc.port) if (rc.proto == 6 or rc.proto == 17) else ""),
+                                    out_interface_color, "" if rc.matched_priority == -1 else rc.matched_priority, rc.mark,
+                                    "", worker_id, extra_string + "\b" * (len(extra_string) + 52 + 3), isp_string))
+                        finally:
+                            g_io_lock.release()
+
+                else:
+                    time.sleep(0.01)
+            except Exception as e:
+                # Never let an unexpected error kill this thread while it holds
+                # self.lock; log and keep draining the queue.
+                syslog.syslog(syslog.LOG_CRIT, "PrintResult Thread Error: %s\n  %s" % (
+                    str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+            finally:
                 self.lock.release()
-            else:
-                self.lock.release()
-                time.sleep(0.01)
 
     def get_id(self):
         # returns id of the respective thread
@@ -731,12 +762,11 @@ def ip_mark(packet):
             test_ip = None
             test_proxy_id = None
             if g_test_proxy_id.value != -1:
-                g_lock.acquire()
-                if g_test_proxy_id.value != -1:
-                    test_proxy_id = g_proxy_index[g_test_proxy_id.value]
-                    test_ip = str(g_test_ip[:])
-                    test_ip = test_ip[0:test_ip.index("\0")]
-                g_lock.release()
+                with timed_lock(g_lock, 0.5) as got:
+                    if got and g_test_proxy_id.value != -1:
+                        test_proxy_id = g_proxy_index[g_test_proxy_id.value]
+                        test_ip = str(g_test_ip[:])
+                        test_ip = test_ip[0:test_ip.index("\0")]
             # elif not allow_ecmp:
             #     g_lock.acquire()
             #     os.write(ecmp_thread.fdw, struct.pack("=B72s", 0, dst.encode("utf-8")))
@@ -815,10 +845,6 @@ def ip_mark(packet):
                     if geodata is None:
                         packet.set_mark(0x99)
                         packet.repeat()
-                        with g_running_process.get_lock():
-                            g_running_process.value -= 1
-
-                        g_working_flag[worker_id].value = False
                         return
 
                     src_addr = ipaddress.ip_address(src)
@@ -1077,14 +1103,30 @@ class NFQUEUE_Executeor(Process):
         self.worker_id = worker_id
 
     def release_process(self) -> None:
-        g_lock.acquire(timeout=1.0)
-        g_io_lock.acquire(timeout=1.0)
+        # Ask the worker to exit its own loop first (checked in
+        # NFQUEUE_Executeor.run() after nfqueue.run() returns/raises).
         self.terminate()
-        g_io_lock.release()
-        g_lock.release()
-        time.sleep(0.05)
+
+        # Only release locks we actually acquired -- acquire() can time out
+        # if a worker was killed mid critical-section in a previous call,
+        # and blindly releasing here would corrupt state for every other
+        # process still waiting on the lock.
+        got_lock = g_lock.acquire(timeout=2.0)
+        got_io_lock = g_io_lock.acquire(timeout=2.0)
+        try:
+            deadline = time.time() + 2.0
+            while self.is_alive() and time.time() < deadline:
+                time.sleep(0.05)
+        finally:
+            if got_io_lock:
+                g_io_lock.release()
+            if got_lock:
+                g_lock.release()
+
         if self.is_alive():
             print("[-] force kill %d" % self.worker_id)
+            if not got_lock:
+                print("[-] %d did not release g_lock in time before kill, state may be inconsistent" % self.worker_id)
             self.kill()
 
     @staticmethod
@@ -1164,7 +1206,7 @@ if __name__ == "__main__":
     print("[*] load ipdb")
     db = ipdb.City(config['ipdb_v4'])
     db_v6 = None
-    if config.get(config['ipdb_v6'], None):
+    if config.get('ipdb_v6', None) and config['ipdb_v6'] != config['ipdb_v4']:
         db_v6 = ipdb.City(config['ipdb_v6'])
     elif db.is_ipv6():
         db_v6 = db
@@ -1193,6 +1235,7 @@ if __name__ == "__main__":
         nfu.add_set(family=ip_family, table="policy_route", name="ignore_list", set_type="ipv%d_addr" % (ip_version))
         nfu.add_set(family=ip_family, table="policy_route", name="policy_mark", set_type="mark")
         nfu.add_set(family=ip_family, table="policy_route", name="nat_interfaces", set_type="iface_index")
+        nfu.add_set(family=ip_family, table="policy_route", name="redir_ports", set_type="inet_service")
         nfu.add_set_element(family=ip_family, table="policy_route", name="nat_interfaces", element=nat_interfaces)
 
         nfu.add_chain(
@@ -1227,7 +1270,7 @@ if __name__ == "__main__":
         nfu.add_rule({'family': ip_family, 'chain': 'INPUT', 'table': 'policy_route', 'comment': cmt_class,
                       'expr': [{'match': nfu.match_payload('sport', 53, protocol='udp')},
                                {'counter': {'bytes': 0, 'packets': 0}},
-                               {'queue': {'num': 53}}]
+                               {'queue': {'num': 53, 'flags': ['bypass']}}]
                       })
 
         nfu.add_rule(
@@ -1240,14 +1283,15 @@ if __name__ == "__main__":
 
         if ip_version == 4:
             nfu.add_set_element(family=ip_family, table="policy_route", name="local",
-                                element=[nfu.cidr('127.0.0.0', 8), nfu.cidr('10.0.0.0', 8), nfu.cidr('172.16.0.0', 13),
-                                         nfu.cidr('192.168.0.0', 16), nfu.cidr('224.0.0.0', 8),
+                                element=[nfu.cidr('127.0.0.0', 8), nfu.cidr('10.0.0.0', 8), nfu.cidr('172.16.0.0', 12),
+                                         nfu.cidr('192.168.0.0', 16), nfu.cidr('169.254.0.0', 16),
+                                         nfu.cidr('224.0.0.0', 8),
                                          nfu.cidr('239.0.0.0', 8),
                                          nfu.cidr('255.0.0.0', 8)])
             # Add Tunnel IP
         else:
             nfu.add_set_element(family=ip_family, table="policy_route", name="local",
-                                element=[nfu.cidr('fc00::', 6), "::1"])
+                                element=[nfu.cidr('fc00::', 6), nfu.cidr('fe80::', 10), nfu.cidr('ff00::', 8), "::1"])
         nfu.add_set_element(family=ip_family, table="policy_route", name="tunnel_ip",
                             element=config["tunnel_ip"]["ipv%d" % (ip_version)])
         nfu.add_set_element(family=ip_family, table="policy_route", name="ignore_list",
@@ -1283,7 +1327,7 @@ if __name__ == "__main__":
                                                        {'match': nfu.match_iif("@nat_interfaces")},
                                                        {'match': nfu.match_mark(0)},
                                                        {'counter': {'bytes': 0, 'packets': 0}},
-                                                       {'queue': {'num': 4}}]
+                                                       {'queue': {'num': 4, 'flags': ['bypass']}}]
                                               })
 
                                 nfu.add_rule({'family': ip_family, 'chain': ['nat_OUTPUT'], 'table': 'policy_route',
@@ -1298,7 +1342,7 @@ if __name__ == "__main__":
                                                                                    op='!=')},
                                                        {'match': nfu.match_mark(0)},
                                                        {'counter': {'bytes': 0, 'packets': 0}},
-                                                       {'queue': {'num': 4}}]
+                                                       {'queue': {'num': 4, 'flags': ['bypass']}}]
                                               })
 
                                 # nfu.add_rule(
@@ -1332,7 +1376,7 @@ if __name__ == "__main__":
                                                 {'match': nfu.match_l4proto('udp')},
                                                 {'match': nfu.match_iif("@nat_interfaces")},
                                                 {'counter': {'bytes': 0, 'packets': 0}},
-                                                {'queue': {'num': 4}}]
+                                                {'queue': {'num': 4, 'flags': ['bypass']}}]
                                              # {'mangle': {'key': {'meta': {'key': 'mark'}},
                                              #             'value': config["proxy"][tun_id]["mark"]}},
                                              # {'mangle': {'key': {'ct': {'key': 'mark'}},
@@ -1349,7 +1393,7 @@ if __name__ == "__main__":
                  {'match': nfu.match_iif("@nat_interfaces")},
                  {'match': nfu.match_mark(0)},
                  {'counter': {'bytes': 0, 'packets': 0}},
-                 {'queue': {'num': 4}}]
+                 {'queue': {'num': 4, 'flags': ['bypass']}}]
              })
         if functools.reduce(lambda a, b: a | b, [add_rule_rc[0] for add_rule_rc in nrc]):
             print("[-] %s" % tf.format("{msg:s,bg_red,white,bold}",
@@ -1365,7 +1409,7 @@ if __name__ == "__main__":
                                                             op='!=')},
                                 {'match': nfu.match_mark(0)},
                                 {'counter': {'bytes': 0, 'packets': 0}},
-                                {'queue': {'num': 4}}]
+                                {'queue': {'num': 4, 'flags': ['bypass']}}]
                             })
         if functools.reduce(lambda a, b: a | b, [add_rule_rc[0] for add_rule_rc in nrc]):
             print("[-] %s" % tf.format("{msg:s,bg_red,white,bold}",
@@ -1382,7 +1426,7 @@ if __name__ == "__main__":
                       {'match': nfu.match_l4proto('udp')},
                       {'match': nfu.match_iif("@nat_interfaces")},
                       {'counter': {'bytes': 0, 'packets': 0}},
-                      {'queue': {'num': 4}}]
+                      {'queue': {'num': 4, 'flags': ['bypass']}}]
              })
         if functools.reduce(lambda a, b: a | b, [add_rule_rc[0] for add_rule_rc in nrc]):
             print("[-] %s" % tf.format("{msg:s,bg_red,white,bold}",
@@ -1390,10 +1434,13 @@ if __name__ == "__main__":
         # end For Marking UDP First Packet
 
         proxy_marks = [0x99]
+        redir_ports = []
         for k, proxy_cfg in config["proxy"].items():
             # tap0 ss-redir
             if proxy_cfg["ipv%d" % (ip_version)]:
                 if "port" in proxy_cfg:
+                    if proxy_cfg["port"] not in redir_ports:
+                        redir_ports.append(proxy_cfg["port"])
                     create_tproxy(mark=proxy_cfg["mark"], port=proxy_cfg["port"], ip_family=ip_family,
                                   udp=proxy_cfg["udp_v%d" % (ip_version)])
                 if proxy_cfg["mark"] not in proxy_marks:
@@ -1401,6 +1448,41 @@ if __name__ == "__main__":
                 # [0x1, 0x2, 0x5, 0x6, 0x7, 0x8, 0x99]
 
         nfu.add_set_element(family=ip_family, table="policy_route", name="policy_mark", element=proxy_marks)
+
+        # Transparent proxy listeners must be reachable from trusted ingress
+        # interfaces, but never directly from WAN interfaces. Direct WAN
+        # access can make ss-redir proxy its own listening address and create
+        # a recursive connection loop.
+        if redir_ports:
+            nfu.add_set_element(family=ip_family, table="policy_route", name="redir_ports",
+                                element=sorted(redir_ports))
+            for protocol in ["tcp", "udp"]:
+                nfu.add_rule(
+                    {'family': ip_family, 'chain': 'INPUT', 'table': 'policy_route', 'comment': cmt_class,
+                     'expr': [
+                         {'match': nfu.match_iifname('lo')},
+                         {'match': nfu.match_l4proto(protocol)},
+                         {'match': nfu.match_payload('dport', '@redir_ports', protocol=protocol)},
+                         {'counter': {'bytes': 0, 'packets': 0}},
+                         {'accept': None}]
+                     })
+                nfu.add_rule(
+                    {'family': ip_family, 'chain': 'INPUT', 'table': 'policy_route', 'comment': cmt_class,
+                     'expr': [
+                         {'match': nfu.match_iif('@nat_interfaces')},
+                         {'match': nfu.match_l4proto(protocol)},
+                         {'match': nfu.match_payload('dport', '@redir_ports', protocol=protocol)},
+                         {'counter': {'bytes': 0, 'packets': 0}},
+                         {'accept': None}]
+                     })
+                nfu.add_rule(
+                    {'family': ip_family, 'chain': 'INPUT', 'table': 'policy_route', 'comment': cmt_class,
+                     'expr': [
+                         {'match': nfu.match_l4proto(protocol)},
+                         {'match': nfu.match_payload('dport', '@redir_ports', protocol=protocol)},
+                         {'counter': {'bytes': 0, 'packets': 0}},
+                         {'drop': None}]
+                     })
 
         nfu.add_rule(
             {'family': ip_family, 'chain': ['nat_PREROUTING', 'nat_OUTPUT', 'mangle_PREROUTING'],
@@ -1530,59 +1612,58 @@ if __name__ == "__main__":
                 #     fcnat_cleaner = FullConeNAT_Cleaner()
                 #     fcnat_cleaner.start()
 
-                g_io_lock.acquire(timeout=1.0)
+                with timed_lock(g_io_lock, 1.0):
 
-                base_offset = len(" ALIVE: [🟩🟩")
-                if base_offset <= mouse_offset < base_offset + len(g_runner):
-                    selected_proxy = None
-                    print(tf.format("{msg:s,red,bold}", msg="ALIVE Process: %d" % (mouse_offset - base_offset)),
-                          "            ")
+                    base_offset = len(" ALIVE: [🟩🟩")
+                    if base_offset <= mouse_offset < base_offset + len(g_runner):
+                        selected_proxy = None
+                        print(tf.format("{msg:s,red,bold}", msg="ALIVE Process: %d" % (mouse_offset - base_offset)),
+                              "            ")
 
-                base_offset += len(g_runner) + len("]  IPv4: [")
-                if base_offset <= mouse_offset < base_offset + len(g_proxy_index):
-                    selected_proxy = g_proxy_index[(mouse_offset - base_offset)]
-                    print(tf.format("{msg:s,red,bold}",
-                                    msg="IPv4 Proxy: %s" % g_proxy_index[(mouse_offset - base_offset)]),
-                          "            ")
+                    base_offset += len(g_runner) + len("]  IPv4: [")
+                    if base_offset <= mouse_offset < base_offset + len(g_proxy_index):
+                        selected_proxy = g_proxy_index[(mouse_offset - base_offset)]
+                        print(tf.format("{msg:s,red,bold}",
+                                        msg="IPv4 Proxy: %s" % g_proxy_index[(mouse_offset - base_offset)]),
+                              "            ")
 
-                base_offset += len(g_proxy_index) + len("]  IPv6: [")
-                if base_offset <= mouse_offset < base_offset + len(g_proxy_index):
-                    selected_proxy = g_proxy_index[(mouse_offset - base_offset)]
-                    print(tf.format("{msg:s,red,bold}",
-                                    msg="IPv6 Proxy: %s" % g_proxy_index[(mouse_offset - base_offset)]),
-                          "            ")
+                    base_offset += len(g_proxy_index) + len("]  IPv6: [")
+                    if base_offset <= mouse_offset < base_offset + len(g_proxy_index):
+                        selected_proxy = g_proxy_index[(mouse_offset - base_offset)]
+                        print(tf.format("{msg:s,red,bold}",
+                                        msg="IPv6 Proxy: %s" % g_proxy_index[(mouse_offset - base_offset)]),
+                              "            ")
 
-                # error_msg = " " * 40
-                error_msg = "CPS: %-35s" % cps
+                    # error_msg = " " * 40
+                    error_msg = "CPS: %-35s" % cps
 
-                if g_overload_flag.value:
-                    error_msg = tf.format("{msg:s,bg_yellow,red} ",
-                                          msg="Warning: Queue overloaded, working: %d" % g_running_process.value)
+                    if g_overload_flag.value:
+                        error_msg = tf.format("{msg:s,bg_yellow,red} ",
+                                              msg="Warning: Queue overloaded, working: %d" % g_running_process.value)
 
-                if g_cps_dup.value >= 20:
-                    error_msg = tf.format("{msg:s,cyan} ", msg="Info: Print Cached Result overloaded")
+                    if g_cps_dup.value >= 20:
+                        error_msg = tf.format("{msg:s,cyan} ", msg="Info: Print Cached Result overloaded")
 
-                if g_cps.value >= 50:
-                    error_msg = tf.format("{msg:s,bg_cyan,red} ",
-                                          msg="Info: Print Result overloaded")
+                    if g_cps.value >= 50:
+                        error_msg = tf.format("{msg:s,bg_cyan,red} ",
+                                              msg="Info: Print Result overloaded")
 
-                print(" ALIVE: [%s%s%s]  IPv4: [%s]  IPv6: [%s]%s %s" % (
-                    "🟧" if g_lock.locked() else "🟩",
-                    "🟧" if g_running_process._lock._semlock._count() > 0 else "🟩",
-                    "".join(["🔴" if g_runner[x].join(0) is None and not g_runner[x].is_alive() else (
-                        "🟡" if g_working_flag[x].value else (
-                            "🟢" if t_print - g_worker_last_active[x].value <= 30 else "🟩"))
-                             for x in range(len(g_runner))]),
-                    "".join([time_to_level(g_dead_proxy_ipv4[g_proxy_index[x]].value, g_proxy_index[x]) for x in
-                             range(len(g_dead_proxy_ipv4.values()))]),
-                    "".join([time_to_level(g_dead_proxy_ipv6[g_proxy_index[x]].value, g_proxy_index[x]) for x in
-                             range(len(g_dead_proxy_ipv6.values()))]),
-                    "" if selected_proxy is None else " Proxy: %s" % (
-                        tf.format("{proxy:s,cyan}", proxy=selected_proxy)),
-                    error_msg), end="\r" if not g_overload_flag.value else "\n")
+                    print(" ALIVE: [%s%s%s]  IPv4: [%s]  IPv6: [%s]%s %s" % (
+                        "🟧" if g_lock.locked() else "🟩",
+                        "🟧" if g_running_process._lock._semlock._count() > 0 else "🟩",
+                        "".join(["🔴" if g_runner[x].join(0) is None and not g_runner[x].is_alive() else (
+                            "🟡" if g_working_flag[x].value else (
+                                "🟢" if t_print - g_worker_last_active[x].value <= 30 else "🟩"))
+                                 for x in range(len(g_runner))]),
+                        "".join([time_to_level(g_dead_proxy_ipv4[g_proxy_index[x]].value, g_proxy_index[x]) for x in
+                                 range(len(g_dead_proxy_ipv4.values()))]),
+                        "".join([time_to_level(g_dead_proxy_ipv6[g_proxy_index[x]].value, g_proxy_index[x]) for x in
+                                 range(len(g_dead_proxy_ipv6.values()))]),
+                        "" if selected_proxy is None else " Proxy: %s" % (
+                            tf.format("{proxy:s,cyan}", proxy=selected_proxy)),
+                        error_msg), end="\r" if not g_overload_flag.value else "\n")
 
-                mouse_offset = 0
-                g_io_lock.release()
+                    mouse_offset = 0
 
             now = time.time()
             if now - g_cps_reset.value >= 1:
