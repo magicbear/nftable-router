@@ -1038,7 +1038,7 @@ function logView(key){
   function fetchLog(){
    api("/api/proxy_log?line="+encodeURIComponent(key)+"&tail=32768").then(function(r){
     var box=document.getElementById("lg_pre");if(!box)return;
-    box.textContent=r.ok?((r.size>r.text.length?("...(截断,全文件 "+r.size+" 字节)\n"):"")+r.text):("(无日志文件: "+(r.error||"")+")");
+    box.textContent=r.ok?((r.size>r.text.length?("...(截断,全文件 "+r.size+" 字节)\\n"):"")+r.text):("(无日志文件: "+(r.error||"")+")");
     box.scrollTop=box.scrollHeight;
     var a=document.getElementById("lg_auto");
     if(logTimer&&(!a||!a.checked)){clearInterval(logTimer);logTimer=null}})}}

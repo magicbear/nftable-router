@@ -152,6 +152,30 @@ def read_http_body(sock, head, rest):
     return rest
 
 
+def test_ui_js_syntax():
+    print("[6b] every inline <script> in served UI must parse (node --check)")
+    import shutil as _sh, re as _re
+    node = _sh.which("node")
+    if not node:
+        print("  skip: node not installed")
+        return
+    import webui
+    blocks = _re.findall(r"<script>(.*?)</script>", webui.INDEX_HTML, _re.S)
+    check("script blocks found", len(blocks) >= 1)
+    bad = []
+    for i, b in enumerate(blocks):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+            f.write(b)
+            p = f.name
+        import subprocess as _sp
+        r = _sp.run([node, "--check", p], capture_output=True, text=True)
+        if r.returncode != 0:
+            bad.append((i, r.stderr.strip().split("\n")[0:3]))
+        os.unlink(p)
+    check("all %d script block(s) parse" % len(blocks), not bad, str(bad)[:300])
+
+
 def test_server_e2e():
     print("[5] HTTP + websocket end-to-end (temp config, no redis)")
     cfg = {"proxy": {"A": {"mark": 51, "ipv4": True}}, "rules": [],
@@ -460,7 +484,7 @@ def test_webadmin_real_child_smoke():
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         test_master_signal(d)
-    for t in (test_ws_codec, test_ring_hub, test_validate_config, test_server_e2e,
+    for t in (test_ws_codec, test_ring_hub, test_validate_config, test_ui_js_syntax, test_server_e2e,
               test_webadmin_service_lifecycle, test_webadmin_real_child_smoke):
         t()
     print("\n==== %d passed, %d failed ====" % (PASS, FAIL))
