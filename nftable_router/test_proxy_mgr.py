@@ -74,6 +74,11 @@ def test_build_cmd():
           "-t" in pm.build_cmd("l", _cfg(password_file="/run/pw", password=None)))
     a = pm.build_cmd("l", _cfg(mode="tcp_and_udp"))
     check("-u when tcp_and_udp", "-u" in a and "-u" not in argv)
+    pl = pm.build_cmd("hk", _cfg(bind_addr="::0", plugin="v2ray-plugin",
+                                plugin_opts="mode=websocket;tls;host=x;path=/dev"))
+    check("--plugin emitted", "--plugin" in pl and pl[pl.index("--plugin") + 1] == "v2ray-plugin")
+    check("--plugin-opts value", pl[pl.index("--plugin-opts") + 1] == "mode=websocket;tls;host=x;path=/dev")
+    check("bind_addr overrides default -b", pl[pl.index("-b") + 1] == "::0")
     check("obfs/protocol extras",
           all(o in pm.build_cmd("l", _cfg(obfs="tls", protocol="auth_aes128_md5"))
               for o in ("-g", "tls", "-O", "auth_aes128_md5")))

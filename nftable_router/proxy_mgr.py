@@ -87,7 +87,7 @@ def build_cmd(name, cfg):
     if daemon == "ss-redir":
         # Debian: /usr/bin/ss-redir ; some builds /usr/sbin/ -> resolve via PATH
         ssb = cfg.get("binary") or shutil.which("ss-redir") or "/usr/sbin/ss-redir"
-        argv = [ssb, "-b", "0.0.0.0", "-l", str(cfg["port"])]
+        argv = [ssb, "-b", str(cfg.get("bind_addr") or "0.0.0.0"), "-l", str(cfg["port"])]
         server = cfg.get("server") or cfg.get("proxy_ip")
         if not server:
             raise ValueError("%s: ss-redir needs 'server'/'proxy_ip'" % name)
@@ -106,6 +106,10 @@ def build_cmd(name, cfg):
                          ("-O", "protocol"), ("-o", "protocol_param")):
             if cfg.get(key):
                 argv += [opt, str(cfg[key])]
+        if cfg.get("plugin"):
+            argv += ["--plugin", str(cfg["plugin"])]
+        if cfg.get("plugin_opts"):
+            argv += ["--plugin-opts", str(cfg["plugin_opts"])]
         if str(cfg.get("mode", "tcp")).lower() in ("tcp_and_udp", "udp", "both"):
             argv.append("-u")
         return argv + extra

@@ -331,7 +331,7 @@ function pushCfg(reload,cb){
 
 // ---------- proxy lines ----------
 var PROXY_COLS=["mark","weight","port","upstream","daemon","uid","server","server_port","cipher",
- "password","password_file","obfs","obfs_param","protocol","protocol_param","mode","binary","config",
+ "password","password_file","plugin","plugin_opts","bind_addr","obfs","obfs_param","protocol","protocol_param","mode","binary","config",
  "bind","proxy_ip","test_dns","test_url","ipv4","ipv6","udp_v4","udp_v6","fullcone","autostart","restart"];
 function proxyReferrers(name){
  var refs=[];
@@ -408,7 +408,8 @@ function editProxy(name){
  var c=JSON.parse(JSON.stringify(src));
  var cur={name:name||"",mark:c.mark,weight:c.weight,port:c.port,upstream:c.upstream,daemon:c.daemon,
   uid:c.uid,server:c.server||c.proxy_ip,server_port:c.server_port,cipher:c.cipher,password:c.password,
-  password_file:c.password_file,mode:c.mode,bind:c.bind,test_url:c.test_url,
+  password_file:c.password_file,plugin:c.plugin,plugin_opts:c.plugin_opts,bind_addr:c.bind_addr,
+  mode:c.mode,bind:c.bind,test_url:c.test_url,
   restart_max:(c.restart||{}).max,restart_window:(c.restart||{}).window};
   var lines=Object.keys(CFG.proxy||{}).filter(function(x){return x!=name});
   cur.autostart_x=String(c.autostart!==false);
@@ -427,7 +428,11 @@ function editProxy(name){
    mfields(g,[
     ["server","服务器地址","text"],["server_port","服务器端口","num"],
     ["cipher","加密算法","text"],["password","密码(内联,ps可见慎用)","text"],
-    ["password_file","密码文件","text"],["mode","模式","select",["tcp","tcp_and_udp"]],
+    ["password_file","密码文件","text"],
+    ["plugin","传输插件(plugin)","text",null,"如 v2ray-plugin"],
+    ["plugin_opts","插件参数(plugin-opts)","text",null,"mode=websocket;tls;host=x;path=/dev"],
+    ["bind_addr","监听地址(-b)","text",null,"默认0.0.0.0, IPv6用 ::0"],
+    ["mode","模式","select",["tcp","tcp_and_udp"]],
     ["bind","bind ip:port","text"]],cur);
    g=mgroup(body,"能力 / 探测");
    mbools(g,["ipv4","ipv6","udp_v4","udp_v6","fullcone"],c,CAP_LABELS);
@@ -447,7 +452,7 @@ function editProxy(name){
   var p=gi("port");if(p!=null)out.port=p;
   if(g("upstream"))out.upstream=g("upstream");
   if(g("daemon"))out.daemon=g("daemon");
-  ["uid","cipher","password","password_file","mode","bind","test_url"].forEach(function(f){if(g(f))out[f]=g(f)});
+  ["uid","cipher","password","password_file","plugin","plugin_opts","bind_addr","mode","bind","test_url"].forEach(function(f){if(g(f))out[f]=g(f)});
   if(g("server")){out.server=g("server");out.proxy_ip=out.proxy_ip||g("server")}
   var sp=gi("server_port");if(sp!=null)out.server_port=sp;
   ["ipv4","ipv6","udp_v4","udp_v6","fullcone"].forEach(function(f){out[f]=!!body.querySelector('[data-fk="'+f+'"]').checked});
