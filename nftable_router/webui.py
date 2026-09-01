@@ -3,13 +3,13 @@
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260902-0300"
+UI_VERSION = "20260902-0310"
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nft-route 管理台</title>
-<script>var UI_VER="20260902-0300";</script>
+<script>var UI_VER="20260902-0310";</script>
 <style>
 :root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
 --green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
@@ -498,7 +498,10 @@ function editProxy(name){
   mode:c.mode,test_url:c.test_url,
   test_dns:(c.test_dns instanceof Array)?c.test_dns.join(", "):(c.test_dns||""),
   restart_max:(c.restart||{}).max,restart_window:(c.restart||{}).window};
-  var lines=Object.keys(CFG.proxy||{}).filter(function(x){return x!=name});
+   // upstream = inherit that line's skuid identity -> only lines that HAVE a
+   // run-user are chainable; a uid-less line offers nothing to inherit (mfields
+   // still keeps the CURRENT value visible if it predates this rule).
+   var lines=Object.keys(CFG.proxy||{}).filter(function(x){return x!=name && ((CFG.proxy[x].uid||"")+"").trim()!==""});
   cur.autostart_x=String(c.autostart!==false);
   var CAP_LABELS={ipv4:"IPv4",ipv6:"IPv6",udp_v4:"UDP v4",udp_v6:"UDP v6",fullcone:"FullCone"};
   // ---- instances: SOLE source of connection params (默认线路页已移除) ----
@@ -582,7 +585,7 @@ function editProxy(name){
     mfields(g,[
      ["name","线路名","text"],["mark","fwmark","num"],["weight","权重","num"],
      ["port","透明端口(空=ip-rule)","num"],
-     ["upstream","上游线路(chaining)","select",lines],
+     ["upstream","上游线路(继承其skuid)","select",lines],
      ["uid","运行用户(skuid)","text",null,"选填，线路级全局身份；创建: useradd -rs /bin/false 用户名。留空=进程按当前用户运行、不生成 skuid 规则。两条线路不能用同一用户"]],cur);
     g=mgrid(mgroup(body,"托管进程"));
     mfields(g,[
