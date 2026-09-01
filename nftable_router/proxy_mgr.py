@@ -128,13 +128,17 @@ def uid_identity(u):
 
 
 def identity_line(proxy_cfgs, name, uid_cache=None):
-    """line whose RUN-USER the managed process executes as: a mark-type
-    upstream line with its own run-user owns the egress identity (skuid
-    stamp), so we run as IT; otherwise the line keeps its own identity.
-    Pass uid_cache (resolved name->int|None) so we only adopt an upstream
-    whose run-user actually RESOLVES; an unresolvable upstream account must
-    not hijack identity (plan then falls back to stamping the consumer's own
-    uid, so the two paths stay consistent)."""
+    """run-user under which the managed PROCESS executes -- deliberately
+    decoupled from the per-uid nft rules (plan_proxy_chain_rules emits those
+    for every line that has its own run-user, keyed on skuid, independent of
+    this choice):
+      mark-type upstream WITH a run-user  -> inherit IT (hkvmiss/ss-redir runs
+          as hkfib's user and hkfib's own stamp steers the egress; 'managed
+          only by the upstream line's skuid')
+      otherwise                           -> the line keeps its own identity
+    uid_cache (resolved name->int|None) guards against adopting an upstream
+    whose account fails to resolve (would silently run the process as its own
+    user while no stamp rule matches it)."""
     cfg = proxy_cfgs.get(name) or {}
     up = upstream_of(cfg)
     if up and upstream_kind(proxy_cfgs, up) == "mark":
@@ -466,17 +470,14 @@ def plan_proxy_chain_rules(proxy_cfgs, uid_cache, family="ip"):
         up_mark = None
         if up_name:
             up_cfg = proxy_cfgs.get(up_name) or {}
-            if uid_cache.get(up_name) is not None:
-                # our process RUNS AS the upstream line's user (identity_line);
-                # its own stamp rule steers the egress -- nothing keyed on us
-                continue
             up_mark = up_cfg.get("mark")
         if up_mark is not None:
-            # ip-rule upstream WITHOUT its own run-user: stamp our egress with
-            # the upstream mark (never our own line mark -- for udp-tproxy
-            # lines re-marking our egress 126-style would feed our own capture
-            # rule; a direct proxy wanting line routing should point at a
-            # mark line and run as ITS user instead)
+            # ip-rule upstream: stamp OUR egress with the UPSTREAM line's mark
+            # (own skuid wins; a line that left uid empty never gets here --
+            # identity_line runs it as the upstream's user and the upstream's
+            # own stamp covers it). Never stamp our OWN line mark: for udp
+            # tproxy lines re-marking our egress with the capture mark would
+            # feed it back into our own listener.
             rules.append(_stamp_rule(family, uid, up_mark))
         else:
             # direct managed proxy: its upstream egress must never re-enter

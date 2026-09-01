@@ -321,15 +321,33 @@ def test_uid_optional_and_identity():
     check("mark-line stamp generated and targets the route chain",
           len(plan) == 1 and plan[0]["chain"] == ib.CHAIN_ROUTE
           and {"mangle": {"key": {"meta": {"key": "mark"}}, "value": 126}} in plan[0]["expr"], str(plan))
-    # a mark-type upstream WITH its own run-user -> our process adopts ITS skuid
+    # DECOUPLED semantics (hkvmiss/shadowsocks-sshk -> hkfib/shadowsocks-hk):
+    # the managed PROCESS inherits the mark-upstream's user (hkfib's stamp
+    # steers it), while EACH line's own run-user still gets its OWN rule.
     cfgs = {"M": {"mark": 60, "uid": 1260}, "A": _cfg(upstream="M", uid=1200)}
-    check("identity_line: mark-upstream w/ user -> M", pm.identity_line(cfgs, "A") == "M")
-    # ...but ONLY when that user actually resolves (else plan would stamp A's
-    # own uid while the process ran as M -> split-brain; must stay self)
-    check("identity_line: upstream user set but UNRESOLVED -> self",
-          pm.identity_line(cfgs, "A", {"M": None, "A": 1200}) == "A")
-    check("identity_line: upstream user resolves -> M",
+    check("identity_line: mark-upstream user is inherited (hijacks even own uid) -> M",
+          pm.identity_line(cfgs, "A") == "M")
+    check("identity_line: inheritance with uid_cache -> M",
           pm.identity_line(cfgs, "A", {"M": 1260, "A": 1200}) == "M")
+    check("identity_line: inherited upstream user UNRESOLVED -> self",
+          pm.identity_line(cfgs, "A", {"M": None, "A": 1200}) == "A")
+    # ...and the nft rules are per-uid regardless of identity: BOTH stamps exist,
+    # consumer keyed on its OWN skuid with the UPSTREAM mark (the 991->0x24 rule)
+    rules = pm.plan_proxy_chain_rules(cfgs, {"M": 1260, "A": 1200}, "ip")
+    def _skuid_mark(rs, u):
+        return [r["expr"] for r in rs
+                if any(e.get("match", {}).get("left") == {"meta": {"key": "skuid"}}
+                       and e["match"]["right"] == u for e in r["expr"])]
+    check("consumer A keeps OWN-uid rule -> upstream mark 60",
+          len(_skuid_mark(rules, 1200)) == 1
+          and {"mangle": {"key": {"meta": {"key": "mark"}}, "value": 60}} in _skuid_mark(rules, 1200)[0],
+          str(rules))
+    check("upstream M rule present (skuid 1260 -> mark 60)",
+          len(_skuid_mark(rules, 1260)) == 1)
+    # uid-less consumer inherits identity as before
+    cfgs_inh = {"M": {"mark": 60, "uid": 1260}, "A": _cfg(upstream="M")}
+    check("identity_line: uid-EMPTY + mark-upstream w/ user -> M (inherit)",
+          pm.identity_line(cfgs_inh, "A", {"M": 1260}) == "M")
     # upstream mark line WITHOUT a run-user -> keep our own identity
     cfgs2 = {"M": {"mark": 60}, "A": _cfg(upstream="M", uid=1200)}
     check("identity_line: mark-upstream no user -> self", pm.identity_line(cfgs2, "A") == "A")
