@@ -308,7 +308,7 @@ tabs.forEach(function(b){b.onclick=function(){
 // ---------- bind tab ----------
 var ifData=null;
 function unbindEntry(b){
- if(!confirm("解绑 "+(b.ip||b.iface)+" (mark "+b.mark+") ?\n只修改配置文件；在状态页『重载主进程』后 nft 打标规则才会撤销。\n注意:ip rule/路由表若为手工段(ext)不会被自动删除。"))return;
+ if(!confirm("解绑 "+(b.ip||b.iface)+" (mark "+b.mark+") ?\\n只修改配置文件；在状态页『重载主进程』后 nft 打标规则才会撤销。\\n注意:ip rule/路由表若为手工段(ext)不会被自动删除。"))return;
  api("/api/unbind",{method:"POST",headers:{"Content-Type":"application/json"},
   body:JSON.stringify({mark:b.mark,ip:b.ip||"",iface:b.iface||""})}).then(function(r){
    if(r.ok){if(r.mtime)CFG_MTIME=r.mtime;markDirty();toast("已解绑 "+(b.ip||b.iface)+"(未重载)","good");
