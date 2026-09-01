@@ -499,7 +499,9 @@ def mtr_find_bin():
 
 
 def ensure_markso():
-    """compile markexec.so on demand; returns path or (None, error)"""
+    """delegate to proxy_mgr shared builder (single source of truth)"""
+    if pmm is not None and hasattr(pmm, "ensure_markso"):
+        return pmm.ensure_markso()
     if os.path.exists(MARKSO) and os.path.getmtime(MARKSO) >= os.path.getmtime(MARKSRC):
         return MARKSO, None
     cc = shutil.which("cc") or shutil.which("gcc")

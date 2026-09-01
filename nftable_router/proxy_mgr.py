@@ -203,6 +203,44 @@ def upstream_kind(proxy_cfgs, up_name):
     return None
 
 
+MARKSO = os.path.join(os.path.dirname(os.path.realpath(__file__)), "markexec.so")
+MARKSRC = os.path.join(os.path.dirname(os.path.realpath(__file__)), "markexec.c")
+
+
+def ensure_markso():
+    """compile markexec.so (LD_PRELOAD SO_MARK shim) on demand; -> (path|None, err)"""
+    try:
+        if os.path.exists(MARKSO) and os.path.getmtime(MARKSO) >= os.path.getmtime(MARKSRC):
+            return MARKSO, None
+    except OSError:
+        pass
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if not cc:
+        return None, "no cc/gcc available to build markexec.so"
+    try:
+        p = subprocess.run([cc, "-shared", "-fPIC", "-O2", "-o", MARKSO, MARKSRC],
+                           capture_output=True, timeout=25, text=True)
+        if p.returncode != 0:
+            return None, "compile failed: " + (p.stderr or "")[-200:]
+        return MARKSO, None
+    except Exception as e:
+        return None, str(e)
+
+
+def probe_env(mark, base_env=None):
+    """env for a marked child process (dig/curl/mtr); falls back to unmarked
+    with error text so callers can log the degradation once."""
+    env = dict(base_env if base_env is not None else os.environ)
+    if not mark:
+        return env, None
+    so, err = ensure_markso()
+    if so:
+        env["LD_PRELOAD"] = so
+        env["MARK"] = str(int(mark))
+        return env, None
+    return env, err
+
+
 def instances_of(name, cfg):
     """[(tag, merged_cfg)...]; a line without 'instances' yields one tag=''
     entry built from the line itself (single process, unchanged behaviour).

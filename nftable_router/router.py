@@ -43,6 +43,7 @@ from queue import Queue, Empty
 from contextlib import contextmanager
 import traceback
 import itertools
+from concurrent.futures import ThreadPoolExecutor
 import prctl, tty, termios
 import netifaces
 
@@ -75,8 +76,8 @@ def timed_lock(lock, timeout=2.0):
             lock.release()
 
 
-def run_cmd_capture(args, timeout):
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, shell=False)
+def run_cmd_capture(args, timeout, env=None):
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, shell=False, env=env)
     try:
         out = proc.communicate(timeout=timeout)[0]
     except subprocess.TimeoutExpired:
@@ -84,8 +85,6 @@ def run_cmd_capture(args, timeout):
         out = proc.communicate()[0]
     return out.decode('utf-8')
 
-g_test_ip = Array(ctypes.c_wchar, 40)
-g_test_proxy_id = Value('i', -1)
 g_running_process = Value('i', 0)
 g_cps = Value('i', 0)
 g_cps_dup = Value('i', 0)
@@ -140,155 +139,151 @@ raw_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
 syslog.openlog(ident="PolicyRoute[%d]" % os.getpid())
 
 class TestThread(threading.Thread):
+    """Per-line connectivity checks (dig + curl via proxy), run CONCURRENTLY.
+
+    Probes now get routed by SO_MARK directly (LD_PRELOAD markexec.so +
+    MARK=<line mark> env on dig/curl, hitting the existing `ip rule fwmark`
+    tables), so the old g_test_ip/g_test_proxy_id handshake with the NFQUEUE
+    workers is gone: no g_lock on the packet hot path, and lines are no
+    longer serialized one global at a time."""
+    POOL = 6
+
     def __init__(self):
         threading.Thread.__init__(self)
-        self.test_ip = None
-        self.test_mark = None
-        self.test_proxy_id = None
         self.last_check = None
         self.r = redis.Redis(host='127.0.0.1', port=6379, db=1, socket_timeout=3, socket_connect_timeout=3)
 
+    # ---------------- single (line, family) probe job ----------------
+    def _probe(self, proxy_id, ip_version, proxy):
+        out = {"proxy": proxy_id, "ver": ip_version, "ok": False, "ms": None,
+               "ip": "", "dns_fail": False, "tested": []}
+        try:
+            parse_path = urllib.parse.urlparse(proxy['test_url'])
+        except (ValueError, KeyError):
+            return out
+        env, err = pmm.probe_env(proxy.get("mark"))
+        if err:
+            out["mark_err"] = err
+        dig_result = None
+        for i in range(0, 3):
+            if dig_result is None:
+                digParams = ["dig", "+time=2", "+tries=1", "+short", parse_path.netloc]
+                if 'test_dns' in proxy:
+                    pxy_ip = proxy['test_dns'] if isinstance(proxy['test_dns'], str) \
+                        else proxy['test_dns'][i % len(proxy['test_dns'])]
+                    digParams.append("+tcp")
+                    digParams.append("@%s" % pxy_ip)
+                digParams.append('AAAA' if ip_version == 6 else 'A')
+                dig_result = run_cmd_capture(digParams, 10, env=env).split("\n")
+                di = 0
+                while di < len(dig_result):
+                    try:
+                        tip = ipaddress.ip_address(dig_result[di])
+                        if tip.version != ip_version:
+                            dig_result.remove(dig_result[di])
+                            continue
+                        di += 1
+                    except ValueError:
+                        dig_result.remove(dig_result[di])
+            if len(dig_result) > 0:
+                probe_ip = dig_result[i % len(dig_result)].strip()
+                curl_args = ["curl", "-%d" % ip_version, "-s", "-k", "-m", "1",
+                             "-o", "/dev/null",
+                             "-x", "%s:%d" % (probe_ip if ip_version == 4 else "[%s]" % probe_ip,
+                                              80 if parse_path.scheme == 'http' else 443),
+                             proxy['test_url'], '-w', '%{time_total} %{http_code}']
+                tquery = run_cmd_capture(curl_args, 5, env=env).split(" ")
+                while len(tquery) < 2:
+                    tquery.append("000")
+                if tquery[1] in ('200', '204', '301', '302'):
+                    try:
+                        out.update({"ok": True, "ms": float(tquery[0]), "ip": probe_ip})
+                    except ValueError:
+                        out.update({"ok": True, "ms": 0.0, "ip": probe_ip})
+                    return out
+                out["tested"].append(probe_ip)
+            else:
+                dig_result = None
+        out["dns_fail"] = (dig_result is None and not out["tested"])
+        return out
+
+    def _publish(self, res, mark):
+        """stream probe outcomes into the webadmin flow view (sess=1 rows)"""
+        try:
+            self.r.publish("pr_stream", json.dumps({
+                "ts": round(time.time(), 3), "ver": res["ver"], "proto": 6,
+                "src": "probe", "dst": res["ip"] or (",".join(res["tested"])[:60] or "-"),
+                "sport": None, "dport": None, "line": res["proxy"],
+                "mark": mark, "pri": -1, "sess": 1,
+                "ms": (round(res["ms"] * 1000, 1) if res["ok"] else None),
+                "fc": 0, "probe_ok": 1 if res["ok"] else 0}))
+        except Exception as e:
+            syslog.syslog(syslog.LOG_WARNING, "probe publish failed: %s" % e)
+
+    # ---------------- scheduler ----------------
     def run(self):
-        global config, g_test_ip, g_test_proxy_id, g_dead_proxy_ipv4, g_dead_proxy_ipv6
+        global config, g_dead_proxy_ipv4, g_dead_proxy_ipv6
         prctl.set_name("PR - %s" % self.__class__.__name__)
         time.sleep(3)
         while not term.value:
-            # 获取当前连接数
-            with open("/proc/sys/net/netfilter/nf_conntrack_max") as f:
-                MAX_CONNTRACK = int(f.read().strip())
-            with open("/proc/sys/net/netfilter/nf_conntrack_count") as f:
-                count = int(f.read().strip())
-            # 超过80%容量时告警
-            if count > 0.8 * MAX_CONNTRACK:
-                syslog.syslog(syslog.LOG_ALERT, f"Conntrack table 80% full: {count}/{MAX_CONNTRACK}")
+            try:
+                with open("/proc/sys/net/netfilter/nf_conntrack_max") as f:
+                    MAX_CONNTRACK = int(f.read().strip())
+                with open("/proc/sys/net/netfilter/nf_conntrack_count") as f:
+                    count = int(f.read().strip())
+                if count > 0.8 * MAX_CONNTRACK:
+                    syslog.syslog(syslog.LOG_ALERT, f"Conntrack table 80% full: {count}/{MAX_CONNTRACK}")
+            except (OSError, ValueError):
+                pass
             flog = open("/var/log/nft_route.log", "a+")
             test_result = []
-            for proxy_id in config['proxy']:
-                proxy = config['proxy'][proxy_id]
+            jobs = []
+            for proxy_id, proxy in config['proxy'].items():
                 if 'test_url' not in proxy:
-                    with timed_lock(g_lock):
-                        g_dead_proxy_ipv4[proxy_id].value = 0
-                        g_dead_proxy_ipv6[proxy_id].value = 0
+                    g_dead_proxy_ipv4[proxy_id].value = 0
+                    g_dead_proxy_ipv6[proxy_id].value = 0
                     continue
-
-                parse_path = urllib.parse.urlparse(proxy['test_url'])
-
                 for ip_version in [4, 6]:
-                    dig_result = None
-                    tested_ip = []
-                    if 'ipv%d' % ip_version not in proxy or not proxy['ipv%d' % ip_version]:
-                        continue
-                    for i in range(0, 3):
-                        if dig_result is None:
-                            # , "+dscp=32"
-                            digParams = ["dig", "+time=2", "+tries=1", "+short", parse_path.netloc]
-                            if 'test_dns' in proxy:
-                                pxy_ip = proxy['test_dns'] if isinstance(proxy['test_dns'], str) else proxy['test_dns'][
-                                    i % len(proxy['test_dns'])]
-                                digParams.append("+tcp")
-                                digParams.append("@%s" % pxy_ip)
-                                self.test_proxy_id = proxy_id
-                                self.test_mark = proxy['mark']
-                                self.test_ip = pxy_ip
-                                with timed_lock(g_lock):
-                                    g_test_ip[0:len(pxy_ip) + 1] = pxy_ip + "\0"
-                                    g_test_proxy_id.value = g_proxy_index.index(proxy_id)
-
-                            # if "bind" in proxy:
-                            #     digParams.append("-b")
-                            #     digParams.append(proxy['bind'].replace(":","#"))
-                            digParams.append('AAAA' if ip_version == 6 else 'A')
-
-                            # print(proxy_id, i, " ".join(digParams))
-                            # time.sleep(0.1)
-                            dig_result = run_cmd_capture(digParams, 10).split("\n")
-                            dig_index = 0
-                            while dig_index < len(dig_result):
-                                try:
-                                    test_ip = ipaddress.ip_address(dig_result[dig_index])
-                                    if test_ip.version != ip_version:
-                                        dig_result.remove(dig_result[dig_index])
-                                        continue
-                                    dig_index += 1
-                                except ValueError:
-                                    dig_result.remove(dig_result[dig_index])
-
-                        # print(ip_version, proxy_id, dig_result)
-                        if len(dig_result) > 0:
-                            self.test_proxy_id = proxy_id
-                            self.test_mark = proxy['mark']
-                            self.test_ip = dig_result[i % len(dig_result)].strip()
-                            with timed_lock(g_lock):
-                                g_test_ip[0:len(self.test_ip) + 1] = self.test_ip + "\0"
-                                g_test_proxy_id.value = g_proxy_index.index(proxy_id)
-
-                            curl_args = ["curl", "-%d" % ip_version, "-s", "-k", "-m", "1",
-                                         "-o", "/dev/null",
-                                         "-x", "%s:%d" % (self.test_ip if ip_version == 4 else "[%s]" % self.test_ip,
-                                                          80 if parse_path.scheme == 'http' else 443),
-                                         proxy['test_url'], '-w', '%{time_total} %{http_code}']
-                            # print(" ".join(curl_args))
-
-                            # time.sleep(0.1)
-                            tquery = run_cmd_capture(curl_args, 5).split(" ")
-                            while len(tquery) < 2:
-                                tquery.append("000")
-                            # print(tquery)
-                            if tquery[1] == '200' or tquery[1] == '204' or tquery[1] == '301' or tquery[1] == '302':
-                                # print("[+] \033[38;5;157mProxy Check IPv%d %s OK\033[0m, time %s" % (
-                                # ip_version, proxy_id, tquery[0]))
-                                test_result.append([proxy_id, ip_version, "%s %s" % (tquery[0], self.test_ip)])
-                                flog.write("%s: %s OK %s\n" % (datetime.now().isoformat(), proxy_id, tquery[0]))
-                                self.test_ip = None
-                                with timed_lock(g_lock):
-                                    if ip_version == 4:
-                                        g_dead_proxy_ipv4[proxy_id].value = float(tquery[0])
-                                    else:
-                                        g_dead_proxy_ipv6[proxy_id].value = float(tquery[0])
-                                    g_test_ip[0] = "\0"
-                                    g_test_proxy_id.value = -1
-                                break
-                            else:
-                                tested_ip.append(self.test_ip)
-                                # print("[-] \033[41mProxy Check IPv%d %s Failed\033[0m" % (ip_version, proxy_id))
-                                self.test_ip = None
-                                with timed_lock(g_lock):
-                                    if ip_version == 4:
-                                        g_dead_proxy_ipv4[proxy_id].value = -1
-                                    else:
-                                        g_dead_proxy_ipv6[proxy_id].value = -1
-                                    g_test_ip[0] = "\0"
-                                    g_test_proxy_id.value = -1
-                        else:
-                            dig_result = None
-                            # print("[-] \033[41mProxy Check IPv%d %s Failed, DNS Resolve Failed\033[0m" % (ip_version, proxy_id))
-                            self.test_ip = None
-                            with timed_lock(g_lock):
-                                if ip_version == 4:
-                                    g_dead_proxy_ipv4[proxy_id].value = -1
-                                else:
-                                    g_dead_proxy_ipv6[proxy_id].value = -1
-                                g_test_ip[0] = "\0"
-                                g_test_proxy_id.value = -1
-
-                    if dig_result is None:
-                        test_result.append([proxy_id, ip_version, "-1 DNS"])
-                        print("[-] \033[41mProxy Check IPv%d %s Failed, DNS Resolve Failed, mark dead\033[0m%s" % (
-                            ip_version, proxy_id, " " * 30))
-                        flog.write("%s: %s Failed, IPv%d Resolve failed\n" % (
-                            datetime.now().isoformat(), proxy_id, ip_version))
-                    elif len(tested_ip) > 0:
-                        test_result.append([proxy_id, ip_version, "-1 %s" % ",".join(tested_ip)])
-                        print("[-] \033[41mProxy Check IPv%d %s Failed, ip: %s, mark dead\033[0m%s" % (
-                            ip_version, proxy_id, ",".join(tested_ip), " " * 30))
-                        flog.write("%s: %s IPv%d Failed, ip: %s\n" % (
-                            datetime.now().isoformat(), proxy_id, ip_version, ",".join(tested_ip)))
-
+                    if proxy.get('ipv%d' % ip_version):
+                        jobs.append((proxy_id, ip_version, proxy))
+            pool = ThreadPoolExecutor(max_workers=self.POOL)
+            try:
+                futures = {pool.submit(self._probe, pid, v, pxy): (pid, v, pxy)
+                           for pid, v, pxy in jobs}
+                for fut in futures:
+                    pid, v, pxy = futures[fut]
+                    try:
+                        res = fut.result(timeout=45)
+                    except Exception as e:
+                        res = {"proxy": pid, "ver": v, "ok": False, "ms": None,
+                               "ip": "", "dns_fail": False, "tested": [], "err": str(e)}
+                    self._publish(res, pxy.get("mark"))
+                    dead = g_dead_proxy_ipv4 if v == 4 else g_dead_proxy_ipv6
+                    if res["ok"]:
+                        dead[pid].value = res["ms"] if res["ms"] is not None else 0.001
+                        test_result.append([pid, v, "%s %s" % (res["ms"], res["ip"])])
+                        flog.write("%s: %s OK %s\n" % (datetime.now().isoformat(), pid, res["ms"]))
+                    else:
+                        dead[pid].value = -1
+                        tag = "DNS" if res.get("dns_fail") else ",".join(res.get("tested", []))[:60]
+                        test_result.append([pid, v, "-1 %s" % tag])
+                        print("[-] \033[41mProxy Check IPv%d %s Failed %s, mark dead\033[0m%s" % (
+                            v, pid, tag, " " * 30))
+                        flog.write("%s: %s IPv%d Failed %s\n" % (
+                            datetime.now().isoformat(), pid, v, tag))
+                        if res.get("mark_err"):
+                            syslog.syslog(syslog.LOG_WARNING,
+                                          "probe %s v%d: markexec unavailable (%s) -> tested via MAIN route"
+                                          % (pid, v, res["mark_err"]))
+            finally:
+                pool.shutdown(wait=False)
             flog.close()
-            self.r.delete("test_v4", "test_v6")
-            for proxy_id, ip_version, rc in test_result:
-                self.r.hset("test_v%d" % ip_version, proxy_id, rc)
-
+            try:
+                self.r.delete("test_v4", "test_v6")
+                for proxy_id, ip_version, rc in test_result:
+                    self.r.hset("test_v%d" % ip_version, proxy_id, rc)
+            except Exception as e:
+                syslog.syslog(syslog.LOG_WARNING, "test results redis write failed: %s" % e)
             self.last_check = time.time()
             try:
                 self.r.set("test_at", "%.3f" % time.time())
@@ -1206,14 +1201,7 @@ def ip_mark(packet):
             out_interface = ""
             matched_priority = -1
 
-            test_ip = None
-            test_proxy_id = None
-            if g_test_proxy_id.value != -1:
-                with timed_lock(g_lock, 0.5) as got:
-                    if got and g_test_proxy_id.value != -1:
-                        test_proxy_id = g_proxy_index[g_test_proxy_id.value]
-                        test_ip = str(g_test_ip[:])
-                        test_ip = test_ip[0:test_ip.index("\0")]
+            # (SO_MARK-based probes need no global test state in the hot path)
             # elif not allow_ecmp:
             #     g_lock.acquire()
             #     os.write(ecmp_thread.fdw, struct.pack("=B72s", 0, dst.encode("utf-8")))
@@ -1236,14 +1224,6 @@ def ip_mark(packet):
                 packet.repeat()
                 test_session = 1
                 out_interface = test_info['proxy_id']
-            elif test_ip is not None and test_ip == dst:
-                proxy = config['proxy'][test_proxy_id]
-                mark = proxy['mark']
-                packet.set_mark(mark)
-                packet.repeat()
-                test_session = 1
-                out_interface = test_proxy_id
-                # print("[*] Connect to Test IP: %s  Mark: %d" % (dst, mark))
             elif not allow_ecmp and dst in ecmp_thread.ip_list:
                 # Use Cached ECMP
                 cache_ecmp = ecmp_thread.ip_list[dst]
