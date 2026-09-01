@@ -3,13 +3,13 @@
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260902-0240"
+UI_VERSION = "20260902-0300"
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nft-route 管理台</title>
-<script>var UI_VER="20260902-0240";</script>
+<script>var UI_VER="20260902-0300";</script>
 <style>
 :root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
 --green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
@@ -578,24 +578,22 @@ function editProxy(name){
    iname&&(iname.onchange=function(){inst_commit();itabs_render()});
   }
   openModal(isNew?"新增线路":"编辑线路: "+name,function(body){
-   var g=mgrid(mgroup(body,"基本信息"));
-   mfields(g,[
-    ["name","线路名","text"],["mark","fwmark","num"],["weight","权重","num"],
-    ["port","透明端口(空=ip-rule)","num"],
-    ["upstream","上游线路(chaining)","select",lines]],cur);
-   g=mgrid(mgroup(body,"托管进程"));
-   mfields(g,[
-    ["daemon","托管进程","select",["ss-redir","v2ray","sing-box","custom"]],
-    ["uid","运行用户 *","text",null,"如 shadowsocks（创建: useradd -rs /bin/false 用户名）"],
-    ["autostart_x","自动启动","select",["true","false"]]],cur);
-   (function(){
-    var dsel=g.querySelector('[data-fk="daemon"]'), uin=g.querySelector('[data-fk="uid"]');
-    var hint=el("span","bad","  已选择托管进程：运行用户为必填项（防环规则按此用户的 skuid 识别代理流量）");
-    hint.style.display="none";uin.parentNode.appendChild(hint);
-    function req(){var need=!!(dsel.value||"").trim();
-     uin.style.borderColor=need&&!uin.value.trim()?"var(--red)":"";
-     hint.style.display=need&&!uin.value.trim()?"inline":"none"}
-    dsel.onchange=req;uin.oninput=req;uin.onchange=req;req()})();
+    var g=mgrid(mgroup(body,"基本信息"));
+    mfields(g,[
+     ["name","线路名","text"],["mark","fwmark","num"],["weight","权重","num"],
+     ["port","透明端口(空=ip-rule)","num"],
+     ["upstream","上游线路(chaining)","select",lines],
+     ["uid","运行用户(skuid)","text",null,"选填，线路级全局身份；创建: useradd -rs /bin/false 用户名。留空=进程按当前用户运行、不生成 skuid 规则。两条线路不能用同一用户"]],cur);
+    g=mgrid(mgroup(body,"托管进程"));
+    mfields(g,[
+     ["daemon","托管进程","select",["ss-redir","v2ray","sing-box","custom"]],
+     ["autostart_x","自动启动","select",["true","false"]]],cur);
+    (function(){
+     var dsel=g.querySelector('[data-fk="daemon"]');
+     var hint=el("div","dim","  托管进程绑定上游线路时：若上游是 ip-rule(mark) 线路并设有运行用户，本进程即『以上游用户身份运行』，其出站被上游线路的 skuid 规则路由出该线路（无需本线路再填运行用户）；若上游是透明端口(port)线路，则靠本线路自身的运行用户生成 redirect 规则。");
+     hint.style.display="none";g.parentNode.appendChild(hint);
+     function upd(){hint.style.display=dsel.value?"block":"none"}
+     dsel.onchange=upd;upd()})();
    g=mgroup(body,"能力 / 探测");
    mbools(g,["ipv4","ipv6","udp_v4","udp_v6","fullcone"],c,CAP_LABELS);
    mfields(mgrid(g),[
@@ -621,10 +619,12 @@ function editProxy(name){
   out.mark=gi("mark");out.weight=gi("weight");
   var p=gi("port");if(p!=null)out.port=p;else delete out.port;
   if(g("upstream"))out.upstream=g("upstream");else delete out.upstream;
-  var dn=g("daemon");
-  if(dn&&!g("uid"))return toast("托管进程必须填写『运行用户』(uid)——进程降权与防环都依赖它","bad");
-  if(dn)out.daemon=dn;else delete out.daemon;
-  ["uid","test_url"].forEach(function(f){var v=g(f);if(v)out[f]=v;else delete out[f]});
+   var dn=g("daemon");
+   if(dn)out.daemon=dn;else delete out.daemon;
+   ["uid","test_url"].forEach(function(f){var v=g(f);if(v)out[f]=v;else delete out[f]});
+   var upn=g("upstream"),upl=upn?((CFG.proxy||{})[upn]||{}):null;
+   if(dn&&upl&&(upl.port!=null)&&!g("uid"))
+     toast("提示: 上游 "+upn+" 是透明端口线路，本线路需填运行用户才能生成 skuid redirect，否则主进程会拒绝托管","bad");
   delete out.bind;   // legacy alive-check bind ip:port -- dead since SO_MARK probes
   if(g("test_dns"))out.test_dns=g("test_dns").split(/[,，\s]+/).filter(function(x){return x.length});
   else if("test_dns" in out&&!g("test_dns"))delete out.test_dns;

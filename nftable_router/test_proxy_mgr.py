@@ -10,6 +10,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import proxy_mgr as pm
+import iface_bind as ib
 
 PASS = 0
 FAIL = 0
@@ -56,7 +57,7 @@ class FakeProc:
 
 def _cfg(daemon="ss-redir", **kw):
     base = {"daemon": daemon, "port": 10506, "server": "5.6.7.9", "server_port": 8388,
-            "cipher": "aes-256-gcm", "password": "s3cr3t", "uid": "proxyusr"}
+            "cipher": "aes-256-gcm", "password": "s3cr3t"}
     base.update(kw)
     return base
 
@@ -141,6 +142,29 @@ def test_chain_validation():
     cfgs["D"]["upstream"] = "A"
     cfgs["A"].pop("daemon")  # A now unmanaged
     check("upstream not managed -> error", _raises(pm.validate_chain, cfgs))
+
+
+def test_uid_uniqueness():
+    print("[2b] two lines must not bind one run-user (skuid uniqueness)")
+    dup = {
+        "A": _cfg(port=10506, uid=1200, upstream=None),
+        "B": _cfg(port=10507, uid=1200, upstream=None),  # same numeric uid
+    }
+    try:
+        pm.validate_chain(dup)
+        check("duplicate uid rejected", False)
+    except ValueError as e:
+        check("duplicate uid rejected", True)
+        check("names both lines", "A" in str(e) and "B" in str(e), str(e))
+    # name vs its numeric uid resolve to the same identity -> also rejected
+    dup2 = {"A": _cfg(uid=1200), "B": _cfg(port=10507, uid="1200")}
+    check("int vs str same uid rejected", _raises(pm.validate_chain, dup2))
+    # distinct uids pass
+    dup3 = {"A": _cfg(uid=1200), "B": _cfg(port=10507, uid=1201)}
+    check("distinct uids pass", not _raises(pm.validate_chain, dup3))
+    # blank uids are not identities -> duplicates of blank are fine
+    dup4 = {"A": _cfg(uid=""), "B": _cfg(port=10507, uid=None)}
+    check("blank uids not counted", not _raises(pm.validate_chain, dup4))
 
 
 def test_chain_rules():
@@ -284,15 +308,47 @@ def test_redact():
     check("secret not present", "s3cr3t" not in red and "****" in red)
 
 
-def test_uid_requirement():
-    print("[8] chained proxy without uid -> error")
-    try:
-        cfg = _cfg(upstream="B")
-        cfg.pop("uid")
-        pm.get_uid(cfg, "A")
-        check("raises", False)
-    except ValueError as e:
-        check("raises uid required", "uid" in str(e))
+def test_uid_optional_and_identity():
+    print("[8] run-user OPTIONAL (global line identity) + identity_line")
+    # empty/unset run-user -> no uid (process runs as current user, no own rules)
+    check("unset uid -> None", pm.get_uid(_cfg(upstream="B"), "A") is None)
+    check("empty-string uid -> None", pm.get_uid(_cfg(uid="   "), "A") is None)
+    check("numeric uid passes through", pm.get_uid(_cfg(uid=1207), "A") == 1207)
+    check("string int uid parsed", pm.get_uid(_cfg(uid="1208"), "A") == 1208)
+
+    # stamp rules target iface_bind's generic type-route output chain
+    check("ROUTE_OUT_CHAIN == iface_bind.CHAIN_RESTORE", pm.ROUTE_OUT_CHAIN == ib.CHAIN_RESTORE)
+    check("iface_bind restore chain is TYPE ROUTE",
+          any(c["name"] == ib.CHAIN_RESTORE and c["type"] == "route"
+              for c in ib.plan_rules({"egress_marks": [{"iface": "ppp0", "mark": 51, "dynamic": True}]},
+                                     "ip", restore_exists=False)[0]))
+    # a mark-type upstream WITH its own run-user -> our process adopts ITS skuid
+    cfgs = {"M": {"mark": 60, "uid": 1260}, "A": _cfg(upstream="M", uid=1200)}
+    check("identity_line: mark-upstream w/ user -> M", pm.identity_line(cfgs, "A") == "M")
+    # ...but ONLY when that user actually resolves (else plan would stamp A's
+    # own uid while the process ran as M -> split-brain; must stay self)
+    check("identity_line: upstream user set but UNRESOLVED -> self",
+          pm.identity_line(cfgs, "A", {"M": None, "A": 1200}) == "A")
+    check("identity_line: upstream user resolves -> M",
+          pm.identity_line(cfgs, "A", {"M": 1260, "A": 1200}) == "M")
+    # upstream mark line WITHOUT a run-user -> keep our own identity
+    cfgs2 = {"M": {"mark": 60}, "A": _cfg(upstream="M", uid=1200)}
+    check("identity_line: mark-upstream no user -> self", pm.identity_line(cfgs2, "A") == "A")
+    # port-type upstream -> redirect is keyed on OUR skuid, so identity stays self
+    cfgs3 = {"P": {"daemon": "ss-redir", "port": 10507, "uid": 1270},
+             "A": _cfg(upstream="P", uid=1200)}
+    check("identity_line: port-upstream -> self", pm.identity_line(cfgs3, "A") == "A")
+    # a managed line without upstream -> self
+    check("identity_line: direct -> self", pm.identity_line({"A": _cfg(uid=1200)}, "A") == "A")
+    # port-chain consumer with NO own run-user produces NO redirect rule
+    # (this is exactly why router fails it CLOSED rather than leaking direct).
+    # P itself is direct -> gets an accept; A (uid None) -> skipped entirely.
+    rules = pm.plan_proxy_chain_rules(cfgs3, {"P": 1270, "A": None}, "ip")
+    check("port consumer w/o uid -> no redirect at all",
+          not any(x.get("redirect") for r in rules for x in r["expr"]), rules)
+    check("consumer A (uid None) yields no rule",
+          not any(any(e.get("match", {}).get("left") == {"meta": {"key": "skuid"}}
+                      and e["match"]["right"] == 1200 for e in r["expr"]) for r in rules))
 
 
 
@@ -599,10 +655,10 @@ def test_spec_quarantine():
 
 
 if __name__ == "__main__":
-    for t in (test_build_cmd, test_chain_validation, test_chain_rules, test_mark_upstream_chain, test_multi_instances, test_spec_quarantine,
+    for t in (test_build_cmd, test_chain_validation, test_uid_uniqueness, test_chain_rules, test_mark_upstream_chain, test_multi_instances, test_spec_quarantine,
               test_instance_fields_do_not_leak,
               test_supervisor_restart, test_supervisor_stop_semantics,
-              test_dependency_gating, test_redact, test_uid_requirement,
+              test_dependency_gating, test_redact, test_uid_optional_and_identity,
               test_reconfigure_diff, test_monitor_thread_safe_with_reconfigure):
         t()
     print("\n==== %d passed, %d failed ====" % (PASS, FAIL))

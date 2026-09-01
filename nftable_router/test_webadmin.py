@@ -87,13 +87,19 @@ def test_validate_config():
     bad["proxy"]["C"] = {"mark": 51}
     check("duplicate proxy mark caught", any("duplicate proxy mark" in e for e in wa.validate_config(bad)))
     bad2 = json.loads(json.dumps(good))
-    for k, port in (("A", 101), ("B", 102)):
+    for k, (port, uid) in (("A", (101, "nobody")), ("B", (102, "nogroup"))):
         bad2["proxy"][k].update({"daemon": "custom", "port": port,
-                                 "uid": "nobody", "cmd": ["/bin/sleep", "1"]})
+                                 "uid": uid, "cmd": ["/bin/sleep", "1"]})
     bad2["proxy"]["A"]["upstream"] = "B"
     bad2["proxy"]["B"]["upstream"] = "A"
     errs = wa.validate_config(bad2)
     check("proxy chain cycle caught", any("chain" in e and "loop" in e for e in errs), str(errs))
+    # same run-user on two lines is a distinct, earlier error
+    bad2u = json.loads(json.dumps(good))
+    bad2u["proxy"]["A"].update({"daemon": "custom", "port": 101, "uid": "nobody", "cmd": ["/x"]})
+    bad2u["proxy"]["B"].update({"daemon": "custom", "port": 102, "uid": "nobody", "cmd": ["/x"]})
+    check("duplicate run-user across lines caught",
+          any("run-user" in e for e in wa.validate_config(bad2u)), str(wa.validate_config(bad2u)))
     bad2b = json.loads(json.dumps(good))
     bad2b["proxy"]["A"]["upstream"] = "GHOST"
     check("chain: unknown upstream caught",

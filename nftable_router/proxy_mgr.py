@@ -5,7 +5,11 @@ Proxy process supervision + proxy-chain (A via B) loop prevention.
 New optional fields inside a nft_route.json proxy entry:
 
   "daemon":        "ss-redir" | "v2ray" | "sing-box" | "custom"  (absent = not managed)
-  "uid":           run-user name (REQUIRED for chained proxies; skuid matching)
+  "uid":           LINE run-user (OPTIONAL; empty = processes run as the
+                   current user and get no skuid identity rules). Binding a
+                   line to a run-user is GLOBAL line logic -- it lives with
+                   the line's basic info, not inside the managed proxy spec.
+                   Two lines must NEVER share one uid (enforced in validate).
   "server":        upstream server address   (fallback: existing "proxy_ip")
   "server_port":   upstream server port
   "password": / "password_file":   ss-redir -k / -t
@@ -15,25 +19,32 @@ New optional fields inside a nft_route.json proxy entry:
   "config":        v2ray / sing-box json config path
   "cmd":           custom: argv template, {field} placeholders from the entry
   "args":          extra argv appended to any daemon command line
-  "upstream":      proxy_id whose transparent port this proxy's own traffic
-                   should be chained through (enables ProxyA-via-ProxyB)
+  "upstream":      line this proxy's own traffic chains through. If the
+                   upstream line has its own run-user, our process executes
+                   AS THAT USER (identity binding -> the upstream line's
+                   skuid rules route its egress); port-type upstreams keep
+                   the classic consumer-keyed redirect.
   "autostart":     default true; false = supervise only if started manually
   "restart":       {"max": N, "window": seconds} rate-limit (default 5/300)
 
-Loop prevention / chain rules (INSERTED at the HEAD of nat_OUTPUT so they
-run BEFORE the policy NFQUEUE rule and the per-mark tproxy redirects;
-comment-tagged, managed entirely here because we know each proxy's uid):
-  chained (has "upstream"):
-    meta skuid == uid(A), tcp, daddr != @local, tcp dport != port(B)
-      -> redirect to port(B)          # incl. A's own server: that IS the chain
-  direct (managed, uid set, no upstream):
-    meta skuid == uid(A), daddr != @local -> accept
-      # exempts A's upstream traffic from policy marking, which could
-      # otherwise redirect it into A's own listener (self-loop)
-Self-loop / cycle / missing-upstream / unmanaged-upstream are rejected at
-plan time; chain start order is topological (deepest dependency first);
-each dependency's listen port is verified reachable before the dependent
-process is spawned.
+skuid identity rules (one set per LINE that has a run-user; comment-tagged,
+managed entirely here -- INSERT at HEAD of nat_OUTPUT for verdict rules so
+they run BEFORE the policy NFQUEUE; mark stamps go into the iface_bind
+TYPE-ROUTE output chain because a mark set after the routing decision never
+steers egress):
+  managed, upstream = port-line B : skuid A, tcp, daddr != @local,
+                                   dport != port(B) -> redirect :port(B)
+  managed, upstream = mark-line M : skuid A -> meta mark set M (+ct save)
+                                   [skipped when M has its own run-user: the
+                                    process then runs as M's user and M's own
+                                    stamp rule covers it]
+  managed, direct, line has mark  : skuid A -> meta mark set own mark (+ct)
+  managed, direct, no mark        : skuid A, daddr != @local -> accept
+  plain mark line w/ run-user     : skuid X -> meta mark set own mark (+ct)
+Self-loop / cycle / missing-upstream / unmanaged-upstream / duplicate uid are
+rejected at plan time; chain start order is topological (deepest dependency
+first); each dependency's listen port is verified reachable before the
+dependent process is spawned.
 """
 
 import errno
@@ -85,16 +96,53 @@ def is_managed(proxy_cfg):
 
 
 def get_uid(proxy_cfg, what=""):
-    """Resolve uid/user name -> int; raises ValueError."""
+    """Resolve the LINE's run-user ('uid') -> int. Empty/unset -> None:
+    no skuid identity, processes simply run as the current user. Raises
+    ValueError only for a named user that does not exist on the system."""
     u = proxy_cfg.get("uid")
-    if u is None:
-        raise ValueError("proxy %s must define 'uid' (skuid loop-guard)" % what)
+    if u is None or (isinstance(u, str) and not u.strip()):
+        return None
     if isinstance(u, int):
         return u
+    try:
+        return int(u)
+    except ValueError:
+        pass
     try:
         return pwd.getpwnam(u).pw_uid
     except KeyError:
         raise ValueError("unknown uid/user %r for proxy %s" % (u, what))
+
+
+def uid_identity(u):
+    """comparable identity for duplicate-run-user checks: resolved int when
+    the account exists, else the raw string."""
+    try:
+        return int(u)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return pwd.getpwnam(str(u)).pw_uid
+    except KeyError:
+        return str(u)
+
+
+def identity_line(proxy_cfgs, name, uid_cache=None):
+    """line whose RUN-USER the managed process executes as: a mark-type
+    upstream line with its own run-user owns the egress identity (skuid
+    stamp), so we run as IT; otherwise the line keeps its own identity.
+    Pass uid_cache (resolved name->int|None) so we only adopt an upstream
+    whose run-user actually RESOLVES; an unresolvable upstream account must
+    not hijack identity (plan then falls back to stamping the consumer's own
+    uid, so the two paths stay consistent)."""
+    cfg = proxy_cfgs.get(name) or {}
+    up = upstream_of(cfg)
+    if up and upstream_kind(proxy_cfgs, up) == "mark":
+        u_up = (proxy_cfgs.get(up) or {}).get("uid")
+        if u_up is not None and not (isinstance(u_up, str) and not u_up.strip()) and \
+                (uid_cache is None or uid_cache.get(up) is not None):
+            return up
+    return name
 
 
 def build_cmd(name, cfg):
@@ -268,7 +316,19 @@ def instances_of(name, cfg):
 
 def validate_chain(proxy_cfgs):
     """Returns ordered list [deepest dependency first]. Raises ValueError
-    describing the first problem found (unknown/unmanaged/self/cycle)."""
+    describing the first problem found (unknown/unmanaged/self/cycle).
+    Also enforces GLOBAL skuid uniqueness: one run-user == one line."""
+    seen_users = {}
+    for name, cfg in proxy_cfgs.items():
+        u = cfg.get("uid")
+        if u is None or (isinstance(u, str) and not u.strip()):
+            continue
+        key = uid_identity(u)
+        if key in seen_users:
+            raise ValueError("lines %s and %s bind the same run-user (%s) -- "
+                             "a skuid may identify exactly ONE line"
+                             % (seen_users[key], name, u))
+        seen_users[key] = name
     for name, cfg in proxy_cfgs.items():
         up = upstream_of(cfg)
         if up is None:
@@ -313,65 +373,99 @@ def validate_chain(proxy_cfgs):
 # loop-guard / chain nft rules (pure dicts; committed by router.py via nfu)
 # ---------------------------------------------------------------------------
 
+# iface_bind's generic type-route OUTPUT chain (mark changes there actually
+# re-trigger the routing decision; test_iface_bind asserts the constants match)
+ROUTE_OUT_CHAIN = "mangle_EGRESS_RESTORE"
+
+
+def _stamp_rule(family, uid, mark):
+    """skuid -> fwmark identity stamp, type-route OUTPUT chain so the packet
+    is ROUTED by the mark (a filter chain sets it after the route lookup).
+    Applies to tcp AND udp: the stamped mark is always an ip-rule routing
+    line's mark (no tproxy listener), so it can never re-trigger a udp tproxy
+    capture. A direct proxy is instead accept-guarded and, when it needs line
+    routing, should run AS a mark line's user rather than be stamped itself."""
+    return {"family": family, "table": "policy_route", "chain": ROUTE_OUT_CHAIN,
+            "comment": CHAIN_CMT, "expr": [
+                {"match": {"left": {"meta": {"key": "skuid"}}, "op": "==", "right": uid}},
+                {"match": {"left": {"payload": {"protocol": family, "field": "daddr"}},
+                           "op": "!=", "right": "@local"}},
+                {"counter": {"bytes": 0, "packets": 0}},
+                {"mangle": {"key": {"meta": {"key": "mark"}}, "value": int(mark)}},
+                {"mangle": {"key": {"ct": {"key": "mark"}}, "value": {"meta": {"key": "mark"}}}},
+            ]}
+
+
 def plan_proxy_chain_rules(proxy_cfgs, uid_cache, family="ip"):
-    """Per managed proxy with a known uid, keyed on ITS OWN skuid:
-      - chained  -> redirect to the upstream's transparent port
-      - direct   -> accept (skip the policy queue / tproxy-mark redirects)
-    Both guard against the self-connect loop where the policy engine marks a
-    proxy's own upstream flow with a tproxy mark and redirects it back into
-    its own listener. MUST be installed at the head of nat_OUTPUT (insert,
-    not append) or the policy queue rule verdicts first and these never run."""
+    """LINE-identity skuid rules (binding a line to a run-user is global
+    line logic; the managed process may additionally RUN AS its mark-type
+    upstream's user -- see identity_line -- and then needs no own rule):
+      managed + upstream port-line B : skuid A -> redirect :port(B)  [nat_OUTPUT head]
+      managed + upstream mark-line M (M without own run-user): skuid A -> stamp M.mark
+      managed direct, line has mark  : skuid A -> stamp own mark      [ROUTE chain]
+      managed direct, no mark        : skuid A -> accept              [nat_OUTPUT head]
+      plain mark line with run-user  : skuid X -> stamp own mark      [ROUTE chain]
+    Verdict rules MUST be inserted at the head of nat_OUTPUT (before the
+    policy NFQUEUE) or the queue verdicts first and these never run."""
     rules = []
     for name in proxy_cfgs:
         cfg = proxy_cfgs[name]
-        if not is_managed(cfg):
-            continue
         uid = uid_cache.get(name)
         if uid is None:
             continue
-        up_name = upstream_of(cfg)
         skuid = {"match": {"left": {"meta": {"key": "skuid"}}, "op": "==", "right": uid}}
         not_local = {"match": {"left": {"payload": {"protocol": family, "field": "daddr"}},
                                "op": "!=", "right": "@local"}}
-        if not up_name:
+        mark = cfg.get("mark") if isinstance(cfg.get("mark"), int) and cfg["mark"] > 0 else None
+        if not is_managed(cfg):
+            # pure identity line (an ip-rule upstream like hkfib, or any
+            # mark line the admin gave a run-user): everything it runs egresses
+            # through its own fwmark
+            if mark is not None:
+                rules.append(_stamp_rule(family, uid, mark))
+            continue
+        up_name = upstream_of(cfg)
+        if up_name and upstream_kind(proxy_cfgs, up_name) == "port":
+            up_port = int(proxy_cfgs[up_name]["port"])
+            expr = [
+                skuid,
+                {"match": {"left": {"meta": {"key": "l4proto"}}, "op": "==", "right": "tcp"}},
+                not_local,
+            ]
+            # belt & braces: never redirect a flow whose dport already IS the
+            # upstream port (would re-enter the same listener forever)
+            expr.append({"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}},
+                                   "op": "!=", "right": up_port}})
+            expr += [
+                {"counter": {"bytes": 0, "packets": 0}},
+                {"redirect": {"port": up_port}},
+            ]
+            rules.append({"family": family, "table": "policy_route", "chain": "nat_OUTPUT",
+                          "comment": CHAIN_CMT, "expr": expr})
+            continue
+        up_mark = None
+        if up_name:
+            up_cfg = proxy_cfgs.get(up_name) or {}
+            if uid_cache.get(up_name) is not None:
+                # our process RUNS AS the upstream line's user (identity_line);
+                # its own stamp rule steers the egress -- nothing keyed on us
+                continue
+            up_mark = up_cfg.get("mark")
+        if up_mark is not None:
+            # ip-rule upstream WITHOUT its own run-user: stamp our egress with
+            # the upstream mark (never our own line mark -- for udp-tproxy
+            # lines re-marking our egress 126-style would feed our own capture
+            # rule; a direct proxy wanting line routing should point at a
+            # mark line and run as ITS user instead)
+            rules.append(_stamp_rule(family, uid, up_mark))
+        else:
             # direct managed proxy: its upstream egress must never re-enter
-            # the policy queue (covers tcp AND udp)
+            # the policy queue / its own tproxy capture (covers tcp AND udp)
             rules.append({"family": family, "table": "policy_route", "chain": "nat_OUTPUT",
                           "comment": CHAIN_CMT, "expr": [
                               skuid, not_local,
                               {"counter": {"bytes": 0, "packets": 0}},
                               {"accept": None}]})
-            continue
-        if upstream_kind(proxy_cfgs, up_name) == "mark":
-            # ip-rule upstream: stamp this proxy's own egress with the
-            # upstream line mark -> `ip rule fwmark M table M` sends it out
-            # that line (works for tcp AND udp, no listener involved).
-            up_mark = int(proxy_cfgs[up_name]["mark"])
-            rules.append({"family": family, "table": "policy_route", "chain": "nat_OUTPUT",
-                          "comment": CHAIN_CMT, "expr": [
-                              skuid, not_local,
-                              {"counter": {"bytes": 0, "packets": 0}},
-                              {"mangle": {"key": {"meta": {"key": "mark"}}, "value": up_mark}},
-                              {"mangle": {"key": {"ct": {"key": "mark"}},
-                                           "value": {"meta": {"key": "mark"}}}},
-                          ]})
-            continue
-        up_port = int(proxy_cfgs[up_name]["port"])
-        expr = [
-            skuid,
-            {"match": {"left": {"meta": {"key": "l4proto"}}, "op": "==", "right": "tcp"}},
-            not_local,
-        ]
-        # belt & braces: never redirect a flow whose dport already IS the
-        # upstream port (would re-enter the same listener forever)
-        expr.append({"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}},
-                               "op": "!=", "right": up_port}})
-        expr += [
-            {"counter": {"bytes": 0, "packets": 0}},
-            {"redirect": {"port": up_port}},
-        ]
-        rules.append({"family": family, "table": "policy_route", "chain": "nat_OUTPUT",
-                      "comment": CHAIN_CMT, "expr": expr})
     return rules
 
 
@@ -575,11 +669,13 @@ class ProxySupervisor(threading.Thread):
         self._port_wait = port_wait or wait_port
         uid_cache = {}
         for n, c in proxy_cfgs.items():
-            if is_managed(c):
-                try:
-                    uid_cache[n] = get_uid(c, n)
-                except ValueError as e:
-                    self.log("uid error: %s" % e)
+            # EVERY line can own a run-user (global skuid identity), not only
+            # managed ones: mark/upstream lines get stamp rules too.
+            try:
+                uid_cache[n] = get_uid(c, n)
+            except ValueError as e:
+                self.log("uid error: %s" % e)
+                uid_cache[n] = None
         self.uid_cache = uid_cache
         self.spec_errors = {}           # key -> build error (quarantined specs)
         self._stop_evt = threading.Event()
@@ -591,6 +687,7 @@ class ProxySupervisor(threading.Thread):
             c = proxy_cfgs[n]
             if not is_managed(c):
                 continue
+            suid = uid_cache.get(identity_line(proxy_cfgs, n, uid_cache))
             keys = []
             for tag, icfg in instances_of(n, c):
                 key = n if not tag else "%s#%s" % (n, tag)
@@ -602,9 +699,9 @@ class ProxySupervisor(threading.Thread):
                     self.log("%s: spec error, SKIPPED: %s" % (key, e))
                     self.spec_errors[key] = str(e)
                     continue
-                spawn = self._spawn or make_uid_spawner(uid_cache.get(n),
+                spawn = self._spawn or make_uid_spawner(suid,
                                                         logfile=instance_logfile(key))
-                p = ManagedProxy(key, icfg, argv, uid_cache.get(n), line=n,
+                p = ManagedProxy(key, icfg, argv, suid, line=n,
                                  spawn=spawn, sleeper=self._sleep, timer=self._now)
                 self.proxies[key] = p
                 keys.append(key)
@@ -693,19 +790,20 @@ class ProxySupervisor(threading.Thread):
     def _build_proxies(self, proxy_cfgs, order):
         """-> (built_instances_by_key, uid_cache, lines_map). A line with
         'instances' yields one ManagedProxy per instance (key 'line#tag');
-        they share the line uid, so one skuid anti-loop/chain rule covers all."""
+        the whole line runs under its IDENTITY user (own uid, or the uid of
+        its mark-type upstream line), so one skuid rule covers all."""
         built, uids, lines = {}, {}, {}
         self.spec_errors = {}
         for n in order:
             c = proxy_cfgs[n]
-            if not is_managed(c):
-                continue
-            uid = None
             try:
-                uid = get_uid(c, n)
+                uids[n] = get_uid(c, n)
             except ValueError as e:
                 self.log("uid error: %s" % e)
-            uids[n] = uid
+                uids[n] = None
+            if not is_managed(c):
+                continue
+            suid = uids.get(identity_line(proxy_cfgs, n, uids))
             keys = []
             try:
                 insts = instances_of(n, c)
@@ -723,8 +821,8 @@ class ProxySupervisor(threading.Thread):
                         built[key] = self.proxies[key]   # keep running old instance
                         keys.append(key)
                     continue
-                spawn = self._spawn or make_uid_spawner(uid, logfile=instance_logfile(key))
-                built[key] = ManagedProxy(key, icfg, argv, uid, line=n,
+                spawn = self._spawn or make_uid_spawner(suid, logfile=instance_logfile(key))
+                built[key] = ManagedProxy(key, icfg, argv, suid, line=n,
                                           spawn=spawn, sleeper=self._sleep, timer=self._now)
                 keys.append(key)
             lines[n] = keys

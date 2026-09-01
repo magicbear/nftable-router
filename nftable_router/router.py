@@ -678,6 +678,13 @@ def apply_egress_rules(nfu, ip_family):
     except Exception as e:
         syslog.syslog(syslog.LOG_WARNING, "egress ruleset inspect failed: %s" % e)
         restore_exists = False
+    if not restore_exists:
+        # recreate our named restore chain: deployments made before the
+        # rerouting fix have it as 'type filter @ -120' which CANNOT be
+        # altered into 'type route @ -150' (mark changes there are applied
+        # AFTER the route lookup -- no fwmark policy effect). Delete+re-add.
+        nfu.nft.json_cmd({"nftables": [{"delete": {"chain": {
+            "family": ip_family, "table": "policy_route", "name": ib.CHAIN_RESTORE}}}]})
     chains, rules = ib.plan_rules(config, ip_family, restore_exists=restore_exists)
     for ch in chains:
         nfu.add_chain(ch)
@@ -789,35 +796,54 @@ def install_proxy_chain_rules():
         nfu.delete_rules(comment=pmm.CHAIN_CMT, family=None)
     except Exception as e:
         syslog.syslog(syslog.LOG_WARNING, "clear proxy-chain rules failed: %s" % e)
-    if not managed:
+    order = []
+    if managed:
+        try:
+            order = pmm.validate_chain(config["proxy"])
+        except ValueError as e:
+            print(tf.format("{msg:s,bg_red,black}", msg="[-] proxy chain config error, management DISABLED: %s" % e))
+            syslog.syslog(syslog.LOG_CRIT, "proxy chain config error, management disabled: %s" % e)
+            return  # broken chain config disables ALL proxy-chain rules (fail closed)
+    else:
         if g_proxy_sup:
             g_proxy_sup.stop_all()
             g_proxy_sup = None
         _sync_udp_tproxy_loop({4: set(), 6: set()})
-        return
-    try:
-        order = pmm.validate_chain(config["proxy"])
-    except ValueError as e:
-        print(tf.format("{msg:s,bg_red,black}", msg="[-] proxy chain config error, management DISABLED: %s" % e))
-        syslog.syslog(syslog.LOG_CRIT, "proxy chain config error, management disabled: %s" % e)
-        return
     uid_cache = {}
     chain_disabled = set()
-    for name in list(managed):
+    # the run-user is an OPTIONAL per-line identity (empty = process simply
+    # runs as the current user, no skuid rules). An unknown system account
+    # still fails CLOSED where a skuid rule is load-bearing: chain consumers
+    # and chain targets lose their loop-prevention without one.
+    for name, cfg in config["proxy"].items():
         try:
-            uid_cache[name] = pmm.get_uid(managed[name], name)
+            uid_cache[name] = pmm.get_uid(cfg, name)
         except ValueError as e:
-            if pmm.upstream_of(managed[name]) or any(
-                    pmm.upstream_of(c) == name for n, c in managed.items()):
-                # uid is mandatory for chained proxies (skuid rules). Fail
-                # CLOSED: without the skuid rule its traffic would silently
-                # bypass the chain (direct leak), so don't run it at all.
+            load_bearing = (pmm.is_managed(cfg) and pmm.upstream_of(cfg)) or any(
+                pmm.is_managed(c) and pmm.upstream_of(c) == name
+                for c in config["proxy"].values())
+            uid_cache[name] = None
+            if load_bearing and name in managed:
                 print(tf.format("{msg:s,bg_red,black}", msg="[-] %s (chained proxy NOT started)" % e))
                 syslog.syslog(syslog.LOG_CRIT, "proxy chain disabled for %s (not started): %s" % (name, e))
                 managed.pop(name)
                 chain_disabled.add(name)
             else:
-                uid_cache[name] = None
+                syslog.syslog(syslog.LOG_WARNING, "line %s: %s -- no skuid rules for it" % (name, e))
+    # PORT-chain consumers: their OWN line skuid is the only anchor of the
+    # redirect rule; with an empty run-user the egress would silently leak
+    # direct instead of chaining -> fail closed (mark-type upstreams are fine
+    # empty: the process simply runs as the upstream line's identity user)
+    for name in list(managed):
+        up = pmm.upstream_of(managed[name])
+        if up and uid_cache.get(name) is None and \
+                pmm.upstream_kind(config["proxy"], up) == "port":
+            print(tf.format("{msg:s,bg_red,black}",
+                            msg="[-] %s: 端口链上游(%s)要求本线路设置运行用户(skuid)，未设置 -- 不托管该线路" % (name, up)))
+            syslog.syslog(syslog.LOG_CRIT,
+                          "proxy %s chained to port-upstream %s without own run-user (not started)" % (name, up))
+            managed.pop(name)
+            chain_disabled.add(name)
     print("[*] managed proxies, start order (deepest dependency first):")
     for n, cfg in config["proxy"].items():
         if n not in managed:
@@ -836,6 +862,8 @@ def install_proxy_chain_rules():
             continue
         for tag, icfg in insts:
             label = n if not tag else "%s#%s" % (n, tag)
+            idl = pmm.identity_line(config["proxy"], n, uid_cache)
+            idu = uid_cache.get(idl)
             try:
                 argv = pmm.build_cmd(label, icfg)
             except ValueError as e:
@@ -843,22 +871,70 @@ def install_proxy_chain_rules():
                 continue
             iwhere = where or "direct: %s:%s" % (
                 icfg.get("server") or icfg.get("proxy_ip"), icfg.get("server_port", "-"))
-            print("      [%-14s] %-8s :%-6s %s  uid=%s  cmd=%s" % (
-                label, icfg.get("daemon"), icfg.get("port"), iwhere,
-                uid_cache.get(n), " ".join(pmm.redact(argv))))
+            print("      [%-14s] %-8s :%-6s %s  uid=%s%s  cmd=%s" % (
+                label, icfg.get("daemon"), icfg.get("port"), iwhere, idu,
+                ("(line %s)" % idl if idl != n else "") if idu is not None else "(未绑定:按当前用户运行)",
+                " ".join(pmm.redact(argv))))
             if icfg.get("password"):
                 print("      [!] %s: inline password visible in /proc cmdline; prefer 'password_file'" % label)
     n_ok = 0
     for ip_family in ("ip", "ip6"):
+        planned = pmm.plan_proxy_chain_rules(config["proxy"], uid_cache, ip_family)
+        stamps = [r for r in planned if r["chain"] == ib.CHAIN_RESTORE]
+        verdicts = [r for r in planned if r["chain"] != ib.CHAIN_RESTORE]
+        if stamps:
+            # guarantee the type-route chain with the CURRENT spec: iface
+            # bindings may be absent entirely, or the chain may predate the
+            # rerouting fix (filter @ -120) and nobody recreates it then.
+            spec = {"family": ip_family, "table": "policy_route", "name": ib.CHAIN_RESTORE,
+                    "type": "route", "hook": "output",
+                    "prio": ib.RESTORE_PRIO, "policy": "accept"}
+            try:
+                rq, ro, _ = nfu.nft.json_cmd({"nftables": [
+                    {"list": {"chain": {"family": ip_family, "table": "policy_route",
+                                        "name": ib.CHAIN_RESTORE}}}]})
+            except Exception:
+                rq, ro = 1, None
+            cur = None
+            if rq == 0 and isinstance(ro, dict):
+                for it in ro.get("nftables", []):
+                    if isinstance(it, dict) and isinstance(it.get("chain"), dict):
+                        cur = it["chain"]
+                        break
+            if cur is None:
+                nfu.add_chain(spec)
+            else:
+                hk = cur.get("hook") if isinstance(cur.get("hook"), dict) else {}
+                prio_val = cur.get("prio", hk.get("priority"))
+                if cur.get("type") not in (None, "route") or (
+                        prio_val is not None and prio_val != ib.RESTORE_PRIO):
+                    nfu.nft.json_cmd({"nftables": [{"delete": {"chain": {
+                        "family": ip_family, "table": "policy_route",
+                        "name": ib.CHAIN_RESTORE}}}]})
+                    nfu.add_chain(spec)
+                    syslog.syslog(syslog.LOG_NOTICE,
+                                  "route chain %s/%s recreated (type/prio upgrade)"
+                                  % (ip_family, ib.CHAIN_RESTORE))
         # INSERT at the head of nat_OUTPUT: the policy queue rule verdicts
         # (queue) before appended rules would ever run, so appended skuid
         # rules are dead code exactly when the policy engine marks a proxy's
         # own upstream flow. Insert in reverse to preserve planned order.
-        for r in reversed(pmm.plan_proxy_chain_rules(config["proxy"], uid_cache, ip_family)):
+        for r in reversed(verdicts):
             rc = nfu.insert_rule(dict(r))
             if rc[0] != 0:
                 print(tf.format("{msg:s,bg_red,black}", msg="[-] insert proxy-chain rule failed (%s): %s" % (ip_family, rc)))
                 syslog.syslog(syslog.LOG_CRIT, "insert proxy-chain rule failed %s: %s" % (ip_family, rc))
+            else:
+                n_ok += 1
+        # identity stamps APPEND into the type-route output chain (only a
+        # route-type chain reroutes after a mark change; iface_bind owns the
+        # chain itself -- it exists whenever any egress binding is planned,
+        # and we ensured it above otherwise)
+        for r in stamps:
+            rc = nfu.add_rule(dict(r))
+            if rc[0] != 0:
+                print(tf.format("{msg:s,bg_red,black}", msg="[-] add skuid stamp rule failed (%s): %s" % (ip_family, rc)))
+                syslog.syslog(syslog.LOG_CRIT, "add skuid stamp rule failed %s: %s" % (ip_family, rc))
             else:
                 n_ok += 1
     print("[+] proxy-chain skuid rules: %d installed" % n_ok)
@@ -908,6 +984,9 @@ def install_proxy_chain_rules():
         print("    " + msg)
         syslog.syslog(syslog.LOG_NOTICE, msg)
         proxy_state_update(name, state, pid)
+
+    if not managed:
+        return  # no supervisors without managed lines (rules/stamps already done)
 
     # chained proxies whose uid could not be resolved must not run (their
     # traffic would silently bypass the chain) -> supervise but never start
