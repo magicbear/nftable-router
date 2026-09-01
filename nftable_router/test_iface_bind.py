@@ -225,9 +225,9 @@ def test_rules_safety_and_shape():
           set4["type"] == "nat" and set4["hook"] == "prerouting")
     check("setter prio after conntrack(-200) before policy queue(-90)",
           -200 < set4["prio"] < -90)
-    check("restore chain: type filter, hook output",
-          res4["type"] == "filter" and res4["hook"] == "output")
-    check("restore prio before -90", -200 < res4["prio"] < -90)
+    check("restore chain: type route, hook output (mark change reroutes)",
+          res4["type"] == "route" and res4["hook"] == "output")
+    check("restore prio is mangle class (-150)", res4["prio"] == -150)
     check("ip rules safe", ib.rules_are_safe(rules4))
     check("ip6 rules safe", ib.rules_are_safe(rules6))
 
@@ -388,17 +388,26 @@ def test_clear_egress_rules():
 
 
 def test_restore_json_detection():
-    print("[14] restore_in_ruleset works on real nft JSON output")
+    print("[14] restore_in_ruleset: only TYPE ROUTE output chains count (reroute works)")
     rs = {"nftables": [
-        {"table": {"family": "ip", "name": "mangle"}},
-        {"rule": {"family": "ip", "table": "mangle", "chain": "PREROUTING", "expr": [
+        {"chain": {"family": "ip", "table": "mangle", "name": "ROUTE_OUT", "type": "route",
+                   "hook": {"hook": "output", "priority": -150, "policy": "accept"}}},
+        {"rule": {"family": "ip", "table": "mangle", "chain": "ROUTE_OUT", "expr": [
             {"match": {"left": {"ct": {"key": "mark"}}, "op": "!=", "right": 0}},
             {"match": {"left": {"meta": {"key": "mark"}}, "op": "==", "right": 0}},
             {"mangle": {"key": {"meta": {"key": "mark"}}, "value": {"ct": {"key": "mark"}}}}]}},
     ]}
-    check("JSON ruleset with restore -> True (ip)", ib.restore_in_ruleset(rs, "ip"))
+    check("restore inside type-route output chain -> True (ip)", ib.restore_in_ruleset(rs, "ip"))
     check("other family -> False", not ib.restore_in_ruleset(rs, "ip6"))
     check("bare rule list also accepted", ib.restore_in_ruleset(rs["nftables"], "ip"))
+    rs_f = {"nftables": [
+        {"chain": {"family": "ip", "table": "mangle", "name": "OUTPUT", "type": "filter",
+                   "hook": {"hook": "output", "priority": -120, "policy": "accept"}}},
+        {"rule": {"family": "ip", "table": "mangle", "chain": "OUTPUT", "expr": [
+            {"mangle": {"key": {"meta": {"key": "mark"}}, "value": {"ct": {"key": "mark"}}}}]}},
+    ]}
+    check("same rule in FILTER chain does NOT count (no reroute, production bug)",
+          not ib.restore_in_ruleset(rs_f, "ip"))
     check("garbage -> False", not ib.restore_in_ruleset("no restore here", "ip"))
 
 

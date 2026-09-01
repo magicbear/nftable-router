@@ -62,7 +62,11 @@ EGRESS_MARKS_KEY = "egress_marks"
 CHAIN_SET = "nat_EGRESS_SET"
 CHAIN_RESTORE = "mangle_EGRESS_RESTORE"
 SET_PRIO = -95
-RESTORE_PRIO = -120
+# type route chain MUST run before the (re)routing decision -- mangle class.
+# A type FILTER OUTPUT chain cannot influence local routing: the kernel picks
+# the route BEFORE netfilter output runs; only "type route" re-triggers the
+# fib lookup after a meta mark change (nftables' answer to iptables MARK).
+RESTORE_PRIO = -150
 DANGEROUS_VERDICTS = {"accept", "drop", "queue", "redirect", "tproxy", "reject"}
 RESTORE_SIGNATURE = "meta mark set ct mark"
 
@@ -355,7 +359,7 @@ def plan_rules(cfg, family="ip", restore_exists=None):
         ]})
     if not restore_exists:
         chains.append({"family": family, "table": "policy_route", "name": CHAIN_RESTORE,
-                       "type": "filter", "hook": "output", "prio": RESTORE_PRIO, "policy": "accept"})
+                       "type": "route", "hook": "output", "prio": RESTORE_PRIO, "policy": "accept"})
         rules.append({"family": family, "table": "policy_route", "chain": CHAIN_RESTORE, "expr": [
             _match({"ct": {"key": "mark"}}, "!=", 0),
             _match({"meta": {"key": "mark"}}, "==", 0),
@@ -387,9 +391,14 @@ def clear_egress_rules(nfu, family, comment):
 
 
 def restore_in_ruleset(ruleset, family="ip"):
-    """Detect an equivalent generic ct->meta restore already deployed
-    (e.g. the manual 'Src-Route Policy' in table mangle). Accepts either the
-    nft JSON ruleset dict / list or raw text (substring fallback)."""
+    """Detect an equivalent generic ct->meta restore that ACTUALLY works:
+    the rule must live in a TYPE ROUTE output chain. A type filter chain
+    sets the skb mark only AFTER the routing decision -> ip rule fwmark
+    never sees it (production incident: proxy upstream traffic marked in
+    ct, but every flow egressed via the main default route).
+    Accepts either the nft JSON ruleset dict / list or raw text (substring
+    fallback -- type cannot be verified there, e.g. the manual 'Src-Route
+    Policy' deployments)."""
     if isinstance(ruleset, str):
         try:
             ruleset = json.loads(ruleset)
@@ -401,10 +410,22 @@ def restore_in_ruleset(ruleset, family="ip"):
         items = list(ruleset)
     else:
         items = []
+    route_chains = set()
+    for item in items:
+        ch = item.get("chain") if isinstance(item, dict) else None
+        if not isinstance(ch, dict) or ch.get("type") != "route":
+            continue
+        hook = ch.get("hook")
+        hook = hook.get("hook") if isinstance(hook, dict) else hook
+        if hook not in (None, "output") or ch.get("family") not in (family, "inet"):
+            continue
+        route_chains.add((ch.get("family"), ch.get("table"), ch.get("name")))
     for item in items:
         rule = item.get("rule") if isinstance(item, dict) else None
         # an inet-family table covers both ip and ip6 hooks
         if not rule or rule.get("family") not in (family, "inet"):
+            continue
+        if (rule.get("family"), rule.get("table"), rule.get("chain")) not in route_chains:
             continue
         for e in rule.get("expr", []):
             m = e.get("mangle", {}) if isinstance(e, dict) else {}
