@@ -551,10 +551,26 @@ def test_iprule_apply_lifecycle():
     r7 = ib.iprule_apply(ipr5, [dyn_plan], auto_gateway=lambda dev, fam: "10.0.0.1")
     check("auto gateway resolved into route",
           any(c[1] == "add" and c[0] == "route" and c[2]["gateway"] == "10.0.0.1" for c in ipr5.calls))
+    # ppp0 reality: PPPoE has NO gateway anywhere (pppd itself installs
+    # gateway-less 'default dev ppp0'). Dynamic bindings must fall back to the
+    # dev-only table default instead of waiting forever (TEL-FIB regression).
     ipr6 = MockIPRoute()
     r8 = ib.iprule_apply(ipr6, [dyn_plan], auto_gateway=lambda dev, fam: None)
-    check("auto gw unavailable -> pending", r8["pending"] and not any(
-        c[0] == "route" and c[1] == "add" for c in ipr6.calls))
+    docr = [c[2] for c in ipr6.calls if c[0] == "route" and c[1] == "add"]
+    check("auto gw unavailable (ppp-like) -> dev-only default added, no gateway key",
+          bool(docr) and "gateway" not in docr[0] and docr[0].get("oif") == 33
+          and docr[0].get("table") == 51, str(ipr6.calls))
+    check("dev-only binding not left pending", not r8["pending"], str(r8))
+    ipr6b = MockIPRoute()
+    ib.iprule_apply(ipr6b, [dyn_plan], auto_gateway=lambda dev, fam: None)
+    ipr6b.calls = []
+    r8b = ib.iprule_apply(ipr6b, [dyn_plan], auto_gateway=lambda dev, fam: None)
+    check("dev-only apply is idempotent", ipr6b.calls == [] and r8b["kept"] == [51],
+          str(ipr6b.calls))
+    ipr7 = MockIPRoute(links={})
+    r9 = ib.iprule_apply(ipr7, [dyn_plan], auto_gateway=lambda dev, fam: None)
+    check("dev missing (ppp down) still pending", r9["pending"] and not any(
+        c[0] == "route" and c[1] == "add" for c in ipr7.calls))
 
 
 def test_external_rule_adopts_table():

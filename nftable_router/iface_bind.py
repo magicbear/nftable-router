@@ -692,22 +692,38 @@ def iprule_apply(ipr, plans, log=None, auto_gateway=None):
             resolver = auto_gateway or _main_default_gateway
             gw = resolver(dev, fam)
             if gw is None:
-                res["pending"].append((p["mark"], "auto gateway: no default on %s yet" % dev))
-                continue
-        if gw is None:
+                # PPPoE-style dynamic links carry NO gateway anywhere: pppd
+                # itself installs plain 'default dev ppp0' (a gateway-less
+                # point-to-point route), so the main-table gateway probe can
+                # never resolve -- waiting for one would keep the table empty
+                # forever. For dynamic iface bindings fall back to the dev-only
+                # form, the canonical 'default dev ppp0 table M'.
+                if p.get("dynamic"):
+                    gw = None  # dev-only
+                else:
+                    res["pending"].append((p["mark"], "auto gateway: no default on %s yet" % dev))
+                    continue
+        elif gw is None and not p.get("dynamic"):
             res["pending"].append((p["mark"], "gateway not set"))
             continue
         try:
             existing = current_default(ipr, p["table"], fam)
-            want = {"dst": "default", "gateway": gw, "table": p["table"], "family": af[fam]}
+            want = {"dst": "default", "table": p["table"], "family": af[fam]}
+            if gw is not None:
+                want["gateway"] = gw
             if idx is not None:
                 want["oif"] = idx
             if p["src"]:
                 want["src"] = p["src"]
-            same = (existing is not None
-                    and existing.get("gateway") == gw
-                    and (p["src"] is None or existing.get("src") == p["src"])
-                    and (idx is None or existing.get("oif") in (idx, None)))
+            if gw is None and idx is not None:
+                # dev-only binding: the table default must point at THIS device
+                same = (existing is not None and existing.get("gateway") is None
+                        and existing.get("oif") == idx)
+            else:
+                same = (existing is not None
+                        and existing.get("gateway") == gw
+                        and (p["src"] is None or existing.get("src") == p["src"])
+                        and (idx is None or existing.get("oif") in (idx, None)))
             if same:
                 continue
             if existing is not None:
