@@ -617,16 +617,26 @@ def iprule_apply(ipr, plans, log=None, auto_gateway=None):
             return None
 
     def current_default(ipr_obj, table, fam):
-        """existing default-route attrs dict for a table, or None"""
+        """existing default-route attrs dict for a table, or None.
+        NOTE: must DUMP the table and filter dst_len==0 -- a GETROUTE request
+        carrying RTA_DST is a FIB *lookup* (kernel resolves through the rules,
+        returning whatever default main/core computes, NOT this table's
+        content). That misuse made every dev-only plan look 'drifted' against
+        a foreign default -> silent del + duplicate add -> EEXIST spam."""
         try:
-            for rt in ipr_obj.get_routes(table=table, dst="default", family=af[fam]):
+            for rt in ipr_obj.get_routes(table=table, family=af[fam]):
+                o = rt.get("_object", rt)
+                # dst_len missing (test fixtures / synthetic dumps) = default
+                if o.get("dst_len", rt.get("dst_len", 0)) != 0:
+                    continue  # only the default route
                 attrs = {"gateway": None, "src": None, "oif": None}
                 for a, v in (rt.get("attrs") or []):
                     if a in ("RTA_GATEWAY", "RTA_SRC", "RTA_OIF"):
                         attrs[{"RTA_GATEWAY": "gateway", "RTA_SRC": "src",
                                 "RTA_OIF": "oif"}[a]] = v
-                o = rt.get("_object", rt)
                 attrs["gateway"] = o.get("gateway", attrs["gateway"])
+                attrs["src"] = o.get("src", attrs["src"])
+                attrs["oif"] = o.get("oif", attrs["oif"])
                 return attrs
             return None
         except Exception:
