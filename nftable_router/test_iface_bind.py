@@ -592,6 +592,18 @@ def test_iprule_apply_lifecycle():
     check("pointopoint detection matches flags", ib._link_is_pointopoint(
         MockIPRoute(links={"ppp0": 1, "bond0.2000": 2}), "ppp0")
         and not ib._link_is_pointopoint(MockIPRoute(), "bond0.2000"))
+    # TUNNEL devices (tun/gre/sit/vti/wireguard) are POINTOPOINT|NOARP as well:
+    # the gateway-less fallback must apply to them too ('default dev tun126').
+    # Detection is FLAG-based (not name-based) exactly for this reason.
+    ipr9 = MockIPRoute(links={"tun126": (30, 0x8000 | 0x80 | 0x1)})
+    tun_plan = dict(ib.iprule_plan(_cfg_with_bindings(
+        [{"iface": "tun126", "mark": 126, "dynamic": True,
+           "iprule": {"gateway": "auto"}}]), 4)[0])
+    r11 = ib.iprule_apply(ipr9, [tun_plan], auto_gateway=lambda dev, fam: None)
+    check("tun device: dev-only default fallback applies (flag-based)",
+          any(c[0] == "route" and c[1] == "add" and c[2].get("oif") == 30
+              and "gateway" not in c[2] and c[2].get("table") == 126
+              for c in ipr9.calls), str(ipr9.calls))
 
 
 def test_external_rule_adopts_table():
