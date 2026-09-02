@@ -107,14 +107,14 @@ def test_rt_table_name():
 
 
 def test_local_lo_route():
-    print("[2] local default dev lo scope host: add + idempotent")
+    print("[2] default dev lo scope link (unicast): add + idempotent")
     ipr = MockIPRoute()
     logs = []
     added = ut.ensure_local_lo_route(ipr, 100, 4, log=logs.append)
     check("route added first time", added is True)
-    check("route uses lo ifindex, type local, scope host",
-          ipr.routes[0]["oif"] == 1 and ipr.routes[0]["type"] == "local"
-          and ipr.routes[0]["scope"] == "host")
+    check("route uses lo ifindex, unicast, scope link",
+          ipr.routes[0]["oif"] == 1 and ipr.routes[0]["scope"] == "link"
+          and ipr.routes[0].get("type") in (None, "unicast"))
     check("table id correct", ipr.routes[0]["table"] == 100)
 
     added2 = ut.ensure_local_lo_route(ipr, 100, 4, log=logs.append)

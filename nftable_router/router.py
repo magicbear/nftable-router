@@ -981,15 +981,15 @@ def install_proxy_chain_rules():
                 n_ok += 1
     print("[+] proxy-chain skuid rules: %d installed" % n_ok)
 
-    # local (router-self) UDP output -> loopback -> TPROXY, only for lines
-    # that have BOTH udp_v{4,6}+port AND a resolvable managed uid: the
-    # self-loop guard is the skuid accept-guard rule just installed above
-    # (proxy_mgr.plan_proxy_chain_rules' "direct" branch), which needs a
-    # known uid to exist at all -- without it this loop is NOT safe to
-    # enable, so lines with an unresolved uid are skipped here too.
+    # local (router-self) UDP output -> loopback -> TPROXY, for every managed
+    # line that has udp_v{4,6}+port: build by capability. NO own-uid gate
+    # here: the self-loop guard is the skuid accept rule keyed on the uid the
+    # process actually runs under -- inherited from the chain identity
+    # (proxy_mgr.identity_line: own uid, else the mark-upstream's) -- and the
+    # startup chain-loop quarantine already removed looping lines above.
     udp_lines_by_family = {4: set(), 6: set()}
     for n, cfg in config["proxy"].items():
-        if n not in managed or uid_cache.get(n) is None:
+        if n not in managed:
             continue
         port, mark = cfg.get("port"), cfg.get("mark")
         if not port or mark is None:

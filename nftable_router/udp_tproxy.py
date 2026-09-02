@@ -13,7 +13,7 @@ needs for UDP.
 The standard workaround: once a locally-generated UDP packet has been
 classified (fwmark == a udp-tproxy-enabled proxy line's mark, same
 GeoIP/domain classification pipeline as everything else), a policy route
-sends it out via a `local default dev lo` route instead of a real
+sends it out via a `default dev lo` (unicast) route instead of a real
 interface. A `local`-type route makes the kernel redeliver the packet
 through the local-input path instead of actually transmitting it, which
 re-enters PREROUTING (this time with iif=lo) -- where an ordinary mangle
@@ -25,7 +25,7 @@ This module owns:
     for `ip rule`/`ip route show table tproxy` -- the actual rule/route
     installation always uses the resolved numeric id via pyroute2, so this
     works correctly even if the file can't be written).
-  * that table's content: `local default dev lo scope host`, once per
+  * that table's content: `default dev lo scope link` (unicast), once per
     family, idempotent.
   * one `ip rule add fwmark <mark> ipproto udp lookup tproxy` per
     udp-tproxy-enabled proxy mark, idempotent.
@@ -103,8 +103,14 @@ def _af(family):
 
 
 def ensure_local_lo_route(ipr, table_id, family, log=None):
-    """Ensure route table `table_id` has `local default dev lo scope host`
-    for `family`. Idempotent. Returns True if a route was added."""
+    """Ensure table `table_id` has `default dev lo` (unicast, scope link) for
+    `family`. Idempotent. Returns True if a route was added.
+
+    0.9.x/5.10 pitfall (production 2026-09-02): a `local`-TYPE default route
+    here makes connect() fail with ENETUNREACH for every marked socket, while
+    sendto() works -- use a plain unicast route instead: the packet is still
+    emitted on lo and re-enters PREROUTING (iif lo), which is all the tproxy
+    capture needs."""
     logf = log or (lambda m: None)
     af = _af(family)
     lo_idx = ipr.link_lookup(ifname="lo")
@@ -113,9 +119,9 @@ def ensure_local_lo_route(ipr, table_id, family, log=None):
     lo_idx = lo_idx[0]
     if list(ipr.get_routes(table=table_id, dst="default", family=af)):
         return False
-    ipr.route("add", dst="default", type="local", scope="host",
+    ipr.route("add", dst="default", scope="link",
               oif=lo_idx, table=table_id, family=af)
-    logf("route table %d: local default dev lo scope host (family %d)" % (
+    logf("route table %d: default dev lo scope link (family %d)" % (
         table_id, family))
     return True
 
@@ -173,7 +179,7 @@ def sync(ipr, marks, family, table_name=TPROXY_TABLE_NAME,
          preferred_table=TPROXY_TABLE_PREFERRED, priority_base=TPROXY_RULE_PRIO_BASE,
          rt_tables_path=RT_TABLES_PATH, log=None):
     """Idempotent reconcile for one family: ensure the named table exists,
-    ensure its `local default dev lo` content, ensure one ip rule per mark,
+    ensure its `default dev lo` (unicast) content, ensure one ip rule per mark,
     remove ip rules for marks no longer present. Safe to call every reload.
     `marks`: iterable of proxy fwmarks needing local-UDP-output tproxy."""
     marks = sorted(set(int(m) for m in marks))
