@@ -437,14 +437,22 @@ import socket as _sock
 
 class MockIPRoute:
     def __init__(self, links=None, rules=None, routes=None):
+        # values: idx OR (idx, flags); bare ppp* default to POINTOPOINT|NOARP|UP,
+        # every other bare name to UP|BROADCAST|RUNNING (realistic for VLANs)
         self.links = links if links is not None else {"ppp0": 33, "bond0.2000": 13}
         self.rules = list(rules or [])      # {priority, fwmark, table, family}
         self.routes = list(routes or [])    # {table, family, attrs:[(RTA_*,v)..]}
         self.calls = []
+    def _li(self, n):
+        v = self.links[n]
+        if isinstance(v, tuple):
+            return v
+        return (v, (0x8000 | 0x80 | 0x1) if n.startswith("ppp") else (0x1 | 0x2 | 0x1000))
     def get_links(self):
-        return [{"index": i, "attrs": [("IFLA_IFNAME", n)]} for n, i in self.links.items()]
+        return [{"index": self._li(n)[0], "flags": self._li(n)[1],
+                 "attrs": [("IFLA_IFNAME", n)]} for n in self.links]
     def link_lookup(self, ifname=None):
-        return [self.links[ifname]] if ifname in self.links else []
+        return [self._li(ifname)[0]] if ifname in self.links else []
     def get_rules(self, family=None):
         return [r for r in self.rules if r.get("family") in (family, None)]
     def rule(self, cmd, **kw):
@@ -571,6 +579,19 @@ def test_iprule_apply_lifecycle():
     r9 = ib.iprule_apply(ipr7, [dyn_plan], auto_gateway=lambda dev, fam: None)
     check("dev missing (ppp down) still pending", r9["pending"] and not any(
         c[0] == "route" and c[1] == "add" for c in ipr7.calls))
+    # BROADCAST devices never get the gateway-less fallback (5G CPE VLAN case:
+    # it would clobber the good statically-declared table default)
+    ipr8 = MockIPRoute(links={"bond0.118": 21})
+    bcast_plan = dict(ib.iprule_plan(_cfg_with_bindings(
+        [{"iface": "bond0.118", "mark": 118, "dynamic": True,
+           "iprule": {"gateway": "auto"}}]), 4)[0])
+    r10 = ib.iprule_apply(ipr8, [bcast_plan], auto_gateway=lambda dev, fam: None)
+    check("broadcast dev: no gw -> pending, NOT a gateway-less route",
+          r10["pending"] and not any(c[0] == "route" and c[1] == "add" for c in ipr8.calls),
+          str(ipr8.calls))
+    check("pointopoint detection matches flags", ib._link_is_pointopoint(
+        MockIPRoute(links={"ppp0": 1, "bond0.2000": 2}), "ppp0")
+        and not ib._link_is_pointopoint(MockIPRoute(), "bond0.2000"))
 
 
 def test_external_rule_adopts_table():

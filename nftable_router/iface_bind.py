@@ -692,13 +692,15 @@ def iprule_apply(ipr, plans, log=None, auto_gateway=None):
             resolver = auto_gateway or _main_default_gateway
             gw = resolver(dev, fam)
             if gw is None:
-                # PPPoE-style dynamic links carry NO gateway anywhere: pppd
-                # itself installs plain 'default dev ppp0' (a gateway-less
-                # point-to-point route), so the main-table gateway probe can
-                # never resolve -- waiting for one would keep the table empty
-                # forever. For dynamic iface bindings fall back to the dev-only
-                # form, the canonical 'default dev ppp0 table M'.
-                if p.get("dynamic"):
+                # PPPoE-style links carry NO gateway anywhere: pppd itself
+                # installs plain 'default dev ppp0' (point-to-point, gateway-
+                # less), so the main-table gateway probe can never resolve --
+                # waiting for one keeps the table empty forever. Fall back to
+                # the dev-only table default, but ONLY for point-to-point
+                # devices: on a broadcast net (e.g. the 5G CPE VLANs) a
+                # gateway-less route is broken and would clobber a good
+                # statically-declared default.
+                if p.get("dynamic") and _link_is_pointopoint(ipr, dev):
                     gw = None  # dev-only
                 else:
                     res["pending"].append((p["mark"], "auto gateway: no default on %s yet" % dev))
@@ -737,6 +739,29 @@ def iprule_apply(ipr, plans, log=None, auto_gateway=None):
         except Exception as e:
             res["errors"].append("route table %d: %s" % (p["table"], e))
     return res
+
+
+IFF_POINTOPOINT = 0x8000
+IFF_NOARP = 0x80
+
+
+def _link_is_pointopoint(ipr, dev):
+    """True when <dev> is a point-to-point link (ppp/pppoe/sit/wireguard...):
+    IFF_POINTOPOINT or IFF_NOARP. Only such devices may safely carry a
+    gateway-less 'default dev X' route; on broadcast media that route is
+    broken (per-dst ARP) and would clobber a good declared default."""
+    try:
+        for l in ipr.get_links():
+            if hasattr(l, "get_attr"):
+                name = l.get_attr("IFLA_IFNAME")
+            else:
+                name = next((v for a, v in (l.get("attrs") or [])
+                             if a == "IFLA_IFNAME"), None)
+            if name == dev:
+                return bool(int(l.get("flags") or 0) & (IFF_POINTOPOINT | IFF_NOARP))
+    except Exception:
+        pass
+    return False
 
 
 def _main_default_gateway(dev, family=4):
