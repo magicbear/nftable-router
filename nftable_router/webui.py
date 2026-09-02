@@ -3,13 +3,13 @@
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260902-0310"
+UI_VERSION = "20260902-0400"
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nft-route 管理台</title>
-<script>var UI_VER="20260902-0310";</script>
+<script>var UI_VER="20260902-0400";</script>
 <style>
 :root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
 --green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
@@ -513,13 +513,19 @@ function editProxy(name){
    server_port:c.server_port!=null?String(c.server_port):"",
    cipher:c.cipher||c.method||"",password:c.password||"",password_file:c.password_file||""};
   var raw_insts=(c.instances instanceof Array)?JSON.parse(JSON.stringify(c.instances)):[];
+  // Line-level (legacy) protocol fields may ONLY seed a line that has no
+  // instances at all. Once instances exist they are the single source of
+  // truth -- the line mirror (proxy_ip=inst[0].server, single-main flatten)
+  // must NOT backfill empty fields of other instances (bug: switching to
+  // instance #2 showed instance #1's values in every empty field).
+  var legacy_fallback=(raw_insts.length===0);
   function materialize(o,i){
    var r={name:String(o.name||("i"+i))};
    if(o.port!=null&&o.port!=="")r.port=parseInt(o.port,10);
    ["mode","plugin","plugin_opts","bind_addr","server","cipher","password","password_file"].forEach(function(k){
-    var v=(o[k]!=null&&String(o[k])!=="")?String(o[k]):(line_srv[k]||"");
+    var v=(o[k]!=null&&String(o[k])!=="")?String(o[k]):(legacy_fallback?(line_srv[k]||""):"");
     if(v!=="")r[k]=v});
-   var sp=(o.server_port!=null&&String(o.server_port)!=="")?String(o.server_port):(line_srv.server_port||"");
+   var sp=(o.server_port!=null&&String(o.server_port)!=="")?String(o.server_port):(legacy_fallback?(line_srv.server_port||""):"");
    if(sp!=="")r.server_port=parseInt(sp,10);
    if(!r.mode)r.mode="tcp";
    return r}
