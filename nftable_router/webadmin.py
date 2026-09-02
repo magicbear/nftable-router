@@ -1250,7 +1250,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             # FRESHNESS FIRST: an outdated page snapshot normally fails content
             # validation for keys the user never edited -> say "stale" not ghost
-            # errors (CPE5G family-flags confusion root cause)
+            # errors (udp line family-flags confusion root cause)
             base_mtime = body.get("base_mtime")
             try:
                 cur_mtime = os.stat(self.cfg_path()).st_mtime
