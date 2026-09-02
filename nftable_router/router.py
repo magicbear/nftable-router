@@ -654,10 +654,57 @@ def egress_wizard_ui(input_fn):
     sync_iprules("wizard")
 
 
+def ensure_hook_chains(nfu, ip_family):
+    """BOOT-ONLY creation (and healing) of the iface/proxy base chains.
+
+    HOOK INVARIANT -- kernel safety, not style: on 5.10.84 an nft transaction
+    that registers/unregisters a base chain WHILE packets sit in an nfqueue
+    trips `nfqnl_flush -> nf_reinject` (queue entries cache the hook INDEX,
+    which hook churn invalidates) -- observed live as a kernel WARN/oops with
+    Comm=python3 inside nf_tables_commit. Therefore the three egress chains
+    are created HERE, once per family, BEFORE the NFQUEUE is bound, and no
+    runtime path (reload included) ever adds or deletes a chain again; reload
+    only churns RULES, which never touches hook indices.
+
+    Healing (delete+recreate of a wrongly-typed leftover chain from older
+    builds) is likewise boot-only -- the pre-flight queue probe already
+    guaranteed nobody owns the queue right now, so the flush here is empty."""
+    specs = [
+        {"family": ip_family, "table": "policy_route", "name": ib.CHAIN_SET,
+         "type": "nat", "hook": "prerouting", "prio": ib.SET_PRIO, "policy": "accept"},
+        {"family": ip_family, "table": "policy_route", "name": ib.CHAIN_RESTORE,
+         "type": "filter", "hook": "output", "prio": ib.RESTORE_PRIO, "policy": "accept"},
+        dict(ib.route_chain_spec(ip_family), policy="accept"),
+    ]
+    for spec in specs:
+        cur = nfu.get_chain_info(ip_family, "policy_route", spec["name"])
+        if cur is not None:
+            hk = cur.get("hook") if isinstance(cur.get("hook"), dict) else {}
+            prio_val = cur.get("prio", hk.get("priority"))
+            wrong = cur.get("type") not in (None, spec["type"]) or (
+                prio_val is not None and prio_val != spec["prio"])
+            if wrong:
+                print("      [heal] chain %s/%s type=%s prio=%s -> %s @ %s"
+                      % (ip_family, spec["name"], cur.get("type"), prio_val,
+                         spec["type"], spec["prio"]))
+                syslog.syslog(syslog.LOG_WARNING, "healing hook chain %s/%s (type=%s prio=%s)"
+                              % (ip_family, spec["name"], cur.get("type"), prio_val))
+                nfu.delete_chain(ip_family, "policy_route", spec["name"], force=True)
+                cur = None
+        if cur is None:
+            rc = nfu.add_chain(dict(spec))
+            if rc[0] != 0:
+                print(tf.format("{msg:s,bg_red,black}",
+                                msg="[-] add hook chain %s failed: %s" % (spec["name"], rc)))
+                syslog.syslog(syslog.LOG_CRIT, "add hook chain %s/%s failed: %s"
+                              % (ip_family, spec["name"], rc))
+
+
 def apply_egress_rules(nfu, ip_family):
     """Install prerouting setter rules (+ generic OUTPUT restore only when the
     running ruleset has none). Pure 'meta mark/ct mark set' -- no verdicts,
-    no drop of transit traffic."""
+    no drop of transit traffic. NEVER touches chains (hook invariant -- see
+    ensure_hook_chains); boot created the three egress hooks already."""
     bindings = ib.get_bindings(config)
     if not bindings:
         return
@@ -678,20 +725,7 @@ def apply_egress_rules(nfu, ip_family):
     except Exception as e:
         syslog.syslog(syslog.LOG_WARNING, "egress ruleset inspect failed: %s" % e)
         restore_exists = False
-    if not restore_exists:
-        # heal stale chains from earlier buggy builds: one registered our named
-        # RESTORE chain as 'type route @ -150' (connmark restore MUST stay a
-        # plain filter @ -120 chain; egress steering is CHAIN_ROUTE's job).
-        # Deletion goes through nfu.delete_chain = LIST-then-delete-BY-HANDLE:
-        # JSON delete-chain BY NAME NULL-derefs libnftables 0.9.8 (the
-        # recurring boot-time SIGSEGV of recent builds -- see nft_utils).
-        for stale in (ib.CHAIN_RESTORE, ib.CHAIN_ROUTE):
-            if nfu.delete_chain(ip_family, "policy_route", stale, force=True):
-                print("[*] healed stale chain %s/%s" % (ip_family, stale))
-                syslog.syslog(syslog.LOG_NOTICE, "healed stale chain %s/%s" % (ip_family, stale))
-    chains, rules = ib.plan_rules(config, ip_family, restore_exists=restore_exists)
-    for ch in chains:
-        nfu.add_chain(ch)
+    _chains, rules = ib.plan_rules(config, ip_family, restore_exists=restore_exists)
     n_ok = 0
     for r in rules:
         params = dict(r)
@@ -912,14 +946,16 @@ def install_proxy_chain_rules():
         planned = pmm.plan_proxy_chain_rules(config["proxy"], uid_cache, ip_family)
         stamps = [r for r in planned if r["chain"] == ib.CHAIN_ROUTE]
         verdicts = [r for r in planned if r["chain"] != ib.CHAIN_ROUTE]
-        if stamps:
-            # idempotent (same flat form every boot, like the nat chains).
-            # Forms verified crash-free on this nftables build by
-            # tools/type_route_probe.py before merging back.
-            rc = nfu.add_chain(ib.route_chain_spec(ip_family))
-            if rc[0] != 0:
-                print(tf.format("{msg:s,bg_red,black}", msg="[-] add route chain failed (%s): %s" % (ip_family, rc)))
-                syslog.syslog(syslog.LOG_CRIT, "add route chain failed %s: %s" % (ip_family, rc))
+        if stamps and nfu.get_chain_info(ip_family, "policy_route", ib.CHAIN_ROUTE) is None:
+            # HOOK INVARIANT: chains are boot-created only (ensure_hook_chains).
+            # Missing here = someone deleted it under us -> stamps cannot be
+            # placed WITHOUT registering a hook mid-life (nf_reinject oops
+            # class) -> refuse and demand a restart.
+            msg = ("route chain %s/%s missing (deleted externally?) -- skuid "
+                   "stamps SKIPPED; restart the master to rebuild hooks safely" % (ip_family, ib.CHAIN_ROUTE))
+            print(tf.format("{msg:s,bg_red,black}", msg="[-] " + msg))
+            syslog.syslog(syslog.LOG_CRIT, msg)
+            stamps = []
         # INSERT at the head of nat_OUTPUT: the policy queue rule verdicts
         # (queue) before appended rules would ever run, so appended skuid
         # rules are dead code exactly when the policy engine marks a proxy's
@@ -1679,9 +1715,12 @@ def stop_all_executors(grace=1.5):
 
 def quit(signum, sigframe):
     if is_master:
-        print("[*] clear rules by received signal %d" % (signum))
-        clearRules()
-        print("[*] clear rules by received signal %d finished" % (signum))
+        print("[*] shutdown requested by signal %d" % (signum))
+        # kernel-safe ORDERING: do NOT clear rules here -- workers are still
+        # reading and the queue still bound; deleting tables unregisters hooks
+        # whose queued packets the kernel flushes into nf_reinject (the 5.10.84
+        # oops class). Raise into the main loop; its KeyboardInterrupt handler
+        # performs the safe sequence (stop workers -> drain queue -> clearRules).
         raise KeyboardInterrupt
 
 
@@ -1840,6 +1879,29 @@ if __name__ == "__main__":
 
     load_config()
 
+    # PRE-FLIGHT GUARD (kernel-safety, dmesg 5.10.84 oops: nf_tables_commit ->
+    # __nf_unregister_net_hook -> nfqnl_flush -> nf_reinject WARN): touching
+    # nft tables/hooks WHILE packets sit in an NFQUEUE is an oops trigger.
+    # Orphaned 'Policy Route - Wxx' workers of a crashed master keep queue 4
+    # alive with exactly such packets. So, BEFORE any table modification: try
+    # to own queue 4. Busy -> refuse to boot (clean error, zero kernel
+    # changes). OK -> unbind immediately: the close drains the queue and, with
+    # no owner, the ['bypass']-flagged rules ACCEPT new packets instead of
+    # queueing -- the queue stays empty across the boot rebuild below.
+    try:
+        _probe_q = netfilterqueue.NetfilterQueue()
+        _probe_q.bind(4, lambda pkt: None, mode=netfilterqueue.COPY_PACKET)
+        _probe_q.unbind()
+        del _probe_q
+    except OSError as _pqe:
+        msg = ("queue 4 busy at boot (%s) -- stale 'Policy Route' workers from a "
+               "crashed master may still hold it. Refusing to modify nft tables "
+               "(kernel nf_reinject oops risk). Fix: pkill -9 -f 'Policy Route' "
+               "(and nft_route.py), then start again." % _pqe)
+        print(tf.format("{msg:s,bg_red,black}", msg="[-] " + msg))
+        syslog.syslog(syslog.LOG_CRIT, msg)
+        sys.exit(1)
+
     print("[*] load ipdb")
     db = ipdb.City(config['ipdb_v4'])
     db_v6 = None
@@ -1880,6 +1942,11 @@ if __name__ == "__main__":
         nfu.add_set(family=ip_family, table="policy_route", name="nat_interfaces", set_type="iface_index")
         nfu.add_set(family=ip_family, table="policy_route", name="redir_ports", set_type="inet_service")
         nfu.add_set_element(family=ip_family, table="policy_route", name="nat_interfaces", element=nat_interfaces)
+
+        # iface/proxy egress hooks: created ONCE here at boot, before the
+        # nfqueue bind -- reload paths must never churn chains (kernel hook
+        # index race with queued packets, see ensure_hook_chains)
+        ensure_hook_chains(nfu, ip_family)
 
         nfu.add_chain(
             {"family": ip_family, "table": "policy_route", "name": "nat_PREROUTING", "type": "nat",
@@ -2453,9 +2520,23 @@ if __name__ == "__main__":
             if g_webadmin is not None:
                 g_webadmin.shutdown()   # stop webadmin child with the main app
             if g_proxy_sup:
-                g_proxy_sup.stop_all()   # before rules are cleared & master SIGKILLs itself
-            clearRules()
+                g_proxy_sup.stop_all()   # managed proxies out before their rules
+            # KERNEL-SAFE TEARDOWN ORDER: stop the NFQUEUE readers and drain
+            # the queue BEFORE any table/hook deletion. clearRules() unregisters
+            # base chains; if packets still sit in queue 4/53 the kernel flushes
+            # them through nfqnl_flush -> nf_reinject (the 5.10.84 oops). So:
+            # workers down -> unbind (closes+drains our queue fd) -> clearRules.
             stop_all_executors()
+            # term.value (set above) lets the DNS child drop its own queue-53
+            # loop; give it a beat so it is not sendmsg-ing while we clearRules.
+            if dns_proc is not None and dns_proc.is_alive():
+                dns_proc.join(1.5)
+            try:
+                if "nfqueue" in globals() and nfqueue is not None:
+                    nfqueue.unbind()
+            except Exception as e:
+                print("[-] nfqueue unbind: %r" % e)
+            clearRules()
             print("[*] system exit")
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
             os.kill(os.getpid(), signal.SIGKILL)

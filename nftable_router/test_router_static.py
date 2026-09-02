@@ -68,25 +68,92 @@ def check_file(path):
             if "attr='start'" not in code:
                 errors.append("install_proxy_chain_rules never calls supervisor .start()")
 
-    # libnftables 0.9.8 landmine (3 production segfaults, 'segfault at 48'
-    # inside nft_run_cmd_from_buffer): a JSON delete of a CHAIN addressed by
-    # NAME NULL-derefs. Only nft_utils.delete_chain may delete chains at all,
-    # and it resolves the HANDLE first -- forbid raw name-based deletes and
-    # require 'handle' inside that one sanctioned call site.
+    # libnftables 0.9.8 landmine (production segfaults, 'segfault at 48'
+    # inside nft_run_cmd_from_buffer): ANY name-addressed JSON op that targets
+    # a MISSING object NULL-derefs -- measured matrix (2026-09-02,
+    # tools/missing_obj_probe.py):
+    #   CRASH: delete/list/flush chain BY NAME (missing), delete set BY NAME
+    #          (missing), delete rule by BOGUS HANDLE
+    #   SAFE : bulk list ruleset/tables, add chain twice (rc=0 no-op),
+    #          add/delete element, add rule, delete rule by VALID handle
+    # Only nft_utils may touch chains/sets at all, and it must resolve
+    # existence/handles from the bulk ruleset dump (_ruleset_scan) first.
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     import glob as _glob
+    landmines = ('"delete": {"chain"', '"list": {"chain"', '"flush": {"chain"',
+                 '"delete": {"set"')
     for path in _glob.glob(os.path.join(pkg_dir, "*.py")):
         if os.path.basename(path).startswith("test_"):
             continue
         src = open(path).read()
-        n = src.count('"delete": {"chain"')
-        if path.endswith("nft_utils.py"):
-            if n and "handle" not in src[src.index('"delete": {"chain"') - 900:
-                                       src.index('"delete": {"chain"') + 400]:
-                errors.append("nft_utils: JSON chain delete without handle resolution")
-        elif n:
-            errors.append("%s: JSON delete-chain BY NAME (0.9.8 SIGSEGV) -- use nfu.delete_chain"
-                          % os.path.basename(path))
+        if os.path.basename(path) == "nft_utils.py":
+            # each sanctioned site must be preceded by existence/handle
+            # resolution from the bulk dump (handle/_ruleset_scan/get_rules)
+            for frag in ('"delete": {"chain"', '"delete": {"set"'):
+                i = src.find(frag)
+                if i >= 0:
+                    ctx = src[max(0, i - 1500): i + 500]
+                    if not any(k in ctx for k in ("handle", "_ruleset_scan", "get_rules")):
+                        errors.append("nft_utils: %s without bulk-dump existence "
+                                      "resolution" % frag)
+        else:
+            for frag in landmines:
+                if frag in src:
+                    errors.append("%s: %s (0.9.8 SIGSEGV on missing object) "
+                                  "-- go through nft_utils"
+                                  % (os.path.basename(path), frag))
+    # HOOK INVARIANT (5.10.84 kernel oops class: nf_tables_commit ->
+    # __nf_unregister_net_hook -> nfqnl_flush -> nf_reinject WARN, seen live
+    # with Comm=python3): base chains/hooks must be created ONLY at boot
+    # before the NFQUEUE is bound -- no runtime path may ever churn them.
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+    def _chain_calls(fn):
+        return [n.func.attr for n in ast.walk(fn)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr in ("add_chain", "delete_chain")]
+
+    for fname in ("apply_egress_rules", "install_proxy_chain_rules"):
+        fn = funcs.get(fname)
+        if fn is not None:
+            bad_calls = _chain_calls(fn)
+            if bad_calls:
+                errors.append("%s churns chains at runtime (%s) -- hooks are boot-only "
+                              "(nf_reinject oops class)" % (fname, sorted(set(bad_calls))))
+    if "ensure_hook_chains" not in funcs:
+        errors.append("ensure_hook_chains missing (boot hook creation site)")
+
+    # quit() must NOT clearRules itself (workers/queue still live -> flush race);
+    # it must delegate to the main-loop KeyboardInterrupt teardown.
+    q = funcs.get("quit")
+    if q is not None and any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                             and n.func.id == "clearRules" for n in ast.walk(q)):
+        errors.append("quit() clears rules directly -- teardown must go through the "
+                      "main loop (stop workers -> unbind -> clearRules)")
+
+    # in __main__: the boot pre-flight queue probe must precede the FIRST
+    # table deletion (a crashed master's orphan worker may still hold packets;
+    # deleting/rebuilding with a live queue = the flush race), AND the hook
+    # chains must be created before the REAL nfqueue bind (ip_mark callback)
+    # so the reload path never has to churn a chain later.
+    def _first(pred):
+        lines = [n.lineno for n in ast.walk(mainblk) if pred(n)]
+        return min(lines) if lines else None
+    ln_delete_table = _first(lambda n: isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                             and n.func.attr == "delete_table")
+    ln_probe_bind = _first(lambda n: isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                           and n.func.attr == "bind" and n.args
+                           and isinstance(n.args[0], ast.Constant) and n.args[0].value == 4
+                           and len(n.args) > 1 and not (isinstance(n.args[1], ast.Name) and n.args[1].id == "ip_mark"))
+    ln_real_bind = _first(lambda n: isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                          and n.func.attr == "bind" and len(n.args) > 1
+                          and isinstance(n.args[1], ast.Name) and n.args[1].id == "ip_mark")
+    ln_hooks = _first(lambda n: isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                      and n.func.id == "ensure_hook_chains")
+    if ln_delete_table is not None and (ln_probe_bind is None or ln_probe_bind > ln_delete_table):
+        errors.append("boot: queue-4 pre-flight probe must run before the first delete_table")
+    if ln_real_bind is not None and (ln_hooks is None or ln_hooks > ln_real_bind):
+        errors.append("boot: ensure_hook_chains must create hooks before the real nfqueue bind")
     return errors
 
 

@@ -137,8 +137,17 @@ class nftUtils():
         }}}]})
 
     def delete_set(self, name, table, family="ip"):
-        # print("[-] delete set %s %s %s" % (family, name, table))
-        return self.nft.json_cmd({"nftables": [{"delete": {"set": {'name': name, 'table': table, 'family': family}}}]})
+        # print("[-] delete set %s %s %s" % (family, table, name))
+        # 0.9.8 LANDMINE: a name-addressed DELETE of a MISSING set NULL-derefs
+        # ('segfault at 48' -- probed, tools/missing_obj_probe.py). Resolve
+        # existence from the bulk ruleset dump first; no-op when absent.
+        for item in self._ruleset_scan():
+            st = item.get("set") if isinstance(item, dict) else None
+            if (isinstance(st, dict) and st.get("name") == name
+                    and st.get("table") == table and st.get("family") == family):
+                return self.nft.json_cmd({"nftables": [{"delete": {"set": {
+                    'name': name, 'table': table, 'family': family}}}]})
+        return (0, '', '')
 
     def add_set_element(self, name, element, table='filter', family="ip"):
         return self.nft.json_cmd({"nftables": [{"add": {"element": {
@@ -210,35 +219,43 @@ class nftUtils():
     """
 
     def get_chain_info(self, family, table, name):
-        """Chain object via JSON 'list chain' (name-based LIST is supported and
-        crash-free), or None when absent. """
-        res = self.nft.json_cmd({"nftables": [
-            {"list": {"chain": {"family": family, "table": table, "name": name}}}]})
-        if res[0] != 0:
-            return None
-        out = res[1]
-        if isinstance(out, str):
-            import json as _json
-            try:
-                out = _json.loads(out)
-            except ValueError:
-                return None
-        if not isinstance(out, dict):
-            return None
-        for item in out.get("nftables", []):
+        """Chain object via the FULL ruleset dump, or None when absent.
+
+        0.9.8 LANDMINE (production 2026-09-02, 'segfault at 48' inside
+        nft_run_cmd_from_buffer): a name-addressed `list chain` NULL-derefs
+        whenever the chain is MISSING -- same class as delete-by-name. The
+        earlier "name-based LIST is supported and crash-free" assumption was
+        WRONG (it only held for chains that exist). Bulk `list ruleset` never
+        names a possibly-absent object, so it is the only sanctioned lookup."""
+        for item in self._ruleset_scan():
             ch = item.get("chain") if isinstance(item, dict) else None
-            if isinstance(ch, dict) and ch.get("name") == name:
+            if (isinstance(ch, dict) and ch.get("name") == name
+                    and ch.get("table") == table and ch.get("family") == family):
                 return ch
         return None
+
+    def _ruleset_scan(self):
+        """Full ruleset dump as a list of json items. The ONLY lookup form on
+        libnftables 0.9.8 that cannot reference a missing object, hence the
+        only crash-free way to resolve existence/handles (probed via
+        tools/missing_obj_probe.py: name-addressed delete/list/flush CRASH on
+        missing targets, even delete-rule-by-bogus-handle; bulk list never
+        does)."""
+        rc, out, _ = self.nft.json_cmd({"nftables": [{"list": {"ruleset": None}}]})
+        if rc != 0 or not isinstance(out, dict):
+            return []
+        return out.get("nftables", [])
 
     def delete_chain(self, family, table, name, force=False):
         """HARD REQUIREMENT (production SIGSEGV x3): on libnftables 0.9.8 a
         JSON 'delete chain' addressed BY NAME NULL-derefs inside
         nft_run_cmd_from_buffer ('segfault at 48', no netlink frame, not
-        catchable). Chains can ONLY be deleted by HANDLE -> list first (name
-        lookups ARE supported for list), then delete the handle.
-        force=True also removes the rules inside (kernel refuses deleting a
-        chain that still holds rules). -> True when a chain was deleted."""
+        catchable). A name-addressed `list chain` of a MISSING chain crashes
+        the SAME way -- so existence is resolved from the bulk ruleset dump
+        only (get_chain_info -> _ruleset_scan), and the chain is deleted by
+        HANDLE. force=True also removes the rules inside (kernel refuses
+        deleting a chain that still holds rules). -> True when a chain was
+        deleted."""
         ch = self.get_chain_info(family, table, name)
         if not ch or ch.get("handle") is None:
             return False
