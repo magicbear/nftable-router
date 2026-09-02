@@ -67,6 +67,26 @@ def check_file(path):
                 errors.append("install_proxy_chain_rules no longer references ProxySupervisor")
             if "attr='start'" not in code:
                 errors.append("install_proxy_chain_rules never calls supervisor .start()")
+
+    # libnftables 0.9.8 landmine (3 production segfaults, 'segfault at 48'
+    # inside nft_run_cmd_from_buffer): a JSON delete of a CHAIN addressed by
+    # NAME NULL-derefs. Only nft_utils.delete_chain may delete chains at all,
+    # and it resolves the HANDLE first -- forbid raw name-based deletes and
+    # require 'handle' inside that one sanctioned call site.
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    import glob as _glob
+    for path in _glob.glob(os.path.join(pkg_dir, "*.py")):
+        if os.path.basename(path).startswith("test_"):
+            continue
+        src = open(path).read()
+        n = src.count('"delete": {"chain"')
+        if path.endswith("nft_utils.py"):
+            if n and "handle" not in src[src.index('"delete": {"chain"') - 900:
+                                       src.index('"delete": {"chain"') + 400]:
+                errors.append("nft_utils: JSON chain delete without handle resolution")
+        elif n:
+            errors.append("%s: JSON delete-chain BY NAME (0.9.8 SIGSEGV) -- use nfu.delete_chain"
+                          % os.path.basename(path))
     return errors
 
 

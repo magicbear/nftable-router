@@ -682,12 +682,13 @@ def apply_egress_rules(nfu, ip_family):
         # heal stale chains from earlier buggy builds: one registered our named
         # RESTORE chain as 'type route @ -150' (connmark restore MUST stay a
         # plain filter @ -120 chain; egress steering is CHAIN_ROUTE's job).
-        # A 'mangle_EGRESS_ROUTE' left over from the earlier experiment is
-        # recreated with the current spec by install_proxy_chain_rules when
-        # stamps exist. Blind delete of a missing chain = harmless no-op.
+        # Deletion goes through nfu.delete_chain = LIST-then-delete-BY-HANDLE:
+        # JSON delete-chain BY NAME NULL-derefs libnftables 0.9.8 (the
+        # recurring boot-time SIGSEGV of recent builds -- see nft_utils).
         for stale in (ib.CHAIN_RESTORE, ib.CHAIN_ROUTE):
-            nfu.nft.json_cmd({"nftables": [{"delete": {"chain": {
-                "family": ip_family, "table": "policy_route", "name": stale}}}]})
+            if nfu.delete_chain(ip_family, "policy_route", stale, force=True):
+                print("[*] healed stale chain %s/%s" % (ip_family, stale))
+                syslog.syslog(syslog.LOG_NOTICE, "healed stale chain %s/%s" % (ip_family, stale))
     chains, rules = ib.plan_rules(config, ip_family, restore_exists=restore_exists)
     for ch in chains:
         nfu.add_chain(ch)

@@ -209,8 +209,45 @@ class nftUtils():
     }
     """
 
-    def delete_chain(self, params):
-        return self.nft.json_cmd({"nftables": [{"delete": {"chain": params}}]})
+    def get_chain_info(self, family, table, name):
+        """Chain object via JSON 'list chain' (name-based LIST is supported and
+        crash-free), or None when absent. """
+        res = self.nft.json_cmd({"nftables": [
+            {"list": {"chain": {"family": family, "table": table, "name": name}}}]})
+        if res[0] != 0:
+            return None
+        out = res[1]
+        if isinstance(out, str):
+            import json as _json
+            try:
+                out = _json.loads(out)
+            except ValueError:
+                return None
+        if not isinstance(out, dict):
+            return None
+        for item in out.get("nftables", []):
+            ch = item.get("chain") if isinstance(item, dict) else None
+            if isinstance(ch, dict) and ch.get("name") == name:
+                return ch
+        return None
+
+    def delete_chain(self, family, table, name, force=False):
+        """HARD REQUIREMENT (production SIGSEGV x3): on libnftables 0.9.8 a
+        JSON 'delete chain' addressed BY NAME NULL-derefs inside
+        nft_run_cmd_from_buffer ('segfault at 48', no netlink frame, not
+        catchable). Chains can ONLY be deleted by HANDLE -> list first (name
+        lookups ARE supported for list), then delete the handle.
+        force=True also removes the rules inside (kernel refuses deleting a
+        chain that still holds rules). -> True when a chain was deleted."""
+        ch = self.get_chain_info(family, table, name)
+        if not ch or ch.get("handle") is None:
+            return False
+        handle = ch["handle"]
+        if force:
+            self.delete_rules(table=table, chain=name, family=family)
+        res = self.nft.json_cmd({"nftables": [{"delete": {"chain": {
+            "family": family, "table": table, "handle": handle}}}]})
+        return res[0] == 0
 
     def cidr(self, addr, mask):
         return {'prefix': {'addr': addr, 'len': mask}}
