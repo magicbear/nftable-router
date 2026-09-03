@@ -1,0 +1,7 @@
+include LICENSE
+include README.md
+include nft_route.json
+recursive-include nftable_router/webui_parts *.css *.html *.js
+exclude nftable_router/test_*.py
+prune tools
+prune dist

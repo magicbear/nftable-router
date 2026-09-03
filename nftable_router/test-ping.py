@@ -5,7 +5,7 @@ import os.path
 import sys
 import argparse
 import subprocess
-from pytput import TputFormatter
+from nftable_router.compat import TputFormatter
 import ipdb
 import socket
 

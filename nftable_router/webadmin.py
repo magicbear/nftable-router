@@ -69,6 +69,14 @@ except Exception:
         pa = None
 
 try:
+    from nftable_router.arp_snmp import pick_mac_port
+except Exception:
+    try:
+        from arp_snmp import pick_mac_port
+    except Exception:
+        pick_mac_port = None
+
+try:
     import psutil
 except ImportError:
     psutil = None
@@ -282,6 +290,126 @@ def signal_master(sig=signal.SIGUSR1, pidfile=None):
         return {"ok": False, "error": str(e)}
 
 
+def switch_status(app, cfg=None):
+    """Configured switches joined with each collector's live SW::STATUS
+    heartbeat (written by arp_snmp.py) and the redis entry counts it
+    produced. A collector process can be 'alive' while its SNMP walks all
+    fail, so process liveness alone would be misleading -- last_poll age is
+    what actually tells you the data is fresh."""
+    out = {"ok": True, "devices": [], "enabled": False}
+    try:
+        sw = (cfg or {}).get("switches") or {}
+        if isinstance(sw, bool):
+            sw = {"enabled": sw}
+        out["enabled"] = bool(sw.get("enabled", True)) and bool(sw.get("devices"))
+        out["python"] = sw.get("python") or sys.executable
+        out["log_dir"] = sw.get("log_dir")
+        devices = sw.get("devices") or []
+    except Exception as e:
+        return {"ok": False, "error": str(e), "devices": []}
+
+    live = {}
+    try:
+        r = redis.Redis(host=app.args.redis_host, port=app.args.redis_port,
+                        db=app.args.redis_db, socket_timeout=2, socket_connect_timeout=2)
+        raw = r.hgetall("SW::STATUS") or {}
+        for k, v in raw.items():
+            try:
+                live[k.decode("utf-8", "replace")] = json.loads(v.decode("utf-8", "replace"))
+            except (ValueError, AttributeError):
+                pass
+        for d in devices:
+            name = str(d.get("name") or d.get("ip") or "")
+            st = live.get(name) or {}
+            sysname = st.get("sysname") or ""
+            counts = {}
+            for label, key in (("arp", "ARP::MAPPING::%s" % (sysname or name)),
+                               ("mac", "MAC::TABLE::%s" % (sysname or name)),
+                               ("int", "SW::INT::%s" % (sysname or name))):
+                try:
+                    counts[label] = r.hlen(key)
+                except Exception:
+                    counts[label] = None
+            counts["sta"] = st.get("stas")
+            out["devices"].append({
+                "name": name, "ip": d.get("ip"),
+                "enabled": d.get("enabled", True),
+                "auth": "v3" if d.get("user") else ("v2c" if d.get("community") else "-"),
+                "sysname": sysname,
+                "state": st.get("state"), "pid": st.get("pid"),
+                "last_poll": st.get("last_poll"), "error": st.get("error"),
+                "vrp": st.get("vrp"), "wlan": st.get("wlan"), "counts": counts,
+            })
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = "redis: %s" % e
+        for d in devices:
+            out["devices"].append({"name": d.get("name") or d.get("ip"), "ip": d.get("ip"),
+                                   "enabled": d.get("enabled", True), "counts": {}})
+    return out
+
+
+def arp_table(app, limit=4000):
+    """Merged ARP::MAPPING view (what router.py resolves the flow view's
+    源设备 column against), joined with each MAC's switch port from
+    MAC::TABLE::<sysname> so the UI can answer "which switch port is this
+    IP on" in one place."""
+    try:
+        r = redis.Redis(host=app.args.redis_host, port=app.args.redis_port,
+                        db=app.args.redis_db, socket_timeout=3, socket_connect_timeout=3)
+        raw = r.hgetall("ARP::MAPPING") or {}
+        mac_tables = {}
+        for key in (r.keys("MAC::TABLE::*") or []):
+            kname = key.decode("utf-8", "replace")[len("MAC::TABLE::"):]
+            if not kname:
+                continue          # legacy empty-sysname key (old arp.py bug)
+            try:
+                mac_tables[kname] = {
+                    m.decode("utf-8", "replace"): json.loads(v.decode("utf-8", "replace"))
+                    for m, v in (r.hgetall(key) or {}).items()}
+            except (ValueError, AttributeError):
+                pass
+        rows = []
+        for ip_b, blob in raw.items():
+            ip = ip_b.decode("utf-8", "replace")
+            try:
+                e = json.loads(blob.decode("utf-8", "replace"))
+            except (ValueError, AttributeError):
+                continue
+            mac = e.get("mac") or ""
+            # Score every MAC-table hit (access port > named edge trunk
+            # like "To NAS" > inter-switch uplink). Blindly skipping
+            # Eth-Trunk used to leave hosts such as 192.168.11.14 stuck
+            # on Vlanif1 even though CE6881 learned them on Eth-Trunk3.
+            hits = []
+            for sw, table in mac_tables.items():
+                hit = table.get(mac)
+                if hit:
+                    hits.append((sw, hit))
+            if e.get("ifName_L2"):
+                hits.append((e.get("sysname") or "", {
+                    "ifName": e["ifName_L2"], "ifDescr": e["ifName_L2"]}))
+            if e.get("ap_name"):
+                hits.append((e.get("sysname") or "", {
+                    "ifName": e["ap_name"], "ifDescr": e["ap_name"]}))
+            picked = pick_mac_port(hits) if pick_mac_port else None
+            if picked:
+                port_sw, ifName, ifDescr = picked
+                port = ifDescr or ifName
+            else:
+                port, port_sw = "", ""
+            rows.append({"ip": ip, "mac": mac, "sysname": e.get("sysname") or "",
+                         "ifName_L3": e.get("ifName_L3") or "", "vlan": e.get("vlan"),
+                         "ap_name": e.get("ap_name") or "", "ssid": e.get("ssid") or "",
+                         "source": e.get("source") or "",
+                         "port": port, "port_sw": port_sw})
+        rows.sort(key=lambda x: x["ip"])
+        return {"ok": True, "total": len(rows), "rows": rows[:limit],
+                "switches": sorted(mac_tables)}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e), "rows": []}
+
+
 def reload_dnsmasq(run=None, timeout=8):
     """`systemctl reload dnsmasq` -- LOCAL only (this box, not the remote
     pdns_host): re-reads config/hosts, including /etc/dnsmasq.d/nft_route.conf
@@ -363,6 +491,42 @@ def validate_config(cfg):
                 errors.append("webadmin.%s must be a string" % k)
         if "enabled" in w and not isinstance(w["enabled"], bool):
             errors.append("webadmin.enabled must be true/false")
+    sw = cfg.get("switches", {})
+    if sw and not isinstance(sw, dict):
+        errors.append("switches must be an object")
+    elif isinstance(sw, dict) and sw:
+        devs = sw.get("devices")
+        if devs is not None and not isinstance(devs, list):
+            errors.append("switches.devices must be a list")
+        else:
+            seen_names, seen_ips = {}, {}
+            for i, d in enumerate(devs or []):
+                if not isinstance(d, dict):
+                    errors.append("switches.devices[%d] must be an object" % i)
+                    continue
+                ip = d.get("ip")
+                if not ip or not isinstance(ip, str):
+                    errors.append("switches.devices[%d]: ip 必填" % i)
+                    continue
+                name = str(d.get("name") or ip)
+                # duplicate names collide on SW::STATUS / the per-switch log
+                # file; duplicate IPs mean two collectors walking one switch
+                if name in seen_names:
+                    errors.append("switches: 交换机名重复 %s (设备 #%d 与 #%d)" % (name, seen_names[name], i))
+                seen_names.setdefault(name, i)
+                if ip in seen_ips:
+                    errors.append("switches: 同一 IP 配置了两次 %s (设备 #%d 与 #%d)" % (ip, seen_ips[ip], i))
+                seen_ips.setdefault(ip, i)
+                if not d.get("community") and not (d.get("user") and (d.get("auth_key") or d.get("authKey"))):
+                    errors.append("switches.devices[%s]: 需要 community(v2c) 或 user+auth_key(v3)" % name)
+                p = d.get("snmp_port")
+                if p is not None and not (isinstance(p, int) and 0 < p < 65536):
+                    errors.append("switches.devices[%s]: snmp_port 无效 %r" % (name, p))
+        for k in ("poll_interval", "iface_interval"):
+            if k in sw and not (isinstance(sw[k], int) and sw[k] > 0):
+                errors.append("switches.%s must be a positive int" % k)
+        if "enabled" in sw and not isinstance(sw["enabled"], bool):
+            errors.append("switches.enabled must be true/false")
     if pmm is not None:
         try:
             pmm.validate_chain(proxy)
@@ -1263,6 +1427,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, health_snapshot(self.app))
             except Exception as e:
                 self.send_json(500, {"error": "%s: %s" % (type(e).__name__, e)})
+        elif path == "/api/switches":
+            try:
+                cfg = ib.load_config(self.cfg_path())
+                self.send_json(200, switch_status(self.app, cfg))
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+        elif path == "/api/arp":
+            self.send_json(200, arp_table(self.app))
         elif path == "/api/status":
             st = {}
             try:

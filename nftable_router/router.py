@@ -38,15 +38,19 @@ from nftable_router import iface_bind as ib
 from nftable_router import proxy_mgr as pmm
 from nftable_router import udp_tproxy as utp
 from nftable_router.webadmin_svc import WebadminService
-from pytput import TputFormatter
+from nftable_router.arp_svc import ArpCollectorService
+from nftable_router.arp_snmp import pick_mac_port
+from nftable_router.compat import TputFormatter
 import subprocess, urllib, psutil
 from queue import Queue, Empty
 from contextlib import contextmanager
 import traceback
 import itertools
 from concurrent.futures import ThreadPoolExecutor
-import prctl, tty, termios
-import netifaces
+import tty, termios
+# netifaces (abandoned 2021) / python-prctl (2020, needs libcap to
+# build) replaced by compat.py -- see that module for the rationale
+from nftable_router import compat
 
 tf = TputFormatter()
 
@@ -103,6 +107,10 @@ g_proxy_pending = Value('b', False)   # SIGUSR1 -> incremental reconfigure in ma
 g_proxy_restart_all = Value('b', False)  # SIGUSR2 -> restart ALL managed proxies
 g_reload_flag = Value('b', False)        # SIGUSR1 -> FULL reload done in MAIN LOOP (never in signal context)
 g_webadmin = None                         # WebadminService instance (master child proc)
+g_arp_svc = None                          # ArpCollectorService (one child per switch)
+g_shutdown_stage = 0                      # 0=run 1=graceful (1st Ctrl+C) 2=forced (2nd)
+dns_proc = None
+nfqueue = None
 
 
 def config_file_path():
@@ -126,6 +134,23 @@ def sync_webadmin():
                 g_webadmin.spec["host"], g_webadmin.spec["port"]))
     except Exception as e:
         syslog.syslog(syslog.LOG_CRIT, "webadmin sync error: %s\n  %s" % (
+            str(e), '  '.join(traceback.format_tb(e.__traceback__))))
+
+
+def sync_arp_collectors():
+    """Boot + SIGUSR1 entry: (re)start the per-switch SNMP collector children
+    (config 'switches' section). Never raises -- an unreachable switch or a
+    missing pysnmp must not affect routing."""
+    global g_arp_svc
+    try:
+        if g_arp_svc is None:
+            def _log(m):
+                print("[switches] %s" % m)
+                syslog.syslog(syslog.LOG_NOTICE, "switches: %s" % m)
+            g_arp_svc = ArpCollectorService(log=_log)
+        g_arp_svc.reconcile(config)
+    except Exception as e:
+        syslog.syslog(syslog.LOG_CRIT, "switch collector sync error: %s\n  %s" % (
             str(e), '  '.join(traceback.format_tb(e.__traceback__))))
 is_master = True
 worker_id = 0  # Modified by Process
@@ -236,7 +261,7 @@ class TestThread(threading.Thread):
     # ---------------- scheduler ----------------
     def run(self):
         global config, g_dead_proxy_ipv4, g_dead_proxy_ipv6
-        prctl.set_name("PR - %s" % self.__class__.__name__)
+        compat.set_thread_name("PR - %s" % self.__class__.__name__)
         time.sleep(3)
         while not term.value:
             try:
@@ -387,7 +412,7 @@ class ECMPThread(threading.Thread):
         self.fdr_cb, self.fdw_cb = os.pipe()
 
     def run(self):
-        prctl.set_name("PR - %s" % self.__class__.__name__)
+        compat.set_thread_name("PR - %s" % self.__class__.__name__)
         self.r = None
         last_check = 0
         while term.value == False:
@@ -1107,37 +1132,58 @@ class PrintResultThread(threading.Thread):
         except Exception as e:
             return tf.format("{error:30s,red,bold}", error="ERROR " + str(e)), ""
         try:
-            if arp_record is not None and self.device_list is not None:
+            if arp_record is not None:
                 arp_record = json.loads(arp_record)
+            hits = []
+            mac = (arp_record or {}).get("mac") or ""
+            if mac and self.device_list is not None:
                 for dev in self.device_list:
-                    mac_record = self.r.hget(dev, arp_record['mac'])
-                    if mac_record is not None:
-                        mac_record = json.loads(mac_record)
-                        if mac_record['ifName'][0:9] != "Eth-Trunk":
-                            dev = dev[12:]  # len("MAC::TABLE::")
-                            if re.match(r"^[A-Z]{4}\-[0-9]{2}", dev.decode('utf-8')):
-                                dev = dev[8:]
-                            if 'ifDescr' in mac_record and mac_record['ifDescr'] != "":
-                                if mac_record['ifDescr'][0:3] == "To ":
-                                    mac_record['ifDescr'] = mac_record['ifDescr'][3:]
-                                desc_len = 29 - len(dev) - int((len(
-                                    mac_record['ifDescr'].encode('utf-8')) - len(
-                                    mac_record['ifDescr'])) / 2)
-                                if desc_len < 0:
-                                    desc_len = 0
-                                src_interfaces = tf.format(
-                                    "{dev:s,cyan}:{interface:%ds,green,bold}" % desc_len,
-                                    dev=dev.decode("utf-8"),
-                                    interface=mac_record['ifDescr'][0:29 - len(dev.decode("utf-8"))])
-                                dev_plain = "%s:%s" % (dev.decode("utf-8"),
-                                                       mac_record['ifDescr'][0:29 - len(dev.decode("utf-8"))])
-                            else:
-                                mac_record['ifName'] = mac_record['ifName'].replace("GigabitEthernet", "GE")
-                                src_interfaces = tf.format(
-                                    "{dev:s,cyan}:{interface:%ds,green}" % (29 - len(dev)),
-                                    dev=dev.decode("utf-8"), interface=mac_record['ifName'])
-                                dev_plain = "%s:%s" % (dev.decode("utf-8"), mac_record['ifName'])
-                            break
+                    raw = self.r.hget(dev, mac)
+                    if raw is None:
+                        continue
+                    try:
+                        row = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    sw = dev[12:] if isinstance(dev, (bytes, bytearray)) else dev[len("MAC::TABLE::"):]
+                    hits.append((sw, row))
+            if arp_record:
+                if arp_record.get("ifName_L2"):
+                    hits.append((arp_record.get("sysname") or "", {
+                        "ifName": arp_record["ifName_L2"],
+                        "ifDescr": arp_record["ifName_L2"],
+                    }))
+                if arp_record.get("ap_name"):
+                    hits.append((arp_record.get("sysname") or "", {
+                        "ifName": arp_record["ap_name"],
+                        "ifDescr": arp_record["ap_name"],
+                    }))
+            picked = pick_mac_port(hits)
+            if picked:
+                sw, ifName, ifDescr = picked
+                if isinstance(sw, bytes):
+                    sw = sw.decode("utf-8", "replace")
+                else:
+                    sw = str(sw)
+                if re.match(r"^[A-Z]{4}\-[0-9]{2}", sw):
+                    sw = sw[8:]
+                if ifDescr:
+                    if ifDescr[0:3] == "To ":
+                        ifDescr = ifDescr[3:]
+                    desc_len = 29 - len(sw) - int((len(
+                        ifDescr.encode("utf-8")) - len(ifDescr)) / 2)
+                    if desc_len < 0:
+                        desc_len = 0
+                    src_interfaces = tf.format(
+                        "{dev:s,cyan}:{interface:%ds,green,bold}" % desc_len,
+                        dev=sw, interface=ifDescr[0:29 - len(sw)])
+                    dev_plain = "%s:%s" % (sw, ifDescr[0:29 - len(sw)])
+                else:
+                    ifName = ifName.replace("GigabitEthernet", "GE")
+                    src_interfaces = tf.format(
+                        "{dev:s,cyan}:{interface:%ds,green}" % (29 - len(sw)),
+                        dev=sw, interface=ifName)
+                    dev_plain = "%s:%s" % (sw, ifName)
             if dev_plain == "":
                 if arp_record is not None and 'ifName_L3' in arp_record:
                     src_interfaces = tf.format("> {interface:28s,purple,bold}",
@@ -1159,7 +1205,7 @@ class PrintResultThread(threading.Thread):
     def run(self) -> None:
         global queue, term
 
-        prctl.set_name("PR - %s" % self.__class__.__name__)
+        compat.set_thread_name("PR - %s" % self.__class__.__name__)
 
         self.r = None
         while not term.value:
@@ -1192,8 +1238,10 @@ class PrintResultThread(threading.Thread):
                         if self.r is None:
                             self.r = redis.Redis(host='127.0.0.1', port=6379, db=1, socket_timeout=3, socket_connect_timeout=3)
 
-                        if self.device_list is None:
+                        now = time.time()
+                        if self.device_list is None or now - getattr(self, "_device_list_ts", 0) > 30:
                             self.device_list = self.r.keys("MAC::TABLE::*")
+                            self._device_list_ts = now
 
                         # source device location, resolved ONCE per result:
                         # colored -> console column, plain -> pr_stream 'dev'
@@ -1740,18 +1788,91 @@ def stop_all_executors(grace=1.5):
         print("[*] worker %d blocked in nf recv (idle), killing" % run_p.worker_id)
         run_p.kill()
     for run_p in stragglers:
-        run_p.join(1.0)
+        run_p.join(0.3)
+
+
+def _iter_child_pids():
+    """Every subprocess/multiprocessing child the master knows about.
+    Used by the second-Ctrl+C force path so we never wait on join()."""
+    pids = []
+    for run_p in g_runner:
+        pid = getattr(run_p, "pid", None)
+        if pid:
+            pids.append(pid)
+    proc = dns_proc
+    if proc is not None:
+        pid = getattr(proc, "pid", None)
+        if pid:
+            pids.append(pid)
+    if g_arp_svc is not None:
+        for c in getattr(g_arp_svc, "children", {}).values():
+            p = getattr(c, "proc", None)
+            if p is not None and getattr(p, "pid", None) and p.poll() is None:
+                pids.append(p.pid)
+    if g_webadmin is not None:
+        p = getattr(g_webadmin, "proc", None)
+        if p is not None and getattr(p, "pid", None) and p.poll() is None:
+            pids.append(p.pid)
+    if g_proxy_sup is not None:
+        for pr in getattr(g_proxy_sup, "proxies", {}).values():
+            p = getattr(pr, "proc", None)
+            if p is not None and getattr(p, "pid", None) and p.poll() is None:
+                pids.append(p.pid)
+    return pids
+
+
+def _kill_pid(pid):
+    """SIGKILL one child. If it started its own session (webadmin/arp/proxy
+    use start_new_session=True) kill the whole group; never killpg the
+    master's own group."""
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return
+    try:
+        if pgid != os.getpgrp():
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def force_kill_all_children():
+    """Second Ctrl+C: do not join, do not wait. Queue 4 cannot be unbound
+    while a Policy Route worker still holds it."""
+    for pid in _iter_child_pids():
+        _kill_pid(pid)
 
 
 def quit(signum, sigframe):
-    if is_master:
-        print("[*] shutdown requested by signal %d" % (signum))
-        # kernel-safe ORDERING: do NOT clear rules here -- workers are still
-        # reading and the queue still bound; deleting tables unregisters hooks
-        # whose queued packets the kernel flushes into nf_reinject (the 5.10.84
-        # oops class). Raise into the main loop; its KeyboardInterrupt handler
-        # performs the safe sequence (stop workers -> drain queue -> clearRules).
-        raise KeyboardInterrupt
+    global g_shutdown_stage
+    if not is_master:
+        return
+    # First Ctrl+C/SIGTERM: raise into the main-loop KeyboardInterrupt
+    # handler (stop workers -> unbind -> clearRules). Second signal while
+    # that handler is blocked in join() used to abort teardown and leave
+    # orphan 'Policy Route' workers holding queue 4. Force-kill + unbind
+    # + _exit instead -- never wait, never clearRules from a signal.
+    if g_shutdown_stage >= 1:
+        g_shutdown_stage = 2
+        print("[*] second signal %d: force-killing children, releasing queue 4" % signum,
+              flush=True)
+        force_kill_all_children()
+        try:
+            q = globals().get("nfqueue")
+            if q is not None:
+                q.unbind()
+        except Exception:
+            pass
+        os._exit(1)
+    g_shutdown_stage = 1
+    print("[*] shutdown requested by signal %d (Ctrl+C again to force)" % signum,
+          flush=True)
+    raise KeyboardInterrupt
 
 
 def restart_all_proxies(signum, sigframe):
@@ -1815,6 +1936,7 @@ class NFQUEUE_Executeor(Process):
         stop = self._stop_evt
         signal.signal(signal.SIGTERM, self._on_term)
         signal.signal(signal.SIGQUIT, self._on_term)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)    # Ctrl+C is master-only
         signal.signal(signal.SIGUSR1, signal.SIG_IGN)   # reload is master-only
         signal.signal(signal.SIGUSR2, signal.SIG_IGN)
 
@@ -1822,7 +1944,7 @@ class NFQUEUE_Executeor(Process):
         ecmp_thread = ECMPThread()
         ecmp_thread.daemon = True
         ecmp_thread.start()
-        prctl.set_proctitle("Policy Route - W%02d" % (self.worker_id))
+        compat.set_proctitle("Policy Route - W%02d" % (self.worker_id))
 
         # nfqueue.run() must NOT hold the main thread: it sits inside a C recv
         # (no Python handler runs when no packet arrives) and swallows callback
@@ -1946,7 +2068,7 @@ if __name__ == "__main__":
     # Internal Interface
     nat_interfaces = config['nat_interfaces']
     for n, _interface in enumerate(nat_interfaces):
-        if _interface not in netifaces.interfaces():
+        if _interface not in compat.interfaces():
             syslog.syslog(syslog.LOG_WARNING, f"Interface {_interface} not exists")
             nat_interfaces.pop(n)
 
@@ -2270,6 +2392,7 @@ if __name__ == "__main__":
         nfqueue = netfilterqueue.NetfilterQueue()
         nfqueue.bind(4, ip_mark, mode=netfilterqueue.COPY_PACKET)
 
+        signal.signal(signal.SIGINT, quit)
         signal.signal(signal.SIGTERM, quit)
         signal.signal(signal.SIGQUIT, quit)
         signal.signal(signal.SIGHUP, quit)
@@ -2280,6 +2403,8 @@ if __name__ == "__main__":
 
         # web admin as a supervised child process (config: nft_route.json 'webadmin' section)
         sync_webadmin()
+        # per-switch SNMP collectors, one child each (config: 'switches' section)
+        sync_arp_collectors()
     except Exception as boot_err:
         syslog.syslog(syslog.LOG_CRIT,
                       "bootstrap failed after ruleset install: %r -- rolling back rules" % boot_err)
@@ -2435,9 +2560,19 @@ if __name__ == "__main__":
                     sync_webadmin()
                 except Exception as e:
                     syslog.syslog(syslog.LOG_CRIT, "webadmin reload error: %s" % e)
+                # switch collectors: only devices whose spec changed restart
+                try:
+                    sync_arp_collectors()
+                except Exception as e:
+                    syslog.syslog(syslog.LOG_CRIT, "switch collector reload error: %s" % e)
 
             if time.time() - t_webadmin > 5:
                 t_webadmin = time.time()
+                if g_arp_svc is not None:
+                    try:
+                        g_arp_svc.tick()
+                    except Exception as e:
+                        syslog.syslog(syslog.LOG_WARNING, "switch collector tick error: %s" % e)
                 if g_webadmin is not None:
                     try:
                         g_webadmin.tick(config_file_path(), MASTER_PID_FILE)
@@ -2547,28 +2682,45 @@ if __name__ == "__main__":
                     # g_io_lock.release()
         except KeyboardInterrupt:
             term.value = True
-            if g_webadmin is not None:
-                g_webadmin.shutdown()   # stop webadmin child with the main app
-            if g_proxy_sup:
-                g_proxy_sup.stop_all()   # managed proxies out before their rules
-            # KERNEL-SAFE TEARDOWN ORDER: stop the NFQUEUE readers and drain
-            # the queue BEFORE any table/hook deletion. clearRules() unregisters
-            # base chains; if packets still sit in queue 4/53 the kernel flushes
-            # them through nfqnl_flush -> nf_reinject (the 5.10.84 oops). So:
-            # workers down -> unbind (closes+drains our queue fd) -> clearRules.
-            stop_all_executors()
-            # term.value (set above) lets the DNS child drop its own queue-53
-            # loop; give it a beat so it is not sendmsg-ing while we clearRules.
+            g_shutdown_stage = max(g_shutdown_stage, 1)
+            # KERNEL-SAFE TEARDOWN: queue-4 holders FIRST, then unbind, then
+            # the other children. Previously webadmin/arp/proxy stop_all ran
+            # first and each join(3-5s) blocked Ctrl+C; a second SIGINT then
+            # aborted this handler before workers were killed, leaving queue 4
+            # occupied. Short grace; second Ctrl+C force-kills from quit().
+            stop_all_executors(grace=0.8)
             if dns_proc is not None and dns_proc.is_alive():
-                dns_proc.join(1.5)
+                try:
+                    dns_proc.terminate()
+                except OSError:
+                    pass
+                dns_proc.join(0.5)
             try:
-                if "nfqueue" in globals() and nfqueue is not None:
+                if nfqueue is not None:
                     nfqueue.unbind()
             except Exception as e:
                 print("[-] nfqueue unbind: %r" % e)
+            if g_webadmin is not None:
+                try:
+                    g_webadmin.shutdown(grace=0.4)
+                except Exception as e:
+                    print("[-] webadmin shutdown: %r" % e)
+            if g_arp_svc is not None:
+                try:
+                    g_arp_svc.stop_all(grace=0.4)
+                except Exception as e:
+                    print("[-] arp collectors stop: %r" % e)
+            if g_proxy_sup:
+                try:
+                    g_proxy_sup.stop_all(grace=0.4)
+                except Exception as e:
+                    print("[-] proxy stop: %r" % e)
             clearRules()
             print("[*] system exit")
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
             os.kill(os.getpid(), signal.SIGKILL)
             break
         except RuntimeError:

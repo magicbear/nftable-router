@@ -1,0 +1,19 @@
+<section id=s-sw>
+ <div class=bar>
+  <button id=sw-refresh>刷新</button>
+  <button id=sw-add class=good>+ 新增交换机</button>
+  <button id=sw-settings>⚙ 采集设置</button>
+  <span class=dim id=sw-info></span>
+ </div>
+ <div class=card><b>交换机采集器</b>
+  <span class=dim>每台交换机/AC 一个独立子进程(SNMP 轮询 ARP/MAC/WLAN STA → redis)，由主进程守护、崩溃自动重启；不影响转发。华为 WiFi AC 会把 STA 的 IP/MAC/AP 名合并进 ARP::MAPPING。改完配置需到 状态 页『重载主进程』生效。</span>
+  <div style=overflow:auto><table id=sw-tbl></table></div>
+ </div>
+ <div class=card><b>ARP / MAC 查询</b>
+  <div class=bar>
+   <input id=sw-q placeholder="按 IP / MAC / AP / SSID / 交换机 过滤" style=width:300px>
+   <span class=dim>数据来自 redis ARP::MAPPING（各采集器合并视图），即实时流量页『源设备』列的来源</span>
+  </div>
+  <div style=overflow:auto;max-height:420px><table id=sw-arp></table></div>
+ </div>
+</section>

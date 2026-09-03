@@ -144,6 +144,48 @@ def check_file(path):
                              and n.func.id == "clearRules" for n in ast.walk(q)):
         errors.append("quit() clears rules directly -- teardown must go through the "
                       "main loop (stop workers -> unbind -> clearRules)")
+    # second Ctrl+C must force-kill children and os._exit -- never nest a
+    # KeyboardInterrupt that aborts teardown and leaves queue 4 held.
+    if "force_kill_all_children" not in funcs:
+        errors.append("force_kill_all_children missing (second Ctrl+C path)")
+    if q is not None:
+        has_exit = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                       and n.func.attr == "_exit" for n in ast.walk(q))
+        if not has_exit:
+            errors.append("quit() second Ctrl+C must os._exit after force-killing children")
+        has_force = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                        and n.func.id == "force_kill_all_children" for n in ast.walk(q))
+        if not has_force:
+            errors.append("quit() second Ctrl+C must call force_kill_all_children")
+
+    # KeyboardInterrupt teardown must stop NFQUEUE workers BEFORE arp/webadmin
+    # joins (those used to stall 3-5s each and eat the second Ctrl+C).
+    def _ki_call_order():
+        for n in ast.walk(mainblk):
+            if isinstance(n, ast.ExceptHandler) and n.type is not None:
+                names = [a.id for a in ast.walk(n.type) if isinstance(a, ast.Name)]
+                if "KeyboardInterrupt" in names:
+                    ordered = []
+                    for c in ast.walk(n):
+                        if isinstance(c, ast.Call):
+                            if isinstance(c.func, ast.Name):
+                                ordered.append(c.func.id)
+                            elif isinstance(c.func, ast.Attribute):
+                                ordered.append(c.func.attr)
+                    return ordered
+        return []
+    ki_calls = _ki_call_order()
+    if ki_calls:
+        def _idx(name):
+            return ki_calls.index(name) if name in ki_calls else None
+        se, unbind, arp = _idx("stop_all_executors"), _idx("unbind"), _idx("stop_all")
+        if se is None:
+            errors.append("KeyboardInterrupt teardown must call stop_all_executors")
+        if se is not None and arp is not None and se > arp:
+            errors.append("KeyboardInterrupt must stop NFQUEUE workers before "
+                          "arp/proxy stop_all (queue 4 release first)")
+        if se is not None and unbind is not None and se > unbind:
+            errors.append("KeyboardInterrupt must stop_all_executors before nfqueue.unbind")
 
     # in __main__: the boot pre-flight queue probe must precede the FIRST
     # table deletion (a crashed master's orphan worker may still hold packets;

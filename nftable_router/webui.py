@@ -12,7 +12,7 @@ import os
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260904-2200"
+UI_VERSION = "20260904-2415"
 
 _here = os.path.dirname(os.path.realpath(__file__))
 _parts_dir = os.path.join(_here, "webui_parts")
@@ -32,6 +32,7 @@ _JS_FILES = [
     "tab_mtr.js",
     "tab_info.js",
     "tab_dns.js",
+    "tab_sw.js",
     "boot.js",
 ]
 # HTML section order is cosmetic (only nav-button data-t -> #s-<t> id lookup
@@ -45,6 +46,7 @@ _HTML_FILES = [
     "tab_mtr.html",
     "tab_rt.html",
     "tab_dns.html",
+    "tab_sw.html",
     "tab_cfg.html",
     "tab_info.html",
     "shell_tail.html",

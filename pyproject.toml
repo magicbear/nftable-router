@@ -1,40 +1,94 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nftable-router"
+version = "0.2.0"
 authors = [
     {name = "MagicBear", email = "magicbearmo@gmail.com"},
 ]
 description = "Software Policy Router for nftables"
 readme = "README.md"
-requires-python = ">=3.7"
-keywords = ["nftable"]
+requires-python = ">=3.8"
+keywords = ["nftable", "policy-routing", "nfqueue", "geoip"]
 license = {file = "LICENSE"}
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Networking :: Firewalls",
 ]
+
+# NOTE: `nftables` (the libnftables binding used by nft_utils.py) is
+# deliberately NOT listed. It ships with the nftables project itself, not
+# PyPI -- installing the PyPI name would fetch something unrelated. Get it
+# from the distro instead:  apt install python3-nftables
+# (nftable_router/cli.py fails with that hint if the import is missing.)
+#
+# `ipip-ipdb-hp` is the C-extension IPIP.net database reader providing
+# `import ipdb`. Do NOT substitute the similarly named PyPI `ipdb`, which is
+# the IPython debugger and will silently shadow it.
+#
+# >= 0.1.2 is required: 0.1.1 does not compile on GCC 14+ (Debian trixie,
+# Ubuntu 24.04+), which promoted -Wincompatible-pointer-types and
+# -Wimplicit-function-declaration to errors.
+#
+# The pure-Python `ipip-ipdb` exposes the same City/find_map/is_ipv6 API and
+# is a drop-in fallback if the extension cannot be built -- but it is ~11x
+# slower (40k vs 450k lookups/s measured on the deployed database), and this
+# lookup sits in the per-new-connection path, so prefer the C reader.
+#
+# Dropped on purpose (both unmaintained, both replaced by compat.py):
+#   netifaces     last release 2021-05; only .interfaces() was used, psutil
+#                 (already required, actively maintained) covers it
+#   python-prctl  last release 2020-11 and needs libcap headers to build;
+#                 setproctitle + a 3-line ctypes prctl() call replace it
+#   pytput        last release 2020-05; imports pkg_resources, which
+#                 setuptools 81 removed and 3.13 venvs do not ship, so it
+#                 is an ImportError there. compat.TputFormatter replaces it
 dependencies = [
-    "ipip-ipdb-hp",
+    "ipip-ipdb-hp>=0.1.2",
     "scapy",
     "NetfilterQueue",
     "emoji-country-flag",
-    "python-iptables",
     "pyroute2",
-    "netifaces",
-    "pytput",
-    "python-prctl",
+    "setproctitle",
     "psutil",
-    "redis"
+    "redis",
+    # pysnmp 4.4.x (2019) imports `asyncore`, removed in Python 3.12, so it
+    # cannot be used on current interpreters. 7.x is the maintained line.
+    "pysnmp>=7; python_version >= '3.10'",
+    "pysnmp<5; python_version < '3.10'",
 ]
-dynamic = ["version"]
+
+[project.optional-dependencies]
+# The per-switch SNMP collectors run as separate child processes and may be
+# pointed at a different interpreter (switches.python in nft_route.json),
+# e.g. an older one that already has pysnmp. Installing this extra there is
+# enough for the collector alone -- arp_snmp.py speaks both pysnmp
+# generations (see _pysnmp_generation()).
+snmp = [
+    "redis",
+    "pysnmp>=7; python_version >= '3.10'",
+    "pysnmp<5; python_version < '3.10'",
+]
+dev = ["pytest"]
 
 [project.urls]
 Homepage = "https://github.com/magicbear/nftable-router"
 Issues = "https://github.com/magicbear/nftable-router/issues"
 
 [project.scripts]
-nft-router = "nftable_router.router:main"
+nft-router = "nftable_router.cli:router_main"
+nft-router-webadmin = "nftable_router.cli:webadmin_main"
+nft-router-arp = "nftable_router.cli:arp_collector_main"
+
+[tool.setuptools]
+# explicit: `find:` would also sweep in tools/ and the test_*.py helpers
+packages = ["nftable_router"]
+
+[tool.setuptools.package-data]
+# The web UI is assembled at request time from these fragments
+# (webui.py -> SOURCE_FILES); without them an installed copy serves nothing.
+nftable_router = ["webui_parts/*.css", "webui_parts/*.html", "webui_parts/*.js"]

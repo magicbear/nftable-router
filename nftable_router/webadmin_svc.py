@@ -151,18 +151,18 @@ class WebadminService:
         self.state = "backoff"
         self._start(cfg_path, pidfile)
 
-    def stop_child(self):
+    def stop_child(self, grace=3):
         if self.proc is not None and self.proc.poll() is None:
             try:
                 self.proc.terminate()
                 try:
-                    self.proc.wait(timeout=3)
+                    self.proc.wait(timeout=grace)
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
             except OSError:
                 pass
         self.proc = None
 
-    def shutdown(self):
-        self.stop_child()
+    def shutdown(self, grace=3):
+        self.stop_child(grace=grace)
         self.state = "off"

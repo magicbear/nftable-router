@@ -1019,10 +1019,10 @@ class ProxySupervisor(threading.Thread):
         self.launch()
         self._monitor_loop(stop)
 
-    def stop_all(self):
+    def stop_all(self, grace=5.0):
         self._stop_evt.set()
         for n in reversed(self.order):
             p = self.proxies.get(n)
             if p:
-                p.stop()
+                p.stop(grace=grace)
                 self.on_status(n, "stopped", None)

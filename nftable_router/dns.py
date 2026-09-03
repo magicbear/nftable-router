@@ -10,8 +10,8 @@ import os
 from scapy.all import *
 import scapy.layers.inet
 from scapy.layers.dns import DNSRR, DNS, DNSQR
-from pytput import TputFormatter
-import prctl
+from nftable_router.compat import TputFormatter
+from nftable_router import compat
 import signal
 import json
 
@@ -231,9 +231,10 @@ class DNSProcess(multiprocessing.Process):
         signal.signal(signal.SIGUSR1, self.dump_dns)
         signal.signal(signal.SIGTERM, self.quit)
         signal.signal(signal.SIGHUP, self.quit)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)   # Ctrl+C is master-only
         nfqueue = netfilterqueue.NetfilterQueue()
         nfqueue.bind(53, self.dnsSpoof, mode=netfilterqueue.COPY_PACKET)
-        prctl.set_proctitle("Policy Route - DNS")
+        compat.set_proctitle("Policy Route - DNS")
         try:
             self.load_dns()
         except Exception as e:

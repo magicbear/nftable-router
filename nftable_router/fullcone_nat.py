@@ -4,6 +4,7 @@ from multiprocessing import Process
 import signal
 import redis
 from .nft_utils import nftUtils
+from nftable_router import compat
 from datetime import datetime
 import traceback
 
@@ -71,7 +72,7 @@ class FullConeNAT_Listener(Process):
 
         nfu = nftUtils()
         last_check = 0
-        prctl.set_proctitle("Policy Route - Full Cone NAT Actor")
+        compat.set_proctitle("Policy Route - Full Cone NAT Actor")
         while not self.term.value:
             try:
                 if self.r is None:
@@ -121,7 +122,7 @@ class FullConeNAT_Worker(Process):
         signal.signal(signal.SIGTERM, self.quit)
         signal.signal(signal.SIGQUIT, self.quit)
         nfu = nftUtils()
-        prctl.set_proctitle("Policy Route - Full Cone NAT Cleaner")
+        compat.set_proctitle("Policy Route - Full Cone NAT Cleaner")
         self.r = redis.Redis(host='127.0.0.1', port=6379, db=1, socket_timeout=3, socket_connect_timeout=3)
         nat_table = self.r.get("fullcone_nat_table")
         if nat_table is None:
