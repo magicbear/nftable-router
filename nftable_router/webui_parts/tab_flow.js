@@ -82,11 +82,14 @@ function visNow(r){
  var q=$("f-text").value||"";
  return rowMatch(r,q)&&(! $("f-new").checked || r.sess==0)}
 function trim(){
- // EVICT OLDEST-FIRST ONLY. Rows hidden by the current filter must NEVER be
- // purged (the old filter-aware eviction silently deleted other devices'
- // rows while the box held a search term -> "devices missing in webui but
- // present in the console" report, 2026-09-04). Filtered rows stay in the
- // data array and reappear the moment the filter changes (rerender()).
+ // INTENDED behaviour (restored 2026-09-04; an earlier "oldest-first only"
+ // rewrite mis-killed it): while a filter is active, the MATCHING rows are
+ // protected from eviction -- the buffer overflows by dropping the OLDEST
+ // NON-MATCHING rows first, so "筛选出来的结果不要被清空". Only when every
+ // row matches (or no filter) does the oldest matching row yield, keeping the
+ // DOM in sync one-for-one for exactly those rows.
+ var i=0;
+ while(rows.length>MAXROWS&&i<rows.length){if(!visNow(rows[i]))rows.splice(i,1);else i++}
  var dropped=0;
  while(rows.length>MAXROWS){rows.shift();dropped++}
  var b=$("flowbody");
