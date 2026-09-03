@@ -1202,6 +1202,10 @@ def bw_loop():
             cut = t_now - BW_SPAN
             while bw_hist and bw_hist[0][0] < cut:
                 bw_hist.pop(0)
+        try:
+            _mtr_broadcast(json.dumps({"t": "bw", "ts": round(t_now, 1), "r": rates}).encode())
+        except Exception:
+            pass
 
 
 def bw_start():

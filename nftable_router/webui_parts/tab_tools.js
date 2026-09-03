@@ -104,30 +104,49 @@ $("i-run").onclick=function(){
     putRows($("i-tbl"),["IP","路由选路"+(r.mark?(" (mark 0x"+r.mark.toString(16)+")"):""),"归属"],rows)})
    .catch(function(e){$("i-run").disabled=false;$("i-err").textContent=""+e})};
 
-// ---------- 带宽趋势 (15min canvas chart, polled while visible) ----------
-var bwTimer=null,bwData=null,bwSel={},bwCol={},bwLegend=false;
+// ---------- 带宽趋势 (sampler runs in webadmin forever; WS pushes one point
+// every 5s -- first open pulls the 15min snapshot, after that pure push) ----------
+var bwData=null,bwSel={},bwCol={},bwVis=false,bwPend=[],bwSig="";
 var BW_PAL=["#5b8fd6","#e8b04b","#6fbf73","#d66969","#c586c0","#4ec9b0","#dcdcaa","#b8d1ea"];
 function fmtBps(v){v=v||0;
  if(v>=1e9)return (v/1e9).toFixed(2)+" Gb/s";
  if(v>=1e6)return (v/1e6).toFixed(2)+" Mb/s";
  if(v>=1e3)return (v/1e3).toFixed(1)+" Kb/s";
  return Math.round(v)+" b/s"}
-function bwLoad(){api("/api/bw").then(function(d){if(!d||!d.ok)return;bwData=d;
- if(!bwLegend){bwLegend=true;var lg=$("bw-legend");lg.innerHTML="";
-  (d.peak||[]).forEach(function(x,i){var col=BW_PAL[i%BW_PAL.length];bwCol[x.iface]=col;
-   if(i<5||/^(br0|ppp0|bond0|tun|wg|ibs)/.test(x.iface))bwSel[x.iface]=true;else bwSel[x.iface]=false;
-   var b=el("button","bw-lg");b.style.borderColor=col;b.style.color=col;
-   b.innerHTML='<i style="background:'+col+'"></i>'+x.iface+' <span class=dim>'+fmtBps(Math.max(x.rx,x.tx))+'峰</span>';
-   if(!bwSel[x.iface])b.classList.add("off");
-   b.onclick=function(){bwSel[x.iface]=!bwSel[x.iface];b.classList.toggle("off",!bwSel[x.iface]);bwDraw()};
-   lg.appendChild(b)})}
- var n=(d.samples||[]).length;
- $("bw-st").textContent=n<3?"采样积累中 ("+n+")":(n+" 点 · 峰值 "+fmtBps(Math.max.apply(null,(d.peak||[]).map(function(x){return Math.max(x.rx,x.tx)})||[0])));
- bwDraw()}).catch(function(){})}
-function bwDraw(){var cv=$("bw-cv");if(!cv||!bwData)return;
+function bwFeed(sp){
+ if(!bwData){if(bwPend.length<400)bwPend.push(sp);return}
+ var S=bwData.samples;
+ if(S.length&&S[S.length-1][0]>=sp[0])return;      // older than tail = snapshot overlap
+ S.push(sp);
+ bwData.now=sp[0];
+ var cut=sp[0]-bwData.span;
+ while(S.length&&S[0][0]<cut)S.shift();
+ bwLegendMaybe();
+ if(bwVis)bwDraw()}
+window.__bw_on=function(m){if(m&&m.t=="bw")bwFeed([m.ts,m.r||{}])};
+function bwLegendMaybe(){
+ if(!bwData)return;
+ var pk={};
+ bwData.samples.forEach(function(sp){for(var k in sp[1]){var v=sp[1][k],a=pk[k]||[0,0];
+  if(v[0]>a[0])a[0]=v[0];if(v[1]>a[1])a[1]=v[1];pk[k]=a}});
+ var ord=Object.keys(pk).sort(function(x,y){return (pk[y][0]+pk[y][1])-(pk[x][0]+pk[x][1])});
+ var sig=ord.join(",");
+ if(sig===bwSig)return;                            // iface set unchanged -> keep legend DOM
+ bwSig=sig;
+ var lg=$("bw-legend");lg.innerHTML="";
+ ord.forEach(function(k,i){var col=BW_PAL[i%BW_PAL.length];bwCol[k]=col;
+  if(!(k in bwSel))bwSel[k]=i<5||/^(br0|ppp0|bond0|tun|wg|ibs)/.test(k);
+  var x=pk[k],b=el("button","bw-lg");b.style.borderColor=col;b.style.color=col;
+  b.innerHTML='<i style="background:'+col+'"></i>'+k+' <span class=dim>'+fmtBps(Math.max(x[0],x[1]))+'峰</span>';
+  if(!bwSel[k])b.classList.add("off");
+  b.onclick=function(){bwSel[k]=!bwSel[k];b.classList.toggle("off",!bwSel[k]);bwDraw()};
+  lg.appendChild(b)});
+ var mx=0;ord.forEach(function(k){mx=Math.max(mx,pk[k][0],pk[k][1])});
+ $("bw-st").textContent=(bwData.samples.length)+" 点 · 窗口峰值 "+fmtBps(mx)}
+function bwDraw(){if(!bwVis)return;var cv=$("bw-cv");if(!cv||!bwData)return;
  var g=cv.getContext("2d"),W=cv.width,H=cv.height,L=56,B=22,R=8,T=8;
  g.clearRect(0,0,W,H);
- var span=bwData.span||900,t1=bwData.now||Date.now()/1000,t0=t1-span;
+ var span=bwData.span,t1=bwData.now,t0=t1-span;
  var sel=Object.keys(bwSel).filter(function(k){return bwSel[k]});
  var mx=1000;
  bwData.samples.forEach(function(sp){sel.forEach(function(k){var v=sp[1][k];if(v){mx=Math.max(mx,v[0],v[1])}})});
@@ -151,8 +170,14 @@ function bwDraw(){var cv=$("bw-cv");if(!cv||!bwData)return;
     if(!st){g.moveTo(x,y);st=true}else g.lineTo(x,y)});
    g.stroke()});
   g.globalAlpha=1;g.setLineDash([])})}
-TOOL_HOOK.bw={show:function(){bwLoad();if(bwTimer)clearInterval(bwTimer);bwTimer=setInterval(bwLoad,5000)},
- hide:function(){if(bwTimer){clearInterval(bwTimer);bwTimer=null}}};
+function bwLoadSnapshot(){api("/api/bw").then(function(d){
+ if(!d||!d.ok||bwData)return;
+ bwData={interval:d.interval,span:d.span,now:d.now,samples:d.samples||[]};
+ var last=bwData.samples.length?bwData.samples[bwData.samples.length-1][0]:0;
+ bwPend=bwPend.filter(function(sp){return sp[0]>last});
+ bwLegendMaybe();bwPend.forEach(bwFeed);bwPend=[]}).catch(function(){})}
+TOOL_HOOK.bw={show:function(){bwVis=true;bwLoadSnapshot();bwLegendMaybe();bwDraw()},
+ hide:function(){bwVis=false}};
 
 // ---------- IP流量 (on-demand iftop, live over /ws/stream t=iftop) ----------
 var iftOn=false,iftHbTimer=null;
