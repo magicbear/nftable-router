@@ -52,3 +52,10 @@ td.ell.wrap{white-space:normal;word-break:break-all;text-overflow:clip}
 #toast{position:fixed;right:14px;bottom:14px;max-width:420px}
 #toast div{margin-top:6px;padding:8px 12px;border-radius:8px;background:#20283a;border:1px solid var(--line)}
 label{color:var(--dim)}
+
+/* network-tools sub tabs: panes toggle via .sel (works for relocated
+   <section>s and plain divs alike; higher specificity than section rule) */
+#tool-body>*{display:none}
+#tool-body>.sel{display:block}
+#tool-tabs button{padding:3px 12px;margin-right:2px}
+#tool-tabs button.sel{background:#2f4c7d;border-color:#5b8fd6}

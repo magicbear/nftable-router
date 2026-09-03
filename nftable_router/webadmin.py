@@ -952,6 +952,203 @@ def mtr_start(body, cfg):
 
 
 # ---------------------------------------------------------------------------
+# network tools (网络工具 tab): ping (live via WS) / dig / whois / ip query
+# ---------------------------------------------------------------------------
+ping_jobs = {}
+ping_seq = itertools.count(1)
+PING_LOCK = threading.Lock()
+ping_running = [0]
+DIG_TYPES = ("A", "AAAA", "MX", "TXT", "CNAME", "NS", "PTR", "SOA", "SRV")
+
+
+def _tool_env(cfg, line):
+    """line key ('default' or mtr_line_marks key) -> (env, mark, err):
+    SO_MARK via markexec exactly like mtr/test_line, so every tool answers
+    'through this line', not just from this host."""
+    env = dict(os.environ)
+    mark = 0
+    line = str(line or "")
+    if line and line != "default":
+        lines = mtr_line_marks(cfg)
+        if line not in lines:
+            return None, 0, "未知线路 %r" % line
+        mark = lines[line]["mark"]
+    if mark:
+        so, err = ensure_markso()
+        if not so:
+            return None, mark, "markexec.so: %s" % err
+        env["LD_PRELOAD"] = so
+        env["MARK"] = str(mark)
+    return env, mark, None
+
+
+def _tool_target(body, field="target"):
+    tgt = str(body.get(field, "")).strip().strip("[]")
+    if not tgt or tgt.startswith("-") or not TARGET_RE.match(tgt):
+        return None, "非法目标地址/域名"
+    return tgt, None
+
+
+def ping_start(body, cfg):
+    tgt, err = _tool_target(body)
+    if err:
+        return {"ok": False, "error": err}
+    env, mark, err = _tool_env(cfg, body.get("line"))
+    if err:
+        return {"ok": False, "error": err}
+    try:
+        count = min(200, max(1, int(body.get("count", 20))))
+        interval = min(5.0, max(0.2, float(body.get("interval", 1))))
+        size = min(65000, max(1, int(body.get("size", 56))))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "count/interval/size 需为数字"}
+    argv = ["ping", "-n", "-c", str(count), "-i", str(interval), "-s", str(size), "-W", "2"]
+    fam = str(body.get("family", "auto"))
+    if fam == "4":
+        argv.append("-4")
+    elif fam == "6":
+        argv.append("-6")
+    elif ":" in tgt:
+        argv.append("-6")
+    argv.append(tgt)
+    with PING_LOCK:
+        if ping_running[0] >= 4:
+            return {"ok": False, "error": "并发 ping 已满(4)，稍后再试"}
+        ping_running[0] += 1
+        jid = str(next(ping_seq))
+        ping_jobs[jid] = {"id": jid, "status": "running", "target": tgt,
+                          "line": str(body.get("line") or "default"), "mark": mark,
+                          "count": count, "started": time.time(), "out": []}
+        if len(ping_jobs) > 40:
+            for k in sorted(ping_jobs, key=lambda x: ping_jobs[x]["started"])[:len(ping_jobs) - 40]:
+                if ping_jobs[k]["status"] != "running":
+                    del ping_jobs[k]
+    threading.Thread(target=ping_job_run, args=(jid, argv, env, count, interval),
+                     daemon=True).start()
+    return {"ok": True, "id": jid}
+
+
+def ping_job_run(jid, argv, env, count, interval):
+    j = ping_jobs[jid]
+    t0 = time.time()
+    buf = []
+    try:
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             env=env, text=True, bufsize=1)
+        deadline = t0 + count * (interval + 3) + 30
+        for ln in iter(p.stdout.readline, ""):
+            ln = ln.rstrip()
+            buf.append(ln)
+            if len(buf) > 400:
+                del buf[:len(buf) - 400]
+            j["out"] = list(buf)
+            _mtr_broadcast({"t": "ping", "id": jid, "line": ln})
+            if time.time() > deadline:
+                p.kill()
+                break
+        try:
+            rc = p.wait(timeout=5)
+        except Exception:
+            p.kill()
+            rc = -9
+        j.update({"status": "done", "rc": rc, "ms": int((time.time() - t0) * 1000)})
+    except Exception as e:
+        j.update({"status": "error", "error": str(e)})
+    finally:
+        try:
+            p.stdout.close()
+        except Exception:
+            pass
+        with PING_LOCK:
+            ping_running[0] -= 1
+        _mtr_broadcast({"t": "ping", "id": jid, "status": j["status"],
+                        "ms": j.get("ms"), "error": j.get("error")})
+
+
+def dig_run(body, cfg):
+    q, err = _tool_target(body)
+    if err:
+        return {"ok": False, "error": err}
+    typ = str(body.get("type", "A")).upper().strip()
+    if typ not in DIG_TYPES:
+        return {"ok": False, "error": "type 需为 " + "/".join(DIG_TYPES)}
+    env, mark, err = _tool_env(cfg, body.get("line"))
+    if err:
+        return {"ok": False, "error": err}
+    args = ["dig", "+time=2", "+tries=1", "+noall", "+comments", "+answer", "+stats"]
+    fam = str(body.get("family", "auto"))
+    if fam == "4":
+        args.append("-4")
+    elif fam == "6":
+        args.append("-6")
+    srv = str(body.get("server", "")).strip()
+    if srv:
+        if srv.startswith("-") or not TARGET_RE.match(srv):
+            return {"ok": False, "error": "非法 DNS 服务器"}
+        args.append("@%s" % srv)
+    args += [q, typ]
+    t0 = time.time()
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=10, env=env)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "dig 超时"}
+    except OSError as e:
+        return {"ok": False, "error": "dig 不可用: %s" % e}
+    return {"ok": r.returncode == 0, "rc": r.returncode, "ms": round((time.time() - t0) * 1000, 1),
+            "mark": mark, "out": (r.stdout or "")[:8000], "err": (r.stderr or "")[:600]}
+
+
+def whois_run(body):
+    tgt, err = _tool_target(body)
+    if err:
+        return {"ok": False, "error": err}
+    binw = shutil.which("whois")
+    if not binw:
+        return {"ok": False, "error": "whois 未安装（apt install whois）"}
+    try:
+        r = subprocess.run([binw, tgt], capture_output=True, text=True, timeout=25)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "whois 查询超时(25s)"}
+    except OSError as e:
+        return {"ok": False, "error": "whois 失败: %s" % e}
+    return {"ok": r.returncode == 0, "rc": r.returncode,
+            "out": ((r.stdout or "") + (("\n" + r.stderr) if r.stderr else ""))[:65536]}
+
+
+def ipq_run(body, cfg, cfg_path):
+    env, mark, err = _tool_env(cfg, body.get("line"))
+    if err:
+        return {"ok": False, "error": err}
+    raw = str(body.get("ips", "")).replace(",", " ").split()
+    ips = []
+    for x in raw:
+        try:
+            ipaddress.ip_address(x)
+        except ValueError:
+            continue
+        if x not in ips:
+            ips.append(x)
+        if len(ips) >= 16:
+            break
+    if not ips:
+        return {"ok": False, "error": "没有合法 IP（最多 16 个）"}
+    g = geo_lookup(cfg_path, ips)
+    rows = []
+    for ip in ips:
+        route = ""
+        try:
+            args = ["route", "get", ip]
+            if mark:
+                args += ["mark", str(mark)]
+            rc, out = _ip(args, timeout=5)
+            route = (out or "").strip().splitlines()[0][:200] if (out or "").strip() else ("rc=%d" % rc)
+        except Exception as e:
+            route = "ip route get 失败: %s" % e
+        rows.append({"ip": ip, "route": route})
+    return {"ok": True, "mark": mark, "rows": rows, "geo": (g or {}).get("geo") or {}}
+
+
+# ---------------------------------------------------------------------------
 # geoip (SAME ipdb library + database as the router policy engine)
 # ---------------------------------------------------------------------------
 _geo = {"db": None, "tried": False, "error": None}
@@ -1402,6 +1599,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200 if jid in mtr_jobs else 404, mtr_jobs.get(jid, {"status": "gone"}))
         elif path == "/api/mtr/jobs":
             self.send_json(200, sorted(mtr_jobs.values(), key=lambda j: -j["started"])[:20])
+        elif path.startswith("/api/ping/job/"):
+            jid = path.rsplit("/", 1)[-1]
+            self.send_json(200 if jid in ping_jobs else 404, ping_jobs.get(jid, {"status": "gone"}))
+        elif path == "/api/ping/jobs":
+            self.send_json(200, sorted(ping_jobs.values(), key=lambda j: -j["started"])[:20])
         elif path == "/api/routes/tables":
             try:
                 self.send_json(200, dict({"ok": True}, **rt_tables_list()))
@@ -1643,6 +1845,30 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 cfg = ib.load_config(self.cfg_path())
                 self.send_json(200, mtr_start(body, cfg))
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+        elif path == "/api/ping":
+            try:
+                cfg = ib.load_config(self.cfg_path())
+                self.send_json(200, ping_start(body, cfg))
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+        elif path == "/api/dig":
+            try:
+                cfg = ib.load_config(self.cfg_path())
+                self.send_json(200, dig_run(body, cfg))
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+        elif path == "/api/whois":
+            try:
+                self.send_json(200, whois_run(body))
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+        elif path == "/api/ipq":
+            try:
+                cp = self.cfg_path()
+                cfg = ib.load_config(cp)
+                self.send_json(200, ipq_run(body, cfg, cp))
             except Exception as e:
                 self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
         elif path == "/api/test_line":

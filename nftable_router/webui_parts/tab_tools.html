@@ -1,0 +1,58 @@
+<section id=s-tools>
+ <div class=bar id=tool-tabs>
+  <button data-tool=mtr class=sel>链路MTR</button>
+  <button data-tool=rt>路由表</button>
+  <button data-tool=ping>Ping</button>
+  <button data-tool=dig>Dig</button>
+  <button data-tool=whois>Whois</button>
+  <button data-tool=ipq>IP查询</button>
+  <span class=dim>所有工具可选线路：通过 SO_MARK 与真实业务同路径出网</span>
+ </div>
+ <div id=tool-body>
+  <div id=t-ping class="tsub card">
+   <div class=bar>
+    <select id="p-line" style="min-width:220px"></select>
+    <input id="p-target" placeholder="目标 IP / 域名" style="width:220px">
+    <label>次数</label><input id="p-count" type="number" value="20" style="width:60px">
+    <label>间隔s</label><input id="p-int" value="1" style="width:56px">
+    <label>包大小B</label><input id="p-size" type="number" value="56" style="width:64px">
+    <select id="p-fam"><option value="auto">自动</option><option value="4">IPv4</option><option value="6">IPv6</option></select>
+    <button id="p-run" class="good">▶ 开始Ping</button>
+    <button id="p-clear">清屏</button>
+    <span id="p-err" class="bad"></span>
+   </div>
+   <pre id="p-out" class="dim" style="min-height:140px;max-height:440px;overflow:auto;white-space:pre-wrap;margin:6px 0 0"></pre>
+  </div>
+  <div id=t-dig class="tsub card">
+   <div class=bar>
+    <select id="d-line" style="min-width:220px"></select>
+    <input id="d-target" placeholder="查询域名" style="width:240px">
+    <select id="d-type"><option>A</option><option>AAAA</option><option>MX</option><option>TXT</option><option>CNAME</option><option>NS</option><option>PTR</option><option>SOA</option><option>SRV</option></select>
+    <input id="d-server" placeholder="指定DNS(留空=系统)" style="width:170px">
+    <select id="d-fam"><option value="auto">自动</option><option value="4">IPv4</option><option value="6">IPv6</option></select>
+    <button id="d-run" class="good">查询</button>
+    <span id="d-err" class="bad"></span>
+   </div>
+   <pre id="d-out" class="dim" style="min-height:100px;max-height:440px;overflow:auto;white-space:pre-wrap;margin:6px 0 0"></pre>
+  </div>
+  <div id=t-whois class="tsub card">
+   <div class=bar>
+    <input id="w-target" placeholder="域名 / IP / 自治系统号(AS..)" style="width:280px">
+    <button id="w-run" class="good">查询</button>
+    <span class=dim>直连注册局，最长 25s</span>
+    <span id="w-err" class="bad"></span>
+   </div>
+   <pre id="w-out" class="dim" style="min-height:120px;max-height:520px;overflow:auto;white-space:pre-wrap;margin:6px 0 0"></pre>
+  </div>
+  <div id=t-ipq class="tsub card">
+   <div class=bar>
+    <input id="i-ips" placeholder="IP，多个用空格/逗号/换行分隔（≤16）" style="width:380px">
+    <select id="i-line" style="min-width:220px"></select>
+    <button id="i-run" class="good">查询</button>
+    <span class=dim>显示本机路由表选路 + 归属地</span>
+    <span id="i-err" class="bad"></span>
+   </div>
+   <div style="overflow:auto"><table id="i-tbl"></table></div>
+  </div>
+ </div>
+</section>

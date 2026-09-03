@@ -33,6 +33,7 @@ _JS_FILES = [
     "tab_info.js",
     "tab_dns.js",
     "tab_sw.js",
+    "tab_tools.js",
     "boot.js",
 ]
 # HTML section order is cosmetic (only nav-button data-t -> #s-<t> id lookup
@@ -45,6 +46,7 @@ _HTML_FILES = [
     "tab_rules.html",
     "tab_mtr.html",
     "tab_rt.html",
+    "tab_tools.html",
     "tab_dns.html",
     "tab_sw.html",
     "tab_cfg.html",
