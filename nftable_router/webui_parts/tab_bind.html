@@ -1,0 +1,14 @@
+<section id=s-bind>
+ <div class=card><b>已绑定 (egress_marks)</b><table id=tbl-bound></table></div>
+ <div class=card><b>公网出口候选</b><span class=dim>（本机实时扫描，跳过内网/链路本地）</span>
+  <table id=tbl-cand></table></div>
+ <div class=card><b>新增绑定</b><div class=grid>
+  <span><label>接口</label><br><select id=b-iface></select></span>
+  <span><label>IP (静态必填 / 动态留空)</label><br><input id=b-ip list=b-iplist style=width:220px><datalist id=b-iplist></datalist></span>
+  <span><label>类型</label><br><select id=b-dyn><option value=0>静态(按IP)</option><option value=1>动态(按接口)</option></select></span>
+  <span><label>fwmark（复用线路或自定义）</label><br><select id=b-mark></select> <input id=b-markx placeholder=自定义 width:90px style=width:90px disabled></span>
+  <span><label>网关 (动态可填 auto)</label><br><input id=b-gw placeholder="93.184.216.35 / auto"></span>
+  <span id="b-match" class=dim style="align-self:end"></span>
+  <span style=align-self:end><button id=b-add>绑定并重载</button></span>
+ </div></div>
+</section>

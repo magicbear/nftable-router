@@ -1,0 +1,15 @@
+<section id=s-mtr>
+ <div class=bar>
+  <select id="m-line" style="min-width:230px"></select>
+  <input id="m-target" placeholder="目标 IP / 域名" style="width:240px">
+  <label>发包</label><input id="m-cycles" type="number" value="10" style="width:60px">
+  <label>TTL</label><input id="m-ttl" type="number" value="18" style="width:60px">
+  <label>间隔s</label><input id="m-int" value="0.2" style="width:60px">
+  <label>IP族</label><select id="m-fam"><option value="auto">自动</option><option value="4">IPv4</option><option value="6">IPv6</option></select>
+  <button id="m-run" class="good">▶ 开始MTR</button>
+  <button id="m-refresh">刷新</button>
+  <span id="m-err" class="bad"></span>
+ </div>
+ <div class=card id="m-result"><span class=dim>选择线路与目标，回车开测。指定线路通过 SO_MARK 命中 `ip rule fwmark → 表`，与真实业务同路径。</span></div>
+ <div class=card><b>历史任务</b><table id="m-history"></table></div>
+</section>

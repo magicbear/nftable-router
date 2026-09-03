@@ -61,6 +61,14 @@ except Exception:
         pmm = None
 
 try:
+    from nftable_router import pdns_admin as pa
+except Exception:
+    try:
+        import pdns_admin as pa
+    except Exception:
+        pa = None
+
+try:
     import psutil
 except ImportError:
     psutil = None
@@ -74,7 +82,9 @@ except ImportError:
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 STREAM_CHANNEL = "pr_stream"
 RING_MAX = 1000
-CLIENT_QMAX = 2000
+# generous per-client buffer: bursts on busy lines used to overflow a
+# small queue and silently drop rows (console kept showing them)
+CLIENT_QMAX = 8192
 MASTER_PID_FILE = "/run/nft_route.pid"
 PIDFILE_ARG = None  # set from args
 
@@ -198,6 +208,7 @@ class Hub:
                 try:                       # slow consumer: drop its oldest
                     q.get_nowait()
                     q.put_nowait(raw)
+                    q.dropped = getattr(q, "dropped", 0) + 1
                 except Exception:
                     pass
 
@@ -267,6 +278,26 @@ def signal_master(sig=signal.SIGUSR1, pidfile=None):
     try:
         os.kill(pid, sig)
         return {"ok": True, "pid": pid, "signal": int(sig)}
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def reload_dnsmasq(run=None, timeout=8):
+    """`systemctl reload dnsmasq` -- LOCAL only (this box, not the remote
+    pdns_host): re-reads config/hosts, including /etc/dnsmasq.d/nft_route.conf
+    which router.py's load_config() rewrites (PTR records mapping each
+    proxy line's mark to a hostname) on every config load/SIGUSR1 reload.
+    `reload` (not `restart`) so existing DHCP leases aren't dropped.
+    `run` is injectable for tests."""
+    runner = run or subprocess.run
+    try:
+        p = runner(["systemctl", "reload", "dnsmasq"], capture_output=True, text=True, timeout=timeout)
+        out = (p.stdout or "") + (p.stderr or "")
+        return {"ok": p.returncode == 0, "returncode": p.returncode, "output": out.strip()}
+    except FileNotFoundError:
+        return {"ok": False, "error": "systemctl 未找到"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "systemctl reload dnsmasq 超时 (%ss)" % timeout}
     except OSError as e:
         return {"ok": False, "error": str(e)}
 
@@ -1063,27 +1094,46 @@ class App:
         self.last_reload = None   # ts of last explicit /api/reload from this UI
 
 
-_ui_cache = {"mtime": None, "html": None, "ver": None}
+_ui_cache = {"mtimes": {}, "html": None, "ver": None}
 
 
 def _load_ui():
-    """hot reload of webui.py (mtime tracked) so committed UI changes take
-    effect without restarting this child, plus a per-read UI_VERSION gate."""
+    """hot reload of webui.py + everything it assembles from webui_parts/
+    (mtimes tracked for the FULL file set webui.py itself reported last
+    time, so editing any fragment -- not just webui.py -- takes effect
+    without restarting this child), plus a per-read UI_VERSION gate."""
     path = os.path.join(module_dir, "webui.py")
-    try:
-        mt = os.stat(path).st_mtime
-    except OSError:
-        mt = None
-    if mt is not None and _ui_cache["mtime"] == mt and _ui_cache["html"]:
+    watch = _ui_cache["mtimes"] or {path: None}
+    changed = False
+    for p, prev in watch.items():
+        try:
+            cur = os.stat(p).st_mtime
+        except OSError:
+            cur = None
+        if cur != prev:
+            changed = True
+            break
+    if not changed and _ui_cache["html"]:
         return _ui_cache["html"]
-    ns = {"__name__": "webui_hot"}
+    # exec() does not auto-populate __file__ the way a normal import would;
+    # webui.py needs it to locate webui_parts/ relative to itself.
+    ns = {"__name__": "webui_hot", "__file__": path}
     try:
         exec(compile(open(path, encoding="utf-8").read(), path, "exec"), ns)
     except Exception:
         if _ui_cache["html"]:
             return _ui_cache["html"]
         raise
-    _ui_cache.update(mtime=mt, html=ns["INDEX_HTML"], ver=ns.get("UI_VERSION"))
+    src_files = list(ns.get("SOURCE_FILES") or [path])
+    if path not in src_files:
+        src_files.append(path)
+    new_mtimes = {}
+    for p in src_files:
+        try:
+            new_mtimes[p] = os.stat(p).st_mtime
+        except OSError:
+            new_mtimes[p] = None
+    _ui_cache.update(mtimes=new_mtimes, html=ns["INDEX_HTML"], ver=ns.get("UI_VERSION"))
     return ns["INDEX_HTML"]
 
 
@@ -1123,6 +1173,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def cfg_path(self):
         return self.app.args.config
+
+    def pdns_cfg_path(self):
+        return getattr(self.app.args, "pdns_config", None)
+
+    def pdns_poison_path(self):
+        return getattr(self.app.args, "pdns_poison_list", None)
+
+    def pdns_host(self):
+        return getattr(self.app.args, "pdns_host", None)
+
+    def send_pdns_disabled(self):
+        self.send_json(404, {"ok": False, "error": "PowerDNS 管理未启用: 启动 webadmin 时需加 --pdns-config <path>"})
 
     # -- routes -------------------------------------------------------------
     def do_GET(self):
@@ -1215,6 +1277,26 @@ class Handler(BaseHTTPRequestHandler):
                        "uptime": round(time.time() - self.app.started),
                        "config_path": self.cfg_path()})
             self.send_json(200, st)
+        elif path == "/api/pdns/config":
+            if pa is None or not self.pdns_cfg_path():
+                return self.send_pdns_disabled()
+            try:
+                host = self.pdns_host()
+                cfg, mt = pa.load_config_with_mtime(self.pdns_cfg_path(), host=host)
+                self.send_json(200, {"ok": True, "path": self.pdns_cfg_path(), "host": host,
+                                     "mtime": mt, "config": cfg})
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": str(e)})
+        elif path == "/api/pdns/poison":
+            if pa is None or not self.pdns_poison_path():
+                return self.send_pdns_disabled()
+            try:
+                p = self.pdns_poison_path()
+                host = self.pdns_host()
+                ips, mt = pa.load_poison_list_with_mtime(p, host=host)
+                self.send_json(200, {"ok": True, "path": p, "host": host, "mtime": mt, "ips": ips})
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": str(e)})
         elif path == "/favicon.ico":
             self.send_json(404, {})
         else:
@@ -1409,6 +1491,73 @@ class Handler(BaseHTTPRequestHandler):
                                      "note": "已置 redis test_now 标志; 主进程 TestThread 轮询到即开测 (需已加载带该支持的router代码)"})
             except Exception as e:
                 self.send_json(500, {"ok": False, "error": str(e)})
+        elif path == "/api/pdns/validate":
+            if pa is None:
+                return self.send_pdns_disabled()
+            errors = pa.validate_config(body.get("config", body))
+            self.send_json(200, {"ok": not errors, "errors": errors})
+        elif path == "/api/pdns/config":
+            if pa is None or not self.pdns_cfg_path():
+                return self.send_pdns_disabled()
+            host = self.pdns_host()
+            cfg = body.get("config")
+            base_mtime = body.get("base_mtime")
+            cur_mtime = pa.stat_mtime(self.pdns_cfg_path(), host=host)
+            if base_mtime is None and not body.get("force"):
+                self.send_json(428, {"ok": False,
+                                     "error": "缺少 base_mtime: 页面缓存过旧，请刷新页面后重新编辑保存"})
+                return
+            if (base_mtime is not None and cur_mtime is not None
+                    and abs(cur_mtime - float(base_mtime)) > 0.001 and not body.get("force")):
+                self.send_json(409, {"ok": False, "stale": True, "server_mtime": cur_mtime,
+                                     "error": "pdns-recursor.json 在本页面加载后被外部修改过，已阻止覆盖 —— 请重新加载后再编辑保存"})
+                return
+            errors = pa.validate_config(cfg)
+            if errors:
+                self.send_json(422, {"ok": False, "errors": errors})
+                return
+            try:
+                saved = pa.save_config(self.pdns_cfg_path(), cfg, host=host)
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "save failed: %s" % e})
+                return
+            rc = None
+            if body.get("reload"):
+                rc = pa.reload_recursor(rec_control_bin=getattr(self.app.args, "rec_control", "rec_control"), host=host)
+            nm = pa.stat_mtime(self.pdns_cfg_path(), host=host)
+            self.send_json(200, {"ok": True, "config": saved, "reload": rc, "mtime": nm})
+        elif path == "/api/pdns/poison":
+            if pa is None or not self.pdns_poison_path():
+                return self.send_pdns_disabled()
+            p = self.pdns_poison_path()
+            host = self.pdns_host()
+            base_mtime = body.get("base_mtime")
+            cur_mtime = pa.stat_mtime(p, host=host)
+            if (base_mtime is not None and cur_mtime is not None
+                    and abs(cur_mtime - float(base_mtime)) > 0.001 and not body.get("force")):
+                self.send_json(409, {"ok": False, "stale": True, "server_mtime": cur_mtime,
+                                     "error": "污染IP列表在本页面加载后被外部修改过，已阻止覆盖 —— 请重新加载后再编辑保存"})
+                return
+            try:
+                clean = pa.save_poison_list(p, body.get("ips") or [], host=host)
+            except ValueError as e:
+                self.send_json(422, {"ok": False, "error": str(e)})
+                return
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "save failed: %s" % e})
+                return
+            nm = pa.stat_mtime(p, host=host)
+            self.send_json(200, {"ok": True, "ips": clean, "mtime": nm,
+                                 "note": "转发进程约 1 秒内自动检测文件变化并热加载，也可发 SIGHUP 立即触发"})
+        elif path == "/api/pdns/reload":
+            if pa is None:
+                return self.send_pdns_disabled()
+            r = pa.reload_recursor(rec_control_bin=getattr(self.app.args, "rec_control", "rec_control"),
+                                   host=self.pdns_host())
+            self.send_json(200 if r.get("ok") else 500, r)
+        elif path == "/api/dnsmasq/reload":
+            r = reload_dnsmasq()
+            self.send_json(200 if r.get("ok") else 500, r)
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -1453,13 +1602,21 @@ class Handler(BaseHTTPRequestHandler):
                                 conn.sendall(ws_encode(payload, opcode=0xA))
                             except OSError:
                                 closed = True
+                batch = []
                 try:
-                    while True:
-                        conn.sendall(ws_encode(q.get_nowait()))
+                    while len(batch) < 1024:
+                        batch.append(q.get_nowait())
                 except Empty:
                     pass
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    break
+                if batch:
+                    lost = getattr(q, "dropped", 0)
+                    if lost:
+                        q.dropped = 0
+                        batch.insert(0, json.dumps({"t": "gap", "n": lost}))
+                    try:   # ONE syscall for the whole batch: far less
+                        conn.sendall(b"".join(ws_encode(x) for x in batch))
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break  # per-frame write amplification under load
         except (OSError, ConnectionError):
             pass
         finally:
@@ -1501,6 +1658,16 @@ def main(argv=None):
     ap.add_argument("--redis-db", type=int, default=1)
     ap.add_argument("--ring-max", type=int, default=RING_MAX)
     ap.add_argument("--pidfile", default=None, help="router master pidfile (default /run/nft_route.pid)")
+    ap.add_argument("--pdns-config", default=None,
+                    help="path to pdns-recursor.json (omit to disable the DNS tab)")
+    ap.add_argument("--pdns-poison-list", default=None,
+                    help="path to dns_posion_list.txt (omit to disable poison-list editing)")
+    ap.add_argument("--rec-control", default="rec_control",
+                    help="rec_control binary for reload-lua-script (default: PATH lookup)")
+    ap.add_argument("--pdns-host", default=None,
+                    help="PowerDNS Recursor box, if not this machine: 'user@1.2.3.4' or "
+                         "'user@1.2.3.4:2222' -- all pdns file I/O + rec_control go over ssh "
+                         "using the invoking user's own key/agent/~/.ssh/config (omit for local)")
     args = ap.parse_args(argv)
     PIDFILE_ARG = args.pidfile
     json.load(open(args.config))                    # fail fast on unreadable config

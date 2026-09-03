@@ -1,0 +1,54 @@
+:root{--bg:#12151b;--panel:#1a1f28;--line:#2a3140;--fg:#cfd6e4;--dim:#7a8496;
+--green:#3fb96b;--red:#e05252;--yellow:#d9a03f;--cyan:#4bb8c9;--purple:#9a6dd6}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:13px/1.5 ui-monospace,"Cascadia Mono",Consolas,"Noto Sans Mono CJK SC",monospace}
+header{display:flex;gap:16px;align-items:center;padding:8px 14px;background:var(--panel);
+border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+header b{color:var(--cyan)}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#555;margin-right:4px;vertical-align:0}
+.dot.on{background:var(--green)}.dot.err{background:var(--red)}.dot.warn{background:var(--yellow)}
+nav{display:flex;gap:2px;margin-left:auto}
+nav button{background:none;border:1px solid transparent;color:var(--dim);padding:4px 12px;cursor:pointer;border-radius:6px;font:inherit}
+nav button.sel{color:var(--fg);border-color:var(--line);background:var(--bg)}
+main{padding:10px 14px;max-width:1500px}
+section{display:none}section.sel{display:block}
+table{border-collapse:collapse;width:100%}
+th,td{padding:2px 8px;border-bottom:1px solid #202532;text-align:left;white-space:nowrap}
+th{color:var(--dim);font-weight:normal;position:sticky;top:0;background:var(--bg);z-index:2;box-shadow:0 1px 0 var(--line)}
+#flowwrap{height:calc(100vh - 150px);overflow:auto;border:1px solid var(--line);border-radius:6px}
+.bar{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
+input,select,textarea{background:#0c0f14;color:var(--fg);border:1px solid var(--line);
+border-radius:6px;padding:4px 8px;font:inherit}
+textarea{width:100%;height:60vh;resize:vertical}
+button{background:#232a38;border:1px solid var(--line);color:var(--fg);border-radius:6px;
+padding:4px 12px;cursor:pointer;font:inherit}
+button:hover{border-color:var(--cyan)}
+.p6{color:#4bb8c9}.p17{color:#8f7ee8}.p1{color:#69b06a}
+td.line{color:var(--purple)}td.dst{color:var(--cyan)}td.src{color:#c9b458}
+.bad{color:var(--red)}.good{color:var(--green)}.warn{color:var(--yellow)}.dim{color:var(--dim)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:8px}
+td.ell{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+td.ell.wrap{white-space:normal;word-break:break-all;text-overflow:clip}
+#colsbox{margin:0 0 8px}#colsbox label{display:inline-block;margin:2px 12px 2px 0;color:var(--fg);cursor:pointer;user-select:none}
+#colsbox label input{vertical-align:-2px}#colsbox button{margin-left:10px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;display:flex;align-items:flex-start;justify-content:center;overflow:auto}
+.modalcard{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:5vh auto;max-width:1000px;width:92vw;box-shadow:0 8px 30px rgba(0,0,0,.45)}
+.modalcard .bar{margin:0}
+.msec{margin-top:14px}
+.msec>b{display:block;color:var(--cyan);font-size:12px;border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:8px}
+.mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:8px 14px}
+.itabs{display:flex;gap:5px;align-items:center;margin:2px 0 10px;flex-wrap:wrap}
+.itab{background:#232a38;border:1px solid var(--line);color:var(--dim);padding:3px 12px;cursor:pointer;border-radius:14px;font:inherit}
+.itab.sel{color:var(--fg);border-color:var(--cyan);background:var(--bg)}
+.itab.bad{color:var(--red)}
+.ipane{border:1px dashed var(--line);border-radius:8px;padding:8px 10px}
+.mfield{display:flex;flex-direction:column;gap:3px;min-width:0}
+.mfield label{font-size:11px}
+.mfield input,.mfield select{width:100%;min-width:0}
+.mchips{display:flex;flex-wrap:wrap;gap:6px 16px}
+.mchips label{color:var(--fg)}
+.mchips input{vertical-align:-2px}
+#toast{position:fixed;right:14px;bottom:14px;max-width:420px}
+#toast div{margin-top:6px;padding:8px 12px;border-radius:8px;background:#20283a;border:1px solid var(--line)}
+label{color:var(--dim)}

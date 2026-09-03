@@ -1,0 +1,49 @@
+<section id=s-dns>
+ <div class=bar>
+  <button data-dt=rules class="itab sel">规则</button>
+  <button data-dt=fwd class="itab">上游服务器</button>
+  <button data-dt=sg class="itab">源地址组</button>
+  <button data-dt=rg class="itab">应答组</button>
+  <button data-dt=poison class="itab">污染IP</button>
+  <span style="flex:1"></span>
+  <button id=dns-refresh>刷新</button>
+  <button id=dns-reload class=good>⟳ 重载 PowerDNS (rec_control)</button>
+  <button id=dnsmasq-reload class=good>⟳ 重载本机 dnsmasq</button>
+ </div>
+ <div class=dim id=dns-path style="margin-bottom:8px"></div>
+
+ <div id=dt-rules>
+  <div class=bar>
+   <input id=dr-q placeholder="搜索域名 / 上游 / action" style=width:280px>
+   <button id=dr-add class=good>+ 新增规则</button>
+   <span class=dim id=dr-count></span>
+  </div>
+  <div style=overflow:auto><table id=dr-tbl></table></div>
+ </div>
+
+ <div id=dt-fwd style=display:none>
+  <div class=bar><button id=df-add class=good>+ 新增上游服务器</button>
+   <span class=dim>id → host:port（可逗号分隔多个，与 pdns-forwarder.py 的 dns_server 语义一致）</span></div>
+  <table id=df-tbl></table>
+ </div>
+
+ <div id=dt-sg style=display:none>
+  <div class=bar><button id=ds-add class=good>+ 新增源地址组</button>
+   <span class=dim>id → CIDR 列表；规则里按 src_group_id 引用，仅命中这些源地址才生效</span></div>
+  <table id=ds-tbl></table>
+ </div>
+
+ <div id=dt-rg style=display:none>
+  <div class=bar><button id=dg-add class=good>+ 新增应答组</button>
+   <span class=dim>id → 静态应答记录列表(type/value/ttl)；规则 action=result 时直接返回，不再转发</span></div>
+  <table id=dg-tbl></table>
+ </div>
+
+ <div id=dt-poison style=display:none>
+  <div class=bar><span class=dim>每行一个 IP；保存后原样写入 dns_posion_list.txt。转发进程需要支持热加载(SIGHUP)才会立即生效，否则需要重启该进程。</span></div>
+  <textarea id=dp-box spellcheck=false style=height:50vh></textarea>
+  <div class=bar><button id=dp-save class=good>保存污染IP列表</button><span class=dim id=dp-count></span></div>
+ </div>
+
+ <div class=card id=dns-msg></div>
+</section>

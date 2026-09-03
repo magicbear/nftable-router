@@ -26,7 +26,7 @@ import time
 
 DEFAULTS = {"host": "127.0.0.1", "port": 8788, "redis_host": "127.0.0.1",
             "redis_port": 6379, "redis_db": 1, "log": None,
-            "max": 5, "window": 300}
+            "max": 5, "window": 300, "rec_control": "rec_control"}
 
 
 def parse_spec(config):
@@ -36,6 +36,10 @@ def parse_spec(config):
     if not w.get("enabled", True):
         return None
     rl = w.get("restart", {})
+    # PowerDNS management is opt-in: only wired up (DNS tab enabled) when
+    # nft_route.json's "webadmin" section sets pdns_config. Path lives in
+    # a SEPARATE file/project (pdns-recursor.json), so this is deliberately
+    # not auto-discovered.
     return {
         "host": str(w.get("host", DEFAULTS["host"])),
         "port": int(w.get("port", DEFAULTS["port"])),
@@ -45,6 +49,14 @@ def parse_spec(config):
         "log": w.get("log"),
         "max": int(rl.get("max", DEFAULTS["max"])),
         "window": float(rl.get("window", DEFAULTS["window"])),
+        "pdns_config": w.get("pdns_config"),
+        "pdns_poison_list": w.get("pdns_poison_list"),
+        "rec_control": str(w.get("rec_control", DEFAULTS["rec_control"])),
+        # PowerDNS Recursor commonly runs on a different box than this
+        # router: "user@1.2.3.4" or "user@1.2.3.4:2222" routes every pdns
+        # file op + rec_control over ssh (auth via the invoking user's own
+        # key/agent/~/.ssh/config, nothing managed here). Omit for local.
+        "pdns_host": w.get("pdns_host"),
     }
 
 
@@ -74,12 +86,21 @@ class WebadminService:
 
     def build_argv(self, spec, cfg_path, pidfile):
         script = self.script or os.path.join(os.path.dirname(os.path.realpath(__file__)), "webadmin.py")
-        return [sys.executable, script,
+        argv = [sys.executable, script,
                 "--config", cfg_path,
                 "--host", spec["host"], "--port", str(spec["port"]),
                 "--redis-host", spec["redis_host"], "--redis-port", str(spec["redis_port"]),
                 "--redis-db", str(spec["redis_db"]),
                 "--pidfile", pidfile]
+        if spec.get("pdns_config"):
+            argv += ["--pdns-config", spec["pdns_config"]]
+        if spec.get("pdns_poison_list"):
+            argv += ["--pdns-poison-list", spec["pdns_poison_list"]]
+        if spec.get("rec_control"):
+            argv += ["--rec-control", spec["rec_control"]]
+        if spec.get("pdns_host"):
+            argv += ["--pdns-host", spec["pdns_host"]]
+        return argv
 
     # ------------------------------------------------------------------
     def reconcile(self, config, cfg_path, pidfile="/run/nft_route.pid"):

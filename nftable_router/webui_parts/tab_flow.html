@@ -1,0 +1,11 @@
+<section id=s-flow class=sel>
+ <div class=bar>
+  <button id=b-pause>⏸ 暂停</button><button id=b-clear>清空</button><button id=b-cols>⚙ 列</button>
+  <input id=f-text placeholder="过滤: IP / 线路 / 国家 / 运营商关键字" style=width:280px>
+  <label><input type=checkbox id=f-new> 仅新连接</label>
+  <span class=dim>上限 1000 行(旧行自动淘汰)</span>
+ </div>
+ <div id=colsbox class=card style="display:none"></div>
+ <div id=flowwrap><table><thead id=flowhead></thead>
+ <tbody id=flowbody></tbody></table></div>
+</section>

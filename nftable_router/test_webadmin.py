@@ -150,6 +150,37 @@ def test_master_signal(tmpdir):
     check("dead pid -> alive False", wa.check_master(pidfile=pf)["alive"] is False)
 
 
+def test_dnsmasq_reload():
+    print("[4b] reload_dnsmasq: local systemctl reload, injectable runner")
+    class FakeResult:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+    calls = []
+    def ok_runner(argv, **kw):
+        calls.append(argv)
+        return FakeResult(0, "ok")
+    r = wa.reload_dnsmasq(run=ok_runner)
+    check("success path uses systemctl reload dnsmasq",
+          r["ok"] is True and calls[0] == ["systemctl", "reload", "dnsmasq"])
+
+    def fail_runner(argv, **kw):
+        return FakeResult(1, "", "Unit dnsmasq.service not loaded")
+    r2 = wa.reload_dnsmasq(run=fail_runner)
+    check("nonzero rc -> ok False, output captured",
+          r2["ok"] is False and "not loaded" in r2["output"])
+
+    def missing_runner(argv, **kw):
+        raise FileNotFoundError()
+    r3 = wa.reload_dnsmasq(run=missing_runner)
+    check("missing systemctl -> clear error, no traceback", r3["ok"] is False and "error" in r3)
+
+    import subprocess as sp
+    def timeout_runner(argv, **kw):
+        raise sp.TimeoutExpired(argv, 8)
+    r4 = wa.reload_dnsmasq(run=timeout_runner)
+    check("timeout -> clear error", r4["ok"] is False and "超时" in r4["error"])
+
+
 # ---------------------------------------------------------------------------
 # live HTTP/WS end-to-end (server thread, real sockets)
 # ---------------------------------------------------------------------------
@@ -483,6 +514,29 @@ def test_webadmin_service_lifecycle():
     a4 = srv.reconcile({"webadmin": {"enabled": False}}, path)
     check("disabled -> stopped + terminate sent", a4 == "stopped" and srv.state == "off" and procs[-1]._term)
     check("parse default disabled-by-absence is enabled", svc.parse_spec({}) is not None and svc.parse_spec({}).get("port") == 8788)
+    # pdns_config/pdns_poison_list/rec_control: opt-in passthrough into argv
+    spec_nopdns = svc.parse_spec({})
+    check("no pdns_config by default", not spec_nopdns.get("pdns_config"))
+    argv_nopdns = srv.build_argv(spec_nopdns, "/x/nft_route.json", "/x/pid")
+    check("no --pdns-config flag when unset", "--pdns-config" not in argv_nopdns)
+    spec_pdns = svc.parse_spec({"webadmin": {"pdns_config": "/etc/powerdns/pdns-recursor.json",
+                                             "pdns_poison_list": "/etc/powerdns/dns_posion_list.txt"}})
+    check("pdns_config parsed through", spec_pdns["pdns_config"] == "/etc/powerdns/pdns-recursor.json")
+    argv_pdns = srv.build_argv(spec_pdns, "/x/nft_route.json", "/x/pid")
+    check("--pdns-config flag present with configured path",
+          "--pdns-config" in argv_pdns and "/etc/powerdns/pdns-recursor.json" in argv_pdns)
+    check("--pdns-poison-list flag present",
+          "--pdns-poison-list" in argv_pdns and "/etc/powerdns/dns_posion_list.txt" in argv_pdns)
+    check("rec_control defaults to bare binary name", spec_pdns["rec_control"] == "rec_control")
+    # pdns_host: PowerDNS Recursor on a different box -> ssh passthrough
+    check("no pdns_host by default", not spec_nopdns.get("pdns_host"))
+    check("no --pdns-host flag when unset", "--pdns-host" not in argv_nopdns)
+    spec_remote = svc.parse_spec({"webadmin": {"pdns_config": "/etc/powerdns/pdns-recursor.json",
+                                               "pdns_host": "root@10.0.0.5:2222"}})
+    check("pdns_host parsed through", spec_remote["pdns_host"] == "root@10.0.0.5:2222")
+    argv_remote = srv.build_argv(spec_remote, "/x/nft_route.json", "/x/pid")
+    check("--pdns-host flag present with configured target",
+          "--pdns-host" in argv_remote and "root@10.0.0.5:2222" in argv_remote)
 
 
 def test_webadmin_real_child_smoke():
@@ -510,8 +564,8 @@ def test_webadmin_real_child_smoke():
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         test_master_signal(d)
-    for t in (test_ws_codec, test_ring_hub, test_validate_config, test_ui_js_syntax, test_server_e2e,
-              test_webadmin_service_lifecycle, test_webadmin_real_child_smoke):
+    for t in (test_ws_codec, test_ring_hub, test_validate_config, test_dnsmasq_reload, test_ui_js_syntax,
+              test_server_e2e, test_webadmin_service_lifecycle, test_webadmin_real_child_smoke):
         t()
     print("\n==== %d passed, %d failed ====" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

@@ -1,0 +1,12 @@
+<section id=s-info>
+ <div class=bar><button id=i-refresh>刷新</button><button id=i-testnow class=good>▶ 立即测试线路</button>
+  <button id=i-reload class=good>⟳ 重载主进程 (SIGUSR1)</button>
+  <span id=i-dirty class=warn></span>
+  <span class=dim id=i-round></span><span class=dim>状态每4秒自动刷新</span></div>
+ <div class=card id=i-master></div>
+ <div class=card><b>线路测试状态</b><div style=overflow:auto><table id=i-lines></table></div></div>
+ <div class=card><b>托管代理进程</b><div style=overflow:auto><table id=i-prox></table></div></div>
+ <div class=card><b>进程 (router master 子进程树)</b><div style=overflow:auto><table id=i-procs></table></div></div>
+ <div class=card id=i-extwrap style="display:none"><b>外部代理进程 (非router托管: supervisord/手工)</b><div style=overflow:auto><table id=i-ext></table></div></div>
+ <div class=card><details><summary class=dim>原始JSON</summary><pre id=info-box class=dim></pre></details></div>
+</section>
