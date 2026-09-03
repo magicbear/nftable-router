@@ -29,7 +29,27 @@ function curSel(){try{var x=JSON.parse(localStorage.getItem("nft_cols"));
 function visibleCols(){var w={};curSel().forEach(function(i){w[i]=1});return COLS.filter(function(c){return w[c.id]})}
 function searchText(r){var g=r.geo||{};
  return [r.src,r.dev||"",r.dst,r.line,r.mark,r.qname,g.cc,g.cn,g.rg,g.ct,g.isp,PROTO[r.proto]||r.proto].join(" ").toLowerCase()}
-function rowMatch(r,q){if(!q)return true;return searchText(r).indexOf(q)>=0}
+// Android-Studio-style query: space-separated terms all must match (AND);
+// a leading '-' EXCLUDES the term, a leading '~' makes it a REGEX (i flag),
+// anything else is a plain substring. Examples:
+//   192.168.32 ~^tcp .*:22$ -google  -> tcp rows to port 22, from 32-net, not google
+var _qcache={};
+function parseQuery(q){
+ if(_qcache[q])return _qcache[q];
+ var arr=[];
+ (q||"").trim().split(/\s+/).forEach(function(w){
+  var neg=0,re=null,t=w;
+  if((w[0]=="-"||w[0]=="~")&&w.length>1){neg=w[0]=="-";if(w[0]=="~"){try{re=new RegExp(w.slice(1),"i")}catch(e){re=new RegExp(w.slice(1).replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),"i")}}t=w.slice(1)}
+  else if(w.length==1&&w[0]=="-")return;
+  arr.push({neg:neg,re:re,t:t.toLowerCase()})});
+ if(Object.keys(_qcache).length>64)_qcache={};
+ _qcache[q]=arr;return arr}
+function rowMatch(r,q){var arr=parseQuery(q);if(!arr.length)return true;
+ var t=searchText(r);
+ for(var i=0;i<arr.length;i++){var c=arr[i];
+  var hit=c.re?c.re.test(t):t.indexOf(c.t)>=0;
+  if(c.neg?hit:!hit)return false}
+ return true}
 function trOf(r){
  var tr=el("tr");
  visibleCols().forEach(function(c){
@@ -59,7 +79,7 @@ function applySel(){
  localStorage.setItem("nft_cols",JSON.stringify(ids));
  buildHead();buildColsBox();rerender()}
 function visNow(r){
- var q=($("f-text").value||"").toLowerCase();
+ var q=$("f-text").value||"";
  return rowMatch(r,q)&&(! $("f-new").checked || r.sess==0)}
 function trim(){
  // EVICT OLDEST-FIRST ONLY. Rows hidden by the current filter must NEVER be
@@ -74,14 +94,14 @@ function trim(){
 function push(r){
  rows.push(r);evtTotal++;trim();
  if(paused)return;
- var q=($("f-text").value||"").toLowerCase();
+ var q=$("f-text").value||"";
  if(!rowMatch(r,q))return;
  if($("f-new").checked&&r.sess!=0)return;
  var b=$("flowbody");b.appendChild(trOf(r));
  var w=$("flowwrap");if(w.scrollHeight-w.scrollTop-w.clientHeight<400)w.scrollTop=w.scrollHeight;
  $("n-rows").textContent=rows.length;$("n-evt").textContent=evtTotal}
 function rerender(){
- var b=$("flowbody");b.innerHTML="";var q=($("f-text").value||"").toLowerCase();
+ var b=$("flowbody");b.innerHTML="";var q=$("f-text").value||"";
  var frag=document.createDocumentFragment();var n=0;
  for(var i=rows.length-1;i>=0&&n<MAXROWS;i--){
   var r=rows[i];if(!rowMatch(r,q))continue;
