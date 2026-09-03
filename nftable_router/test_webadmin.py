@@ -636,6 +636,9 @@ def test_tools_units():
     check("from+cidr tcp hits L2 weight0", r.get("priority") == 1 and r.get("mark") == 22, str(r))
     r = wa.ipq_decide(cfg, "10.1.1.1", {"country_code": "JP"})
     check("from-rule noted without src", r.get("mark") == 0, str(r))
+    r = wa.ipq_decide(cfg, "8.8.8.8", {"country_code": "US"}, proto=1)
+    check("icmp follows same chain (no udp gate on L1)",
+          r.get("mark") == 11 and r.get("priority") == 0, str(r))
     r = wa.ipq_decide(cfg, "8.8.8.8", None)
     check("geo miss -> 0x99 bypass like router",
           r.get("mark") == 0x99 and "0x99" in r.get("why", ""), str(r))

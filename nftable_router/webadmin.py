@@ -1221,7 +1221,8 @@ def ipq_decide(cfg, dst, geo, names=None, src=None, proto=6, dport=443):
     priority, per-line gates, cidr/resolve/geo/any conditions, weight ECMP).
     Runtime-only states are not reproduced: dead-proxy health flags, ECMP
     1s cache (a weighted pick is pseudo-random by packet.id), qos TOS path,
-    overload bypass."""
+    overload bypass.  proto=1 (ICMP): no udp gate/port semantics; the router
+    consults the 1s ECMP cache first for non-TCP/UDP-ECMP ports (same pick)."""
     v6 = ":" in dst
     ps = "ipv6" if v6 else "ipv4"
     udpk = "udp_v6" if v6 else "udp_v4"
@@ -1381,7 +1382,8 @@ def ipq_run(body, cfg, cfg_path, app=None):
             ipaddress.ip_address(src)
         except ValueError:
             return {"ok": False, "error": "源 IP 非法"}
-    proto = 17 if str(body.get("proto", "6")) in ("17", "udp") else 6
+    pv = str(body.get("proto", "6")).strip().lower()
+    proto = {"icmp": 1, "1": 1, "udp": 17, "17": 17}.get(pv, 6)
     try:
         dport = min(65535, max(1, int(body.get("dport", 443) or 443)))
     except ValueError:
@@ -1481,7 +1483,7 @@ def bw_loop():
             while bw_hist and bw_hist[0][0] < cut:
                 bw_hist.pop(0)
         try:
-            _mtr_broadcast(json.dumps({"t": "bw", "ts": round(t_now, 1), "r": rates}).encode())
+            _mtr_broadcast({"t": "bw", "ts": round(t_now, 1), "r": rates})
         except Exception:
             pass
 

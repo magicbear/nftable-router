@@ -12,7 +12,7 @@ import os
 
 # bump on every UI behaviour change: /api/config refuses saves from older
 # cached pages (they may reconstruct payloads with missing keys)
-UI_VERSION = "20260905-1200"
+UI_VERSION = "20260905-1210"
 
 _here = os.path.dirname(os.path.realpath(__file__))
 _parts_dir = os.path.join(_here, "webui_parts")

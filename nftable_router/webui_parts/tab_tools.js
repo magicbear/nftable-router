@@ -140,6 +140,8 @@ $("i-run").onclick=function(){
     ipqRender(r)})
    .catch(function(e){$("i-run").disabled=false;$("i-err").textContent=""+e})};
 $("i-ips").addEventListener("keydown",function(e){if(e.key==="Enter")$("i-run").click()});
+$("i-proto").onchange=function(){var ic=this.value=="1";$("i-port").disabled=ic;
+ $("i-port").style.opacity=ic?0.4:1};
 
 // ---------- 带宽趋势 (sampler runs in webadmin forever; WS pushes one point
 // every 5s -- first open pulls the 15min snapshot, after that pure push) ----------
