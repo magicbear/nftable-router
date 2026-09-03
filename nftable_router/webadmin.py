@@ -1115,11 +1115,277 @@ def whois_run(body):
             "out": ((r.stdout or "") + (("\n" + r.stderr) if r.stderr else ""))[:65536]}
 
 
-def ipq_run(body, cfg, cfg_path):
-    env, mark, err = _tool_env(cfg, body.get("line"))
-    if err:
-        return {"ok": False, "error": err}
-    raw = str(body.get("ips", "")).replace(",", " ").split()
+def geo_db6(cfg_path):
+    """v6 ipdb mirror of router's db_v6 (falls back to the v4 file)."""
+    global _geo6
+    v4 = geo_db(cfg_path)
+    if _geo6["db"] is not None or _geo6["tried"]:
+        return _geo6["db"] or v4
+    _geo6["tried"] = True
+    try:
+        import ipdb
+        cfg = ib.load_config(cfg_path)
+        p6 = cfg.get("ipdb_v6")
+        if p6 and p6 != cfg.get("ipdb_v4") and os.path.exists(p6):
+            _geo6["db"] = ipdb.City(p6)
+    except Exception:
+        pass
+    return _geo6["db"] or v4
+
+
+_geo6 = {"db": None, "tried": False}
+
+
+def _geo_all(db, ip, v6=False):
+    """raw find_map dict (ALL fields) exactly as the router sees geodata."""
+    if db is None:
+        return None
+    g = None
+    try:
+        key = ip if v6 else struct.unpack("!L", socket.inet_aton(ip))[0]
+        g = db.find_map(key, "CN")
+    except Exception:
+        try:
+            g = db.find_map(ip, "CN")
+        except Exception:
+            g = None
+    if not g:
+        return None
+    out = {}
+    for k, v in g.items():
+        try:
+            json.dumps(v)
+            out[str(k)] = v
+        except TypeError:
+            out[str(k)] = v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+    return out
+
+
+def _ipq_names(app, dst):
+    """recent DNS-observed names for dst (what router's dns_list holds),
+    rebuilt from the live flow ring."""
+    names = set()
+    if app is None:
+        return names
+    try:
+        snap = app.ring.snapshot()
+    except Exception:
+        return names
+    for ev in reversed(snap):
+        try:
+            if isinstance(ev, dict) and ev.get("dst") == dst and ev.get("qname"):
+                for n in str(ev["qname"]).split(","):
+                    n = n.strip().lower()
+                    if n:
+                        names.add(n)
+        except Exception:
+            continue
+        if len(names) >= 40:
+            break
+    return names
+
+
+def _ipq_seen(app, dst):
+    if app is None:
+        return None
+    try:
+        snap = app.ring.snapshot()
+    except Exception:
+        return None
+    for ev in reversed(snap):
+        try:
+            if isinstance(ev, dict) and ev.get("dst") == dst and ev.get("mark") is not None:
+                return {"line": ev.get("line"), "mark": ev.get("mark"),
+                        "pri": ev.get("pri"), "ts": ev.get("ts")}
+        except Exception:
+            continue
+    return None
+
+
+def _in_nets(a, nets):
+    for n in nets or []:
+        try:
+            net = ipaddress.ip_network(str(n), strict=False) if isinstance(n, str) else n
+        except ValueError:
+            continue
+        try:
+            if a in net:
+                return str(n)
+        except TypeError:
+            continue
+    return None
+
+
+def ipq_decide(cfg, dst, geo, names, src=None, proto=6, dport=443):
+    """FAITHFUL replay of the router.py NFQUEUE decision chain (rules by
+    priority, per-line gates, cidr/resolve/geo/any conditions, weight ECMP).
+    Runtime-only states are not reproduced: dead-proxy health flags, ECMP
+    1s cache (a weighted pick is pseudo-random by packet.id), qos TOS path,
+    overload bypass."""
+    v6 = ":" in dst
+    ps = "ipv6" if v6 else "ipv4"
+    udpk = "udp_v6" if v6 else "udp_v4"
+    try:
+        dst_a = ipaddress.ip_address(dst)
+        src_a = ipaddress.ip_address(src) if src else None
+    except ValueError:
+        return {"error": "IP 非法"}
+    if geo is None:
+        return {"mark": 0x99, "priority": None, "candidates": [],
+                "why": "geodata 查不到 → 0x99 直连旁路（router 同款行为）"}
+    cands_all = []
+    for prio, entry in enumerate(cfg.get("rules") or []):
+        cands = []
+        sw = 0
+
+        def add(tun, p, why):
+            nonlocal sw
+            w = p.get("weight", 0)
+            cands.append({"line": tun, "mark": p.get("mark"), "weight": w,
+                          "start": sw, "why": why})
+            sw += w
+
+        for tun, rc in (entry or {}).items():
+            p = (cfg.get("proxy") or {}).get(tun)
+            if p is None:
+                continue
+            if not p.get(ps, False):
+                cands_all.append({"p": prio, "line": tun, "skip": "不支持 %s" % ps})
+                continue
+            if p.get("weight", -1) < 0:
+                cands_all.append({"p": prio, "line": tun, "skip": "weight<0(停用)"})
+                continue
+            if proto == 17 and not p.get(udpk, False):
+                cands_all.append({"p": prio, "line": tun, "skip": "该线路禁 UDP"})
+                continue
+            ign = False
+            for ap in p.get("ignore_apps") or []:
+                try:
+                    if ap[0] != proto:
+                        continue
+                    if len(ap) == 2 and ap[1] == dport:
+                        ign = True
+                    elif len(ap) == 3 and ap[1] <= dport <= ap[2]:
+                        ign = True
+                except Exception:
+                    pass
+            if ign:
+                cands_all.append({"p": prio, "line": tun, "skip": "ignore_apps 命中端口"})
+                continue
+            if "from" in rc:
+                if src_a is None:
+                    cands_all.append({"p": prio, "line": tun, "skip": "有 from 条件，需填源IP才能判定"})
+                    continue
+                if not _in_nets(src_a, rc.get("from")):
+                    continue
+            for k, lst in (rc or {}).items():
+                if k == "from":
+                    continue
+                if not isinstance(lst, list):
+                    lst = [lst]
+                if k == "cidr":
+                    hit = _in_nets(dst_a, lst)
+                    if hit:
+                        add(tun, p, "cidr %s" % hit)
+                elif k == "resolve":
+                    if not names:
+                        continue
+                    hitn = None
+                    for dom in lst:
+                        d = str(dom).lower().rstrip(".")
+                        for nm in names:
+                            n2 = nm.rstrip(".")
+                            if n2 == d or (d.startswith(".") and n2.endswith(d)):
+                                hitn = nm + " ∈ " + str(dom)
+                                break
+                        if hitn:
+                            break
+                    if hitn:
+                        add(tun, p, "resolve %s" % hitn)
+                elif k == "any":
+                    add(tun, p, "any")
+                else:
+                    gv = geo.get(k)
+                    if gv is not None and any(str(x) == str(gv) for x in lst):
+                        add(tun, p, "%s=%s" % (k, gv))
+        if cands:
+            weighted = [c for c in cands if c["weight"] > 0]
+            pick = None
+            if weighted:
+                pick = max(weighted, key=lambda c: c["weight"])
+                for c in cands:
+                    c["share"] = round(100.0 * c["weight"] / sw, 1) if sw else 0.0
+            else:
+                pick = cands[0]          # all weight0 -> stable first (like router)
+                for c in cands:
+                    c["share"] = 0.0
+            return {"priority": prio, "candidates": cands, "mark": pick["mark"],
+                    "line": pick["line"], "why": pick["why"],
+                    "ecmp": len(weighted) > 1,
+                    "skips": [x for x in cands_all if x["p"] == prio]}
+    return {"priority": None, "candidates": [], "mark": 0, "line": "default",
+            "why": "未命中任何策略规则 → mark 0 (main表)"}
+
+
+def ipq_route(dst, mark):
+    try:
+        args = ["-j", "route", "get", dst]
+        if mark:
+            args += ["mark", str(mark)]
+        rc, out = _ip(args, timeout=5)
+    except Exception as e:
+        return {"ok": False, "raw": "ip route get 失败: %s" % e}
+    try:
+        data = json.loads(out)
+        r = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+        return {"ok": True, "dev": r.get("dev") or "", "via": r.get("gateway") or "",
+                "table": str(r.get("table") or "main"),
+                "src": r.get("prefsrc") or (r.get("src") or [""])[0] if isinstance(r.get("src"), list) else (r.get("prefsrc") or r.get("src") or ""),
+                "raw": (out or "").strip()[:400]}
+    except Exception:
+        m = re.search(r"table (\S+)", out or "")
+        return {"ok": True, "dev": "", "via": "", "table": m.group(1) if m else "?",
+                "src": "", "raw": (out or "").strip()[:400]}
+
+
+def ipq_rule_for_mark(mark):
+    if not mark:
+        return {"pref": None, "table": "main", "note": "mark 0 不查 rule"}
+    try:
+        rc, out = _ip(["-j", "rule"], timeout=5)
+        rules = json.loads(out)
+    except Exception:
+        return {"pref": None, "table": "?", "note": "ip rule 解析失败"}
+    for r in rules if isinstance(rules, list) else []:
+        fw = str(r.get("fwmark") or "")
+        if not fw:
+            continue
+        val_s, _, mask_s = fw.partition("/")
+        try:
+            val = int(val_s, 16) if val_s.lower().startswith("0x") else int(val_s)
+            mask = int(mask_s, 16) if mask_s else 0xffffffff
+        except ValueError:
+            continue
+        if (mark & mask) == (val & mask):
+            act = r.get("type") or "to"
+            return {"pref": r.get("priority"), "table": str(r.get("table") or act),
+                    "action": act, "raw": json.dumps(r, ensure_ascii=False)[:200]}
+    return {"pref": None, "table": "main", "note": "无匹配 fwmark 规则 → main"}
+
+
+def ipq_run(body, cfg, cfg_path, app=None):
+    raw = str(body.get("ips", "")).replace(",", " ").replace(";", " ").split()
+    src = str(body.get("src", "")).strip() or None
+    if src:
+        try:
+            ipaddress.ip_address(src)
+        except ValueError:
+            return {"ok": False, "error": "源 IP 非法"}
+    proto = 17 if str(body.get("proto", "6")) in ("17", "udp") else 6
+    try:
+        dport = min(65535, max(1, int(body.get("dport", 443) or 443)))
+    except ValueError:
+        dport = 443
     ips = []
     for x in raw:
         try:
@@ -1132,20 +1398,32 @@ def ipq_run(body, cfg, cfg_path):
             break
     if not ips:
         return {"ok": False, "error": "没有合法 IP（最多 16 个）"}
-    g = geo_lookup(cfg_path, ips)
+    db4 = geo_db(cfg_path)
+    db6 = geo_db6(cfg_path)
+    force = None
+    fl = str(body.get("line", "") or "")
+    if fl and fl not in ("", "default", "auto"):
+        lines = mtr_line_marks(cfg)
+        if fl not in lines:
+            return {"ok": False, "error": "未知线路 %r" % fl}
+        force = lines[fl]
     rows = []
     for ip in ips:
-        route = ""
-        try:
-            args = ["route", "get", ip]
-            if mark:
-                args += ["mark", str(mark)]
-            rc, out = _ip(args, timeout=5)
-            route = (out or "").strip().splitlines()[0][:200] if (out or "").strip() else ("rc=%d" % rc)
-        except Exception as e:
-            route = "ip route get 失败: %s" % e
-        rows.append({"ip": ip, "route": route})
-    return {"ok": True, "mark": mark, "rows": rows, "geo": (g or {}).get("geo") or {}}
+        v6 = ":" in ip
+        geo = _geo_all(db6 if v6 else db4, ip, v6)
+        names = _ipq_names(app, ip)
+        dec = ipq_decide(cfg, ip, geo, names, src, proto, dport)
+        mark = dec.get("mark", 0)
+        if force:
+            dec["forced"] = {"line": fl, "mark": force["mark"]}
+            mark = force["mark"]
+        rows.append({"ip": ip, "geo": geo, "names": sorted(names),
+                     "decision": dec, "mark": mark,
+                     "route": ipq_route(ip, mark),
+                     "rule": ipq_rule_for_mark(mark),
+                     "seen": _ipq_seen(app, ip)})
+    return {"ok": True, "rows": rows, "proto": proto, "dport": dport, "src": src,
+            "geo_err": (_geo["error"] if db4 is None else None)}
 
 
 # ---------------------------------------------------------------------------
@@ -1418,7 +1696,14 @@ def ift_start(body):
     if not binw:
         return {"ok": False, "error": "iftop 未安装（apt install iftop）"}
     ift_stop("replaced")
-    argv = [binw, "-n", "-t", "-s", "86400"]
+    # iftop printf-buffs its piped stdout in 4KB blocks -> WITHOUT a line-buffer
+    # wrapper the UI would starve until iftop exits (and -s delays it further).
+    # stdbuf -oL forces line flushing so screens arrive live; no -s at all.
+    pre = []
+    sb = shutil.which("stdbuf")
+    if sb:
+        pre = [sb, "-oL"]
+    argv = pre + [binw, "-n", "-t"]
     if iface != "any":
         argv += ["-i", iface]
     try:
@@ -1426,6 +1711,7 @@ def ift_start(body):
                                 text=True, bufsize=1)
     except OSError as e:
         return {"ok": False, "error": "iftop 启动失败: %s" % e}
+    note = None if sb else "stdbuf 缺失: 输出将按4KB块到达(非实时)"
     sess = {"id": next(ift_seq), "proc": proc, "iface": iface, "status": "running",
             "started": time.time(), "screen_ts": time.time(), "hb": time.time(),
             "pairs": [], "buf": []}
@@ -1433,7 +1719,7 @@ def ift_start(body):
         ift_sess[0] = sess
     threading.Thread(target=ift_reader, args=(sess,), daemon=True).start()
     threading.Thread(target=ift_ticker, args=(sess,), daemon=True).start()
-    return {"ok": True, "id": sess["id"], "iface": iface}
+    return {"ok": True, "id": sess["id"], "iface": iface, "note": note}
 
 
 # ---------------------------------------------------------------------------
@@ -2171,7 +2457,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 cp = self.cfg_path()
                 cfg = ib.load_config(cp)
-                self.send_json(200, ipq_run(body, cfg, cp))
+                self.send_json(200, ipq_run(body, cfg, cp, self.app))
             except Exception as e:
                 self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
         elif path == "/api/iftop/start":
