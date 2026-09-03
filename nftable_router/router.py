@@ -1093,6 +1093,62 @@ def get_term_width():
     return g_term_width
 
 
+    def resolve_src_iface(self, src):
+        """Resolve a source IP's physical location via redis ARP::MAPPING +
+        MAC::TABLE::<switch> hashes -- ONCE per result; returns
+        (colored_str_for_console, plain_str_for_pr_stream).
+        ported verbatim from the inline block formerly in run() so the console
+        column keeps its exact formatting; publishing reuses the same walk
+        instead of duplicating the redis round-trips."""
+        dev_plain = ""
+        try:
+            arp_record = self.r.hget("ARP::MAPPING", src)
+        except Exception as e:
+            return tf.format("{error:30s,red,bold}", error="ERROR " + str(e)), ""
+        try:
+            if arp_record is not None and self.device_list is not None:
+                arp_record = json.loads(arp_record)
+                for dev in self.device_list:
+                    mac_record = self.r.hget(dev, arp_record['mac'])
+                    if mac_record is not None:
+                        mac_record = json.loads(mac_record)
+                        if mac_record['ifName'][0:9] != "Eth-Trunk":
+                            dev = dev[12:]  # len("MAC::TABLE::")
+                            if re.match(r"^[A-Z]{4}\-[0-9]{2}", dev.decode('utf-8')):
+                                dev = dev[8:]
+                            if 'ifDescr' in mac_record and mac_record['ifDescr'] != "":
+                                if mac_record['ifDescr'][0:3] == "To ":
+                                    mac_record['ifDescr'] = mac_record['ifDescr'][3:]
+                                desc_len = 29 - len(dev) - int((len(
+                                    mac_record['ifDescr'].encode('utf-8')) - len(
+                                    mac_record['ifDescr'])) / 2)
+                                if desc_len < 0:
+                                    desc_len = 0
+                                src_interfaces = tf.format(
+                                    "{dev:s,cyan}:{interface:%ds,green,bold}" % desc_len,
+                                    dev=dev.decode("utf-8"),
+                                    interface=mac_record['ifDescr'][0:29 - len(dev.decode("utf-8"))])
+                                dev_plain = "%s:%s" % (dev.decode("utf-8"),
+                                                       mac_record['ifDescr'][0:29 - len(dev.decode("utf-8"))])
+                            else:
+                                mac_record['ifName'] = mac_record['ifName'].replace("GigabitEthernet", "GE")
+                                src_interfaces = tf.format(
+                                    "{dev:s,cyan}:{interface:%ds,green}" % (29 - len(dev)),
+                                    dev=dev.decode("utf-8"), interface=mac_record['ifName'])
+                                dev_plain = "%s:%s" % (dev.decode("utf-8"), mac_record['ifName'])
+                            break
+            if dev_plain == "":
+                if arp_record is not None and 'ifName_L3' in arp_record:
+                    src_interfaces = tf.format("> {interface:28s,purple,bold}",
+                                               interface=arp_record['ifName_L3'])
+                    dev_plain = "> " + str(arp_record['ifName_L3'])
+                else:
+                    src_interfaces = " " * 30
+            return src_interfaces, dev_plain
+        except Exception as e:
+            return tf.format("{error:30s,red,bold}", error="ERROR " + str(e)), dev_plain
+
+
 class PrintResultThread(threading.Thread):
     def __init__(self):
         threading.Thread.__init__(self)
@@ -1139,6 +1195,10 @@ class PrintResultThread(threading.Thread):
                         if self.device_list is None:
                             self.device_list = self.r.keys("MAC::TABLE::*")
 
+                        # source device location, resolved ONCE per result:
+                        # colored -> console column, plain -> pr_stream 'dev'
+                        src_interfaces, src_dev_plain = self.resolve_src_iface(rc.src)
+
                         if rc.process_fullcone:
                             self.r.publish("fullcone_nat", json.dumps({
                                 "ver": rc.pkt_version,
@@ -1156,6 +1216,8 @@ class PrintResultThread(threading.Thread):
                                   "line": rc.out_interface, "mark": rc.mark,
                                   "pri": rc.matched_priority, "sess": rc.test_session,
                                   "ms": round(rc.t_total, 2), "fc": 1 if rc.process_fullcone else 0}
+                            if src_dev_plain:
+                                ev["dev"] = src_dev_plain
                             try:
                                 _rn = dns_list[rc.dst]
                                 if _rn:
@@ -1272,50 +1334,6 @@ class PrintResultThread(threading.Thread):
                                         dns.qname.decode("utf-8"), dns.qtype)
                         except Exception as e:
                             pass
-                        src_interfaces = ""
-                        try:
-                            arp_record = self.r.hget("ARP::MAPPING", rc.src)
-                        except Exception as e:
-                            arp_record = None
-                            src_interfaces = tf.format("{error:30s,red,bold}", error="ERROR " + str(e))
-
-                        try:
-                            if arp_record is not None and self.device_list is not None:
-                                arp_record = json.loads(arp_record)
-                                for dev in self.device_list:
-                                    mac_record = self.r.hget(dev, arp_record['mac'])
-                                    if mac_record is not None:
-                                        mac_record = json.loads(mac_record)
-                                        if mac_record['ifName'][0:9] != "Eth-Trunk":
-                                            dev = dev[12:]  # len("MAC::TABLE::")
-                                            if re.match(r"^[A-Z]{4}\-[0-9]{2}", dev.decode('utf-8')):
-                                                dev = dev[8:]
-                                            if 'ifDescr' in mac_record and mac_record['ifDescr'] != "":
-                                                if mac_record['ifDescr'][0:3] == "To ":
-                                                    mac_record['ifDescr'] = mac_record['ifDescr'][3:]
-                                                desc_len = 29 - len(dev) - int((len(
-                                                    mac_record['ifDescr'].encode('utf-8')) - len(
-                                                    mac_record['ifDescr'])) / 2)
-                                                if desc_len < 0:
-                                                    desc_len = 0
-                                                src_interfaces = tf.format(
-                                                    "{dev:s,cyan}:{interface:%ds,green,bold}" % desc_len,
-                                                    dev=dev.decode("utf-8"),
-                                                    interface=mac_record['ifDescr'][0:29 - len(dev.decode("utf-8"))])
-                                            else:
-                                                mac_record['ifName'] = mac_record['ifName'].replace("GigabitEthernet", "GE")
-                                                src_interfaces = tf.format(
-                                                    "{dev:s,cyan}:{interface:%ds,green}" % (29 - len(dev)),
-                                                    dev=dev.decode("utf-8"), interface=mac_record['ifName'])
-                            if src_interfaces == "":
-                                if arp_record is not None and 'ifName_L3' in arp_record:
-                                    src_interfaces = tf.format("> {interface:28s,purple,bold}",
-                                                               interface=arp_record['ifName_L3'])
-                                else:
-                                    src_interfaces = " " * 30
-                        except Exception as e:
-                            src_interfaces = tf.format("{error:30s,red,bold}", error="ERROR " + str(e))
-
                         if rc.test_session == 1:
                             src_interfaces = tf.format("{dev:30s,yellow}", dev=" >> Check Alive Connection << ")
                         if rc.test_session == 2:

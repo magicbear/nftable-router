@@ -1580,12 +1580,13 @@ class Handler(BaseHTTPRequestHandler):
         self.app.hub.add(q)
         _MTR_HUB.add(q)          # live mtr progress frames on the same socket
         parser = WSParser()
+        pending = b""          # unsent WS bytes; partial-send safe
         try:
             conn.sendall(ws_encode(json.dumps({"t": "hello", "server": "nft-route webadmin"})))
             conn.sendall(ws_encode(json.dumps({"t": "snap", "rows": self.app.ring.snapshot()})))
             closed = False
             while not closed:
-                r, _, _ = select.select([conn], [], [], 0.05)
+                r, w, _ = select.select([conn], [conn] if pending else [], [], 0.05)
                 if r:
                     try:
                         data = conn.recv(4096)
@@ -1602,21 +1603,27 @@ class Handler(BaseHTTPRequestHandler):
                                 conn.sendall(ws_encode(payload, opcode=0xA))
                             except OSError:
                                 closed = True
-                batch = []
-                try:
-                    while len(batch) < 1024:
-                        batch.append(q.get_nowait())
-                except Empty:
-                    pass
-                if batch:
-                    lost = getattr(q, "dropped", 0)
-                    if lost:
-                        q.dropped = 0
-                        batch.insert(0, json.dumps({"t": "gap", "n": lost}))
-                    try:   # ONE syscall for the whole batch: far less
-                        conn.sendall(b"".join(ws_encode(x) for x in batch))
+                if not pending:
+                    batch = []
+                    try:
+                        while len(batch) < 256:
+                            batch.append(q.get_nowait())
+                    except Empty:
+                        pass
+                    if batch:
+                        lost = getattr(q, "dropped", 0)
+                        if lost:
+                            q.dropped = 0
+                            batch.insert(0, json.dumps({"t": "gap", "n": lost}))
+                        pending = b"".join(ws_encode(x) for x in batch)
+                if pending and w:
+                    try:
+                        n = conn.send(pending)   # may write partially
+                        pending = pending[n:]
+                    except BlockingIOError:      # slow tab (background throttling):
+                        pass                     # keep bytes, NEVER drop the socket
                     except (BrokenPipeError, ConnectionResetError, OSError):
-                        break  # per-frame write amplification under load
+                        break
         except (OSError, ConnectionError):
             pass
         finally:

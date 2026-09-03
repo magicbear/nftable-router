@@ -5,6 +5,7 @@ var COLS=[
  {id:"time", label:"时间",     def:1, get:function(r){return hhmmss(r.ts)}},
  {id:"proto",label:"协议",     def:1, cls:function(r){return "p"+r.proto}, get:function(r){return PROTO[r.proto]||r.proto}},
  {id:"src",  label:"源",       def:1, cls:function(){return "src"},  get:function(r){return r.src}},
+ {id:"dev",  label:"源设备",   def:1, cls:function(){return "dim"}, get:function(r){return r.dev||""}},
  {id:"sport",label:"源端口",   def:1, get:function(r){return r.sport!=null?r.sport:""}},
  {id:"dst",  label:"目的",     def:1, cls:function(){return "dst"},  get:function(r){return r.dst}},
  {id:"dport",label:"目的端口", def:1, get:function(r){return r.dport!=null?r.dport:""}},
@@ -27,7 +28,7 @@ function curSel(){try{var x=JSON.parse(localStorage.getItem("nft_cols"));
  return defaultSel()}
 function visibleCols(){var w={};curSel().forEach(function(i){w[i]=1});return COLS.filter(function(c){return w[c.id]})}
 function searchText(r){var g=r.geo||{};
- return [r.src,r.dst,r.line,r.mark,r.qname,g.cc,g.cn,g.rg,g.ct,g.isp,PROTO[r.proto]||r.proto].join(" ").toLowerCase()}
+ return [r.src,r.dev||"",r.dst,r.line,r.mark,r.qname,g.cc,g.cn,g.rg,g.ct,g.isp,PROTO[r.proto]||r.proto].join(" ").toLowerCase()}
 function rowMatch(r,q){if(!q)return true;return searchText(r).indexOf(q)>=0}
 function trOf(r){
  var tr=el("tr");
@@ -61,12 +62,13 @@ function visNow(r){
  var q=($("f-text").value||"").toLowerCase();
  return rowMatch(r,q)&&(! $("f-new").checked || r.sess==0)}
 function trim(){
- // cap 1000 with filter-aware eviction: non-visible (old, filtered-out) rows
- // go first; visible (matching) rows are kept unless the WHOLE buffer matches
- var i=0;
- while(rows.length>MAXROWS&&i<rows.length){if(!visNow(rows[i]))rows.splice(i,1);else i++}
+ // EVICT OLDEST-FIRST ONLY. Rows hidden by the current filter must NEVER be
+ // purged (the old filter-aware eviction silently deleted other devices'
+ // rows while the box held a search term -> "devices missing in webui but
+ // present in the console" report, 2026-09-04). Filtered rows stay in the
+ // data array and reappear the moment the filter changes (rerender()).
  var dropped=0;
- while(rows.length>MAXROWS){rows.shift();dropped++}   // all-visible: oldest yields
+ while(rows.length>MAXROWS){rows.shift();dropped++}
  var b=$("flowbody");
  for(var k=0;k<dropped&&b.firstChild;k++)b.removeChild(b.firstChild)}
 function push(r){
