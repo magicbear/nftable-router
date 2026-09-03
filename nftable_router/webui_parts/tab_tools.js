@@ -199,7 +199,7 @@ function iftRender(m){
  if(m.ifaces&&m.ifaces.length){var sel=$("f-iface");
   if(!sel.dataset.filled){sel.innerHTML="";var ao=el("option","","any (全部接口)");ao.value="any";sel.appendChild(ao);
    m.ifaces.forEach(function(x){var o=el("option","",x);o.value=x;sel.appendChild(o)});
-   if(m.ifaces.indexOf("br0")>=0)sel.value="br0";
+   if(m.recommended&&m.ifaces.indexOf(m.recommended)>=0)sel.value=m.recommended;
    sel.dataset.filled="1"}}
  if(m.status==="stopped"||m.status==="exited"){iftOn=false;if(iftHbTimer){clearInterval(iftHbTimer);iftHbTimer=null}}}
 function iftHb(){api("/api/iftop/status").then(iftRender).catch(function(){})}

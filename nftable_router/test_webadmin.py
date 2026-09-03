@@ -591,28 +591,34 @@ def test_iife_scope_lint():
 def test_tools_units():
     print("[8] network tools units (iftop parse / bw / arg validation)")
     screen = (
-        "            =>                        10.0Mb                         <=\n"
-        "192.168.1.10:53750 => 140.205.70.130:443\n"
-        "                    =========================   2.34Mb  1.10Mb  0.99Mb\n"
-        "              <=    ==============              1.20Mb  1.54Mb  1.62Mb\n"
-        "[2001:db8::1]:8443 => [2001:db8::2]:52001\n"
-        "                    ====                        500.5Kb 300Kb 200Kb\n"
-        "              <=    ==                          100.0Kb  90Kb  80Kb\n"
-        "--------------------------------------------------------------------------------\n")
+        "   # Host name (port/service if enabled)            last 2s   last 10s   last 40s cumulative\n"
+        "--------------------------------------------------------------------------------------------\n"
+        "   1 183.95.60.178                            =>     50.0Kb     25.0Kb     25.0Kb     12.5KB\n"
+        "     192.168.32.2                             <=     53.8Kb     26.9Kb     26.9Kb     13.4KB\n"
+        "   2 192.168.11.5                             =>     3.47Kb     1.73Kb     1.73Kb       888B\n"
+        "     192.168.32.32                            <=     3.08Kb     1.54Kb     1.54Kb       788B\n"
+        "   3 117.135.184.94                           =>       780b       390b       390b       195B\n"
+        "     192.168.32.2                             <=     4.15Kb     2.08Kb     2.08Kb     1.04KB\n"
+        "--------------------------------------------------------------------------------------------\n"
+        "Total send rate:                                     54.2Kb     27.1Kb     27.1Kb\n"
+        "Peak rate (sent/received/total):                     54.2Kb     61.0Kb      115Kb\n")
     pairs = wa.iftop_parse(screen)
-    check("two host pairs parsed", len(pairs) == 2, str(pairs))
-    p0 = [x for x in pairs if x["a"].startswith("192.168")][0]
-    check("ab rates parsed (Mb->bytes)", p0["ab"] == [2340000, 1100000, 990000], str(p0))
-    check("ba rates parsed", p0["ba"] == [1200000, 1540000, 1620000], str(p0))
+    check("three host pairs parsed", len(pairs) == 3, str(pairs))
+    p0 = [x for x in pairs if x["a"] == "183.95.60.178"][0]
+    check("ab rates parsed (Kb->bytes)", p0["ab"] == [50000, 25000, 25000], str(p0))
+    check("ba rates parsed", p0["ba"] == [53800, 26900, 26900], str(p0))
     sess = {"id": 1, "iface": "br0", "status": "running", "started": time.time(),
             "screen_ts": time.time(), "pairs": pairs}
     fr = wa.ift_frame(sess)
-    ipa = [x for x in fr["ips"] if x["ip"] == "192.168.1.10"][0]
-    check("per-ip up aggregation", ipa["out"][0] == 2340000, str(ipa))
-    ip6 = [x for x in fr["ips"] if x["ip"] == "2001:db8::1"][0]
-    check("ipv6 bracket/port stripped", ip6["out"][0] == 500500, str(ip6))
-    check("sorted by live traffic", fr["ips"][0]["ip"] == "192.168.1.10",
+    ipa = [x for x in fr["ips"] if x["ip"] == "192.168.32.2"][0]
+    check("per-ip out aggregation (53.8K+4.15K)", ipa["out"][0] == 53800 + 4150, str(ipa))
+    check("per-ip in aggregation (50.0K+780)", ipa["in"][0] == 50000 + 780, str(ipa))
+    check("sorted by live traffic", fr["ips"][0]["ip"] == "192.168.32.2",
           str([x["ip"] for x in fr["ips"]]))
+    import os as _os
+    if _os.path.isdir("/sys/class/net"):
+        check("recommended is a real iface or any",
+              wa.ift_recommended() in wa.ift_ifaces() + ["any"])
     d = wa.bw_json()
     check("bw api shape", d.get("ok") and d["interval"] == 5 and d["span"] == 900
           and isinstance(d["samples"], list))

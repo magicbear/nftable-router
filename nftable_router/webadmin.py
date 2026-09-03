@@ -1240,6 +1240,19 @@ ift_sess = [None]
 ift_seq = itertools.count(1)
 
 
+def ift_recommended():
+    for x in ift_ifaces():
+        if x == "br0":
+            return x
+    for x in ift_ifaces():
+        if os.path.isdir("/sys/class/net/%s/brif" % x):
+            return x
+    for x in ift_ifaces():
+        if x.startswith("bond0") and "." not in x:
+            return x
+    return "any"
+
+
 def ift_ifaces():
     try:
         return sorted(x for x in os.listdir("/sys/class/net") if x != "lo")
@@ -1266,24 +1279,32 @@ def _ift_host(h):
 
 
 def iftop_parse(text):
-    """iftop -t screen dump -> host pairs with 2s/10s/40s rates per direction.
-    last occurrence wins (reader keeps only the tail of the stream)."""
+    """parse 'iftop -n -t' screen dumps (real format, two lines per pair):
+        1 183.95.60.178            =>   50.0Kb  25.0Kb  25.0Kb  12.5KB
+          192.168.32.2             <=   53.8Kb  26.9Kb  26.9Kb  13.4KB
+    host before the arrow is the SENDER of that row's rates
+    (=> row: a->b ; <= row: b->a).  last screen wins (reader keeps the tail)."""
     out = {}
-    cur = None
+    pending = None
     for ln in text.splitlines():
-        m = re.match(r"^(\S+)\s+=>\s+(\S+)\s*$", ln)
-        if m:
-            cur = (m.group(1), m.group(2))
-            out[cur] = {"a": cur[0], "b": cur[1]}
+        m = re.match(r"^\s*(?:\d+\s+)?(\S+)\s+(=>|<=)\s+"
+                     r"([\d.]+[KMG]?b)\s+([\d.]+[KMG]?b)\s+([\d.]+[KMG]?b)"
+                     r"\s*(?:[\d.]+[KMG]?B)?\s*$", ln)
+        if not m:
+            if ("----" in ln or ln.startswith("Total") or ln.startswith("Peak")
+                    or ln.startswith("Cumulative")):
+                pending = None
             continue
-        m = re.match(r"^\s*=+\s+([\d.]+[KMG]?b)\s+([\d.]+[KMG]?b)\s+([\d.]+[KMG]?b)\s*$", ln)
-        if m and cur is not None and "ab" not in out[cur]:
-            out[cur]["ab"] = [_ift_num(m.group(i)) for i in (1, 2, 3)]
-            continue
-        m = re.match(r"^\s*<=\s*=*\s*([\d.]+[KMG]?b)\s+([\d.]+[KMG]?b)\s+([\d.]+[KMG]?b)\s*$", ln)
-        if m and cur is not None:
-            out[cur]["ba"] = [_ift_num(m.group(i)) for i in (1, 2, 3)]
-            cur = None
+        host, arr = m.group(1), m.group(2)
+        rates = [_ift_num(m.group(i)) for i in (3, 4, 5)]
+        if arr == "=>":
+            pending = (host, rates)
+        elif arr == "<=" and pending:
+            a, ab = pending
+            pending = None
+            if ":" in host and "]" not in host and host.count(":") > 1:
+                a, host = host, a          # ipv6 no-brackets swap guard
+            out[(a, host)] = {"a": a, "b": host, "ab": ab, "ba": rates}
     return list(out.values())
 
 
@@ -1878,11 +1899,14 @@ class Handler(BaseHTTPRequestHandler):
                 sess = ift_sess[0]
             if sess:
                 sess["hb"] = time.time()
-                self.send_json(200, dict(ift_frame(sess), running=True,
-                                         ifaces=ift_ifaces()))
+                fr = ift_frame(sess)
+                fr.update(running=True, ifaces=ift_ifaces(),
+                          recommended=ift_recommended())
+                self.send_json(200, fr)
             else:
                 self.send_json(200, {"t": "iftop", "running": False, "status": "stopped",
-                                     "ifaces": ift_ifaces()})
+                                     "ifaces": ift_ifaces(),
+                                     "recommended": ift_recommended()})
         elif path == "/api/routes/tables":
             try:
                 self.send_json(200, dict({"ok": True}, **rt_tables_list()))
