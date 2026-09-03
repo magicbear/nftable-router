@@ -1206,6 +1206,20 @@ class PrintResultThread(threading.Thread):
                                 "src": rc.src,
                                 "sport": rc.sport
                             }))
+                        # DNS query packets carry the name IN the payload --
+                        # parse once here; pr_stream gets it directly and the
+                        # console line below reuses it (webui qname column was
+                        # empty for queries because the dns_list cache only
+                        # maps resolved-IP -> names, not resolver IPs)
+                        dns_qname, dns_qtype = "", None
+                        if (rc.proto == 6 or rc.proto == 17) and rc.port == 53:
+                            try:
+                                _po = IP(rc.payload)
+                                if _po.haslayer(DNSQR):
+                                    dns_qname = _po[DNSQR].qname.decode("utf-8")
+                                    dns_qtype = _po[DNSQR].qtype
+                            except Exception:
+                                pass
                         # webadmin live stream (independent subscriber; failures
                         # here must never affect the router itself)
                         try:
@@ -1218,13 +1232,18 @@ class PrintResultThread(threading.Thread):
                                   "ms": round(rc.t_total, 2), "fc": 1 if rc.process_fullcone else 0}
                             if src_dev_plain:
                                 ev["dev"] = src_dev_plain
-                            try:
-                                _rn = dns_list[rc.dst]
-                                if _rn:
-                                    ev["qname"] = ",".join(sorted({str(d.qname).rstrip(".")
-                                                                   for d in _rn}))[:160]
-                            except KeyError:
-                                pass
+                            if dns_qname:
+                                ev["qname"] = dns_qname.rstrip(".")
+                                if dns_qtype is not None:
+                                    ev["qtype"] = int(dns_qtype)
+                            else:
+                                try:
+                                    _rn = dns_list[rc.dst]
+                                    if _rn:
+                                        ev["qname"] = ",".join(sorted({str(d.qname).rstrip(".")
+                                                                       for d in _rn}))[:160]
+                                except KeyError:
+                                    pass
                             if isinstance(rc.geodata, dict):
                                 gd = rc.geodata
                                 ev["geo"] = {"cc": gd.get("country_code") or "",
@@ -1323,17 +1342,10 @@ class PrintResultThread(threading.Thread):
                         extra_string = "%.2f ms (%.2f ms) Resolve: %s" % (
                             rc.t_total, rc.t_init,
                             ",".join({res.qname for res in resolve}) if resolve is not None else "")
-                        try:
-                            if (rc.proto == 6 or rc.proto == 17) and rc.port == 53:
-                                pktObject = IP(rc.payload)
-                                if pktObject.haslayer(DNSQR):
-                                    dns = pktObject[DNSQR]
-                                    extra_string = "%02d:%02d:%02d %.2f ms (%.2f ms) Query Request: %s %d" % (
-                                        datetime.now().hour, datetime.now().minute, datetime.now().second,
-                                        rc.t_total, rc.t_init,
-                                        dns.qname.decode("utf-8"), dns.qtype)
-                        except Exception as e:
-                            pass
+                        if dns_qname:
+                            extra_string = "%02d:%02d:%02d %.2f ms (%.2f ms) Query Request: %s %s" % (
+                                datetime.now().hour, datetime.now().minute, datetime.now().second,
+                                rc.t_total, rc.t_init, dns_qname, dns_qtype)
                         if rc.test_session == 1:
                             src_interfaces = tf.format("{dev:30s,yellow}", dev=" >> Check Alive Connection << ")
                         if rc.test_session == 2:

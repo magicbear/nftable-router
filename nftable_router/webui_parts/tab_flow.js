@@ -9,7 +9,7 @@ var COLS=[
  {id:"sport",label:"源端口",   def:1, get:function(r){return r.sport!=null?r.sport:""}},
  {id:"dst",  label:"目的",     def:1, cls:function(){return "dst"},  get:function(r){return r.dst}},
  {id:"dport",label:"目的端口", def:1, get:function(r){return r.dport!=null?r.dport:""}},
- {id:"qname",label:"域名",     def:1, cls:function(){return "dim ell"}, get:function(r){return r.qname||""}},
+ {id:"qname",label:"域名",     def:1, cls:function(){return "dim ell"}, get:function(r){return (r.qname||"")+(r.qtype?(" "+({1:"(A)",28:"(AAAA)",5:"(CNAME)",12:"(PTR)",16:"(TXT)",6:"(SOA)",15:"(MX)"}[r.qtype]||"")):"")}},
  {id:"cc",   label:"国家",     def:1, get:function(r){var g=r.geo||{};return g.cc?flagOf(g.cc):""}},
  {id:"cname",label:"国家名",   def:0, get:function(r){var g=r.geo||{};return g.cn||""}},
  {id:"region",label:"地区",    def:0, get:function(r){var g=r.geo||{};return g.rg||""}},
