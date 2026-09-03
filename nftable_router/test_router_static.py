@@ -102,6 +102,20 @@ def check_file(path):
                     errors.append("%s: %s (0.9.8 SIGSEGV on missing object) "
                                   "-- go through nft_utils"
                                   % (os.path.basename(path), frag))
+    # methods MUST live INSIDE their class: an indented def after a module
+    # level function silently nests into that function's body (valid syntax,
+    # AttributeError at runtime -- real incident 2026-09-04 with
+    # resolve_src_iface landing outside PrintResultThread)
+    pt = next((n for n in tree.body if isinstance(n, ast.ClassDef)
+               and n.name == "PrintResultThread"), None)
+    if pt is None:
+        errors.append("class PrintResultThread missing at module level")
+    else:
+        members = {m.name for m in pt.body if isinstance(m, ast.FunctionDef)}
+        for need in ("__init__", "run", "resolve_src_iface"):
+            if need not in members:
+                errors.append("PrintResultThread.%s missing (misplaced def?)" % need)
+
     # HOOK INVARIANT (5.10.84 kernel oops class: nf_tables_commit ->
     # __nf_unregister_net_hook -> nfqnl_flush -> nf_reinject WARN, seen live
     # with Comm=python3): base chains/hooks must be created ONLY at boot

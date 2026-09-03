@@ -1093,6 +1093,7 @@ def get_term_width():
     return g_term_width
 
 
+class PrintResultThread(threading.Thread):
     def resolve_src_iface(self, src):
         """Resolve a source IP's physical location via redis ARP::MAPPING +
         MAC::TABLE::<switch> hashes -- ONCE per result; returns
@@ -1149,7 +1150,6 @@ def get_term_width():
             return tf.format("{error:30s,red,bold}", error="ERROR " + str(e)), dev_plain
 
 
-class PrintResultThread(threading.Thread):
     def __init__(self):
         threading.Thread.__init__(self)
         self.device_list = None
