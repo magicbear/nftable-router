@@ -561,11 +561,66 @@ def test_webadmin_real_child_smoke():
         check("child reaped after shutdown", srv.proc is None)
 
 
+
+def test_tools_units():
+    print("[8] network tools units (iftop parse / bw / arg validation)")
+    screen = (
+        "            =>                        10.0Mb                         <=\n"
+        "192.168.1.10:53750 => 140.205.70.130:443\n"
+        "                    =========================   2.34Mb  1.10Mb  0.99Mb\n"
+        "              <=    ==============              1.20Mb  1.54Mb  1.62Mb\n"
+        "[2001:db8::1]:8443 => [2001:db8::2]:52001\n"
+        "                    ====                        500.5Kb 300Kb 200Kb\n"
+        "              <=    ==                          100.0Kb  90Kb  80Kb\n"
+        "--------------------------------------------------------------------------------\n")
+    pairs = wa.iftop_parse(screen)
+    check("two host pairs parsed", len(pairs) == 2, str(pairs))
+    p0 = [x for x in pairs if x["a"].startswith("192.168")][0]
+    check("ab rates parsed (Mb->bytes)", p0["ab"] == [2340000, 1100000, 990000], str(p0))
+    check("ba rates parsed", p0["ba"] == [1200000, 1540000, 1620000], str(p0))
+    sess = {"id": 1, "iface": "br0", "status": "running", "started": time.time(),
+            "screen_ts": time.time(), "pairs": pairs}
+    fr = wa.ift_frame(sess)
+    ipa = [x for x in fr["ips"] if x["ip"] == "192.168.1.10"][0]
+    check("per-ip up aggregation", ipa["out"][0] == 2340000, str(ipa))
+    ip6 = [x for x in fr["ips"] if x["ip"] == "2001:db8::1"][0]
+    check("ipv6 bracket/port stripped", ip6["out"][0] == 500500, str(ip6))
+    check("sorted by live traffic", fr["ips"][0]["ip"] == "192.168.1.10",
+          str([x["ip"] for x in fr["ips"]]))
+    d = wa.bw_json()
+    check("bw api shape", d.get("ok") and d["interval"] == 5 and d["span"] == 900
+          and isinstance(d["samples"], list))
+    with wa.bw_lock:
+        wa.bw_hist.append([time.time(), {"eth0": [1234, 5678], "lo": [9, 9]}])
+    d = wa.bw_json()
+    check("bw peak max-aggregated", d["peak"][0]["iface"] == "eth0"
+          and d["peak"][0]["tx"] == 5678, str(d["peak"]))
+    with wa.bw_lock:
+        wa.bw_hist.pop()
+    r = wa.ift_start({"iface": "no-such-if-9"})
+    check("iftop unknown iface rejected", not r["ok"] and "未知接口" in r["error"], str(r))
+    r = wa.ift_start({"iface": "; rm -rf /"})
+    check("iftop illegal iface name rejected", not r["ok"], str(r))
+    r = wa.ift_stop("test")
+    check("iftop stop when idle is harmless", r.get("ok"), str(r))
+    bad = {"line": "default"}
+    for fn, b, why in ((wa.ping_start, dict(bad, target="x; rm -rf /"), "ping target inject"),
+                       (wa.dig_run, dict(bad, target="ok.com", type="ANY"), "dig type allowlist"),
+                       (wa.whois_run, {"target": "-h evil"}, "whois dash-arg"),
+                       (wa.ping_start, dict(bad, target="a b"), "ping space")):
+        r = fn(b, {}) if fn is not wa.whois_run else fn(b)
+        check("%s rejected" % why, not r.get("ok"), str(r))
+    r = wa.dig_run({"target": "example.com", "type": "A", "line": "zzz"}, {})
+    check("dig unknown line rejected before spawn", not r["ok"] and "未知线路" in r["error"], str(r))
+    r = wa.ipq_run({"ips": "not an ip"}, {}, "")
+    check("ipq without valid ips", not r["ok"], str(r))
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         test_master_signal(d)
     for t in (test_ws_codec, test_ring_hub, test_validate_config, test_dnsmasq_reload, test_ui_js_syntax,
-              test_server_e2e, test_webadmin_service_lifecycle, test_webadmin_real_child_smoke):
+              test_server_e2e, test_webadmin_service_lifecycle, test_webadmin_real_child_smoke,
+              test_tools_units):
         t()
     print("\n==== %d passed, %d failed ====" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)

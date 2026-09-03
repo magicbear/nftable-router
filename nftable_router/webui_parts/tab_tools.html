@@ -6,6 +6,8 @@
   <button data-tool=dig>Dig</button>
   <button data-tool=whois>Whois</button>
   <button data-tool=ipq>IP查询</button>
+  <button data-tool=bw>带宽趋势</button>
+  <button data-tool=ift>IP流量</button>
   <span class=dim>所有工具可选线路：通过 SO_MARK 与真实业务同路径出网</span>
  </div>
  <div id=tool-body>
@@ -43,6 +45,23 @@
     <span id="w-err" class="bad"></span>
    </div>
    <pre id="w-out" class="dim" style="min-height:120px;max-height:520px;overflow:auto;white-space:pre-wrap;margin:6px 0 0"></pre>
+  </div>
+  <div id=t-bw class="tsub card">
+   <div class=bar><span class=dim>最近15分钟 · 5s采样 · 点击图例显示/隐藏接口 · 上行=虚线</span><span id=bw-st class=dim></span></div>
+   <canvas id=bw-cv width=1180 height=340 style="width:100%;background:#0d1526;border:1px solid #22304a;border-radius:6px"></canvas>
+   <div id=bw-legend class="bar" style="flex-wrap:wrap"></div>
+  </div>
+  <div id=t-ift class="tsub card">
+   <div class=bar>
+    <select id="f-iface" style="min-width:180px"></select>
+    <button id="f-start" class="good">▶ 启动iftop</button>
+    <button id="f-stop">■ 停止</button>
+    <span id="f-state" class=dim>未运行</span>
+    <span class=dim>离开本页自动停止</span>
+    <span id="f-err" class=bad></span>
+   </div>
+   <div style=overflow:auto><table id="f-ips"></table></div>
+   <details><summary class=dim>连接对明细</summary><div style=overflow:auto;max-height:320px><table id="f-pairs"></table></div></details>
   </div>
   <div id=t-ipq class="tsub card">
    <div class=bar>

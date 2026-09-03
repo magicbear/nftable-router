@@ -7,13 +7,18 @@
  var mtrS=$("s-mtr"), rtS=$("s-rt");
  if(mtrS)body.insertBefore(mtrS,body.firstChild);
  if(rtS)body.insertBefore(rtS,mtrS?mtrS.nextSibling:body.firstChild);
- var panes={mtr:mtrS,rt:rtS,ping:$("t-ping"),dig:$("t-dig"),whois:$("t-whois"),ipq:$("t-ipq")};
+ var panes={mtr:mtrS,rt:rtS,ping:$("t-ping"),dig:$("t-dig"),whois:$("t-whois"),ipq:$("t-ipq"),bw:$("t-bw"),ift:$("t-ift")};
  var curTool="";
+ var TOOL_HOOK={};  // TOOL_HOOK[name]={show,hide} -- panels with timers
  function showTool(k){
   var e=panes[k];if(!e)return;
+  if(k===curTool)return;
+  var prev=curTool;curTool=k;
   Object.keys(panes).forEach(function(x){panes[x]&&panes[x].classList.toggle("sel",x===k)});
   document.querySelectorAll("#tool-tabs button").forEach(function(b){b.classList.toggle("sel",b.dataset.tool===k)});
-  if(k!==curTool){curTool=k;var fn=TAB_ON_SELECT[k];if(fn)fn()}
+  var h=prev&&TOOL_HOOK[prev];if(h&&h.hide)try{h.hide()}catch(e){}
+  h=TOOL_HOOK[k];if(h&&h.show)try{h.show()}catch(e){}
+  var fn=TAB_ON_SELECT[k];if(fn)fn();
   if(k==="ping"||k==="dig"||k==="ipq")fillLines(k)}
  document.querySelectorAll("#tool-tabs button").forEach(function(b){b.onclick=function(){showTool(b.dataset.tool)}});
  showTool("mtr");
@@ -98,3 +103,98 @@ $("i-run").onclick=function(){
      return [x.ip,el("span","",String(x.route)),geo]});
     putRows($("i-tbl"),["IP","路由选路"+(r.mark?(" (mark 0x"+r.mark.toString(16)+")"):""),"归属"],rows)})
    .catch(function(e){$("i-run").disabled=false;$("i-err").textContent=""+e})};
+
+// ---------- 带宽趋势 (15min canvas chart, polled while visible) ----------
+var bwTimer=null,bwData=null,bwSel={},bwCol={},bwLegend=false;
+var BW_PAL=["#5b8fd6","#e8b04b","#6fbf73","#d66969","#c586c0","#4ec9b0","#dcdcaa","#b8d1ea"];
+function fmtBps(v){v=v||0;
+ if(v>=1e9)return (v/1e9).toFixed(2)+" Gb/s";
+ if(v>=1e6)return (v/1e6).toFixed(2)+" Mb/s";
+ if(v>=1e3)return (v/1e3).toFixed(1)+" Kb/s";
+ return Math.round(v)+" b/s"}
+function bwLoad(){api("/api/bw").then(function(d){if(!d||!d.ok)return;bwData=d;
+ if(!bwLegend){bwLegend=true;var lg=$("bw-legend");lg.innerHTML="";
+  (d.peak||[]).forEach(function(x,i){var col=BW_PAL[i%BW_PAL.length];bwCol[x.iface]=col;
+   if(i<5||/^(br0|ppp0|bond0|tun|wg|ibs)/.test(x.iface))bwSel[x.iface]=true;else bwSel[x.iface]=false;
+   var b=el("button","bw-lg");b.style.borderColor=col;b.style.color=col;
+   b.innerHTML='<i style="background:'+col+'"></i>'+x.iface+' <span class=dim>'+fmtBps(Math.max(x.rx,x.tx))+'峰</span>';
+   if(!bwSel[x.iface])b.classList.add("off");
+   b.onclick=function(){bwSel[x.iface]=!bwSel[x.iface];b.classList.toggle("off",!bwSel[x.iface]);bwDraw()};
+   lg.appendChild(b)})}
+ var n=(d.samples||[]).length;
+ $("bw-st").textContent=n<3?"采样积累中 ("+n+")":(n+" 点 · 峰值 "+fmtBps(Math.max.apply(null,(d.peak||[]).map(function(x){return Math.max(x.rx,x.tx)})||[0])));
+ bwDraw()}).catch(function(){})}
+function bwDraw(){var cv=$("bw-cv");if(!cv||!bwData)return;
+ var g=cv.getContext("2d"),W=cv.width,H=cv.height,L=56,B=22,R=8,T=8;
+ g.clearRect(0,0,W,H);
+ var span=bwData.span||900,t1=bwData.now||Date.now()/1000,t0=t1-span;
+ var sel=Object.keys(bwSel).filter(function(k){return bwSel[k]});
+ var mx=1000;
+ bwData.samples.forEach(function(sp){sel.forEach(function(k){var v=sp[1][k];if(v){mx=Math.max(mx,v[0],v[1])}})});
+ function yy(f){var v=mx*f;return (v>=1e6?(v/1e6).toFixed(v>=1e7?0:1)+"M":v>=1e3?(v/1e3).toFixed(0)+"K":Math.round(v)+"b")}
+ g.font="11px monospace";
+ for(var f=0;f<=4;f++){var y=(H-B)-(H-B-T)*f/4;
+  g.strokeStyle="#1d2a44";g.beginPath();g.moveTo(L,y);g.lineTo(W-R,y);g.stroke();
+  g.fillStyle="#8fa3c0";g.textAlign="right";g.fillText(yy(f/4),L-6,y+4)}
+ g.textAlign="center";
+ for(var mm=0;mm<=3;mm++){var x=L+(W-L-R)*mm/3;
+  g.strokeStyle="#1d2a44";g.beginPath();g.moveTo(x,T);g.lineTo(x,H-B);g.stroke();
+  g.fillStyle="#8fa3c0";g.fillText(mm===3?"现在":"-"+(15-5*mm)+"分",x,H-7)}
+ if(!sel.length){g.fillStyle="#5a6d8c";g.textAlign="center";g.fillText("点击图例选择接口",W/2,H/2);return}
+ sel.forEach(function(k){var col=bwCol[k]||"#5b8fd6";
+  [[0,[]],[1,[5,4]]].forEach(function(dd){var idx=dd[0],dash=dd[1];
+   g.strokeStyle=col;g.globalAlpha=idx?0.75:1;g.lineWidth=1.3;g.setLineDash(dash);g.beginPath();
+   var st=false;
+   bwData.samples.forEach(function(sp){var v=sp[1][k];if(!v)return;
+    var x=L+(sp[0]-t0)/span*(W-L-R);x=Math.min(W-R,x);
+    var y=(H-B)-Math.min(1,v[idx]/mx)*(H-B-T);
+    if(!st){g.moveTo(x,y);st=true}else g.lineTo(x,y)});
+   g.stroke()});
+  g.globalAlpha=1;g.setLineDash([])})}
+TOOL_HOOK.bw={show:function(){bwLoad();if(bwTimer)clearInterval(bwTimer);bwTimer=setInterval(bwLoad,5000)},
+ hide:function(){if(bwTimer){clearInterval(bwTimer);bwTimer=null}}};
+
+// ---------- IP流量 (on-demand iftop, live over /ws/stream t=iftop) ----------
+var iftOn=false,iftHbTimer=null;
+function iftRender(m){
+ if(!m)return;
+ var run=(m.status==="running");
+ if(run)iftOn=true;
+ $("f-state").textContent=run?("运行中 · "+m.iface+(m.pairs&&m.pairs.length?(" · "+m.pairs.length+" 对"):" · 等待流量"))
+  :(m.running===false?"未运行":(m.status+(m.reason?(" · "+m.reason):"")));
+ $("f-start").disabled=run;$("f-stop").disabled=!run;
+ var rows=(m.ips||[]).map(function(x){return [x.ip,
+  el("span","",("↑ "+fmtBps(x.out[0]))),el("span","dim",fmtBps(x.out[1])+" 10s均"),
+  el("span","",("↓ "+fmtBps(x.in[0]))),el("span","dim",fmtBps(x.in[1])+" 10s均")]});
+ putRows($("f-ips"),["IP","上行","(10s均)","下行","(10s均)"],rows);
+ var pr=(m.pairs||[]).map(function(x){return [x.a,"=>",x.b,fmtBps(x.ab[0])+" | "+fmtBps(x.ab[1]),fmtBps(x.ba[0])+" | "+fmtBps(x.ba[1])]});
+ putRows($("f-pairs"),["源","方向","目的","发送 2s|10s","回传 2s|10s"],pr);
+ if(m.ifaces&&m.ifaces.length){var sel=$("f-iface");
+  if(!sel.dataset.filled){sel.innerHTML="";var ao=el("option","","any (全部接口)");ao.value="any";sel.appendChild(ao);
+   m.ifaces.forEach(function(x){var o=el("option","",x);o.value=x;sel.appendChild(o)});
+   if(m.ifaces.indexOf("br0")>=0)sel.value="br0";
+   sel.dataset.filled="1"}}
+ if(m.status==="stopped"||m.status==="exited"){iftOn=false;if(iftHbTimer){clearInterval(iftHbTimer);iftHbTimer=null}}}
+function iftHb(){api("/api/iftop/status").then(iftRender).catch(function(){})}
+window.__iftop_on=function(m){iftRender(m)};
+$("f-start").onclick=function(){$("f-err").textContent="";
+ api("/api/iftop/start",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({iface:$("f-iface").value||"any"})}).then(function(r){
+   if(!r.ok){$("f-err").textContent=r.error;return toast(String(r.error),"bad")}
+   iftOn=true;if(iftHbTimer)clearInterval(iftHbTimer);iftHbTimer=setInterval(iftHb,8000);
+   toast("iftop 启动 ("+r.iface+")","good")}).catch(function(e){$("f-err").textContent=""+e})};
+$("f-stop").onclick=function(){iftOn=false;
+ if(iftHbTimer){clearInterval(iftHbTimer);iftHbTimer=null}
+ api("/api/iftop/stop",{method:"POST",headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({reason:"按钮停止"})}).then(function(r){$("f-ips").innerHTML="";$("f-pairs").innerHTML="";
+  if(r&&r.note)toast(r.note,"warn")}).catch(function(){})};
+function iftLeave(){if(!iftOn)return;iftOn=false;
+ if(iftHbTimer){clearInterval(iftHbTimer);iftHbTimer=null}
+ // sendBeacon: fires reliably during unload; cookie auth rides along
+ try{navigator.sendBeacon("/api/iftop/stop",
+   new Blob([JSON.stringify({reason:"离开页面"})],{type:"application/json"}))}
+ catch(e){try{api("/api/iftop/stop",{method:"POST",headers:{"Content-Type":"application/json"},
+   body:JSON.stringify({reason:"离开页面"})})}catch(e2){}}}
+window.addEventListener("pagehide",iftLeave);
+TOOL_HOOK.ift={show:function(){iftHb();if(iftHbTimer)clearInterval(iftHbTimer);iftHbTimer=setInterval(iftHb,8000)},
+ hide:function(){if(iftHbTimer&&!iftOn){clearInterval(iftHbTimer);iftHbTimer=null}}};

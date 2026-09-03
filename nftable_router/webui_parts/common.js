@@ -124,6 +124,7 @@ function connect(){
   if(m.t=="mtr"){if(window.__mtr_id&&String(m.id)===String(window.__mtr_id)){
     window.__mtr_last=m;renderJob(m);
     if(m.status!=="running"){if(mtrTimer){clearInterval(mtrTimer);mtrTimer=null}loadJobs()}}return}
+  if(m.t=="iftop"){if(window.__iftop_on)window.__iftop_on(m);return}
   if(m.t=="ping"){if(window.__ping_on)window.__ping_on(m);return}
   if(m.t=="gap"){window.__gap=(window.__gap||0)+m.n;$("n-evt").textContent=evtTotal+" (丢"+window.__gap+")";return}
   if(m.t=="hello"||!m.dst)return;

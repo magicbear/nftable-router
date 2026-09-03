@@ -59,3 +59,7 @@ label{color:var(--dim)}
 #tool-body>.sel{display:block}
 #tool-tabs button{padding:3px 12px;margin-right:2px}
 #tool-tabs button.sel{background:#2f4c7d;border-color:#5b8fd6}
+
+#bw-legend .bw-lg{background:none;border:1px solid;border-radius:12px;padding:2px 9px;font-size:11px;cursor:pointer;margin:2px}
+#bw-legend .bw-lg i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px}
+#bw-legend .bw-lg.off{opacity:.35}

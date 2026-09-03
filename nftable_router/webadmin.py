@@ -1149,6 +1149,269 @@ def ipq_run(body, cfg, cfg_path):
 
 
 # ---------------------------------------------------------------------------
+# bandwidth history (带宽趋势): /proc/net/dev every 5s -> 15 min ring buffer
+# ---------------------------------------------------------------------------
+BW_INT = 5
+BW_SPAN = 900
+bw_hist = []
+bw_prev = {}
+bw_lock = threading.Lock()
+_bw_thread = [None]
+
+
+def bw_snap():
+    out = {}
+    try:
+        with open("/proc/net/dev") as f:
+            for ln in f:
+                if ":" not in ln:
+                    continue
+                name, _, rest = ln.partition(":")
+                f2 = rest.split()
+                if len(f2) >= 16:
+                    try:
+                        out[name.strip()] = (int(f2[0]), int(f2[8]))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return out
+
+
+def bw_loop():
+    global bw_prev
+    bw_prev = bw_snap()
+    t_prev = time.time()
+    while True:
+        time.sleep(BW_INT)
+        now = bw_snap()
+        t_now = time.time()
+        dt = max(0.5, t_now - t_prev)
+        rates = {}
+        for k, (r, t) in now.items():
+            pt = bw_prev.get(k)
+            if not pt:
+                continue
+            rx = (r - pt[0]) % (2 ** 64)   # counter wrap safe
+            tx = (t - pt[1]) % (2 ** 64)
+            rates[k] = [int(rx / dt), int(tx / dt)]
+        bw_prev = now
+        t_prev = t_now
+        with bw_lock:
+            bw_hist.append([round(t_now, 1), rates])
+            cut = t_now - BW_SPAN
+            while bw_hist and bw_hist[0][0] < cut:
+                bw_hist.pop(0)
+
+
+def bw_start():
+    if _bw_thread[0] is None:
+        _bw_thread[0] = threading.Thread(target=bw_loop, daemon=True, name="bwsamp")
+        _bw_thread[0].start()
+
+
+def bw_json():
+    with bw_lock:
+        samples = [[ts, dict(r)] for ts, r in bw_hist]
+    peak = {}
+    for _, r in samples:
+        for k, (rx, tx) in r.items():
+            a = peak.setdefault(k, [0, 0])
+            a[0] = max(a[0], rx)
+            a[1] = max(a[1], tx)
+    return {"ok": True, "interval": BW_INT, "span": BW_SPAN, "now": time.time(),
+            "samples": samples,
+            "peak": [{"iface": k, "rx": v[0], "tx": v[1]} for k, v in
+                     sorted(peak.items(), key=lambda x: -(x[1][0] + x[1][1]))]}
+
+
+# ---------------------------------------------------------------------------
+# on-demand iftop (IP流量): started by click, each screen broadcast over the
+# shared /ws/stream socket (t=iftop frames). Auto-stop: page sends stop via
+# button/pagehide/sendBeacon; backstop watchdog kills the session when the WS
+# has no subscribers AND no status heartbeat for >25s (webadmin restart also).
+# ---------------------------------------------------------------------------
+ift_lock = threading.Lock()
+ift_sess = [None]
+ift_seq = itertools.count(1)
+
+
+def ift_ifaces():
+    try:
+        return sorted(x for x in os.listdir("/sys/class/net") if x != "lo")
+    except OSError:
+        return []
+
+
+def _ift_num(x):
+    m = re.match(r"^([\d.]+)([KMG]?)b$", x)
+    if not m:
+        return 0
+    return int(float(m.group(1)) * {"": 1, "K": 1e3, "M": 1e6, "G": 1e9}[m.group(2)])
+
+
+def _ift_host(h):
+    h = h.strip()
+    m = re.match(r"^\[([^\]]+)\](?::\d+)?$", h)
+    if m:
+        return m.group(1)
+    m = re.match(r"^(.*):(\d+)$", h)
+    if m:
+        return m.group(1)
+    return h
+
+
+def iftop_parse(text):
+    """iftop -t screen dump -> host pairs with 2s/10s/40s rates per direction.
+    last occurrence wins (reader keeps only the tail of the stream)."""
+    out = {}
+    cur = None
+    for ln in text.splitlines():
+        m = re.match(r"^(\S+)\s+=>\s+(\S+)\s*$", ln)
+        if m:
+            cur = (m.group(1), m.group(2))
+            out[cur] = {"a": cur[0], "b": cur[1]}
+            continue
+        m = re.match(r"^\s*=+\s+([\d.]+[KMG]?b)\s+([\d.]+[KMG]?b)\s+([\d.]+[KMG]?b)\s*$", ln)
+        if m and cur is not None and "ab" not in out[cur]:
+            out[cur]["ab"] = [_ift_num(m.group(i)) for i in (1, 2, 3)]
+            continue
+        m = re.match(r"^\s*<=\s*=*\s*([\d.]+[KMG]?b)\s+([\d.]+[KMG]?b)\s+([\d.]+[KMG]?b)\s*$", ln)
+        if m and cur is not None:
+            out[cur]["ba"] = [_ift_num(m.group(i)) for i in (1, 2, 3)]
+            cur = None
+    return list(out.values())
+
+
+def ift_frame(s):
+    pairs = s.get("pairs") or []
+    agg = {}
+    for pt in pairs:
+        a = _ift_host(pt["a"])
+        b = _ift_host(pt["b"])
+        ia = agg.setdefault(a, {"ip": a, "out": [0, 0, 0], "in": [0, 0, 0]})
+        ib = agg.setdefault(b, {"ip": b, "out": [0, 0, 0], "in": [0, 0, 0]})
+        ab = pt.get("ab") or [0, 0, 0]
+        ba = pt.get("ba") or [0, 0, 0]
+        for i in range(3):
+            ia["out"][i] += ab[i]
+            ia["in"][i] += ba[i]
+            ib["out"][i] += ba[i]
+            ib["in"][i] += ab[i]
+    ips = sorted(agg.values(), key=lambda x: -(x["in"][0] + x["out"][0]))
+    return {"t": "iftop", "status": s["status"], "iface": s["iface"],
+            "id": s["id"], "age": round(time.time() - s["screen_ts"], 1),
+            "reason": s.get("stop_reason"),
+            "ips": ips[:60],
+            "pairs": [{"a": pt["a"], "b": pt["b"], "ab": pt.get("ab") or [0, 0, 0],
+                       "ba": pt.get("ba") or [0, 0, 0]} for pt in pairs[:80]]}
+
+
+def _ift_kill(sess):
+    try:
+        sess["proc"].terminate()
+        try:
+            sess["proc"].wait(timeout=3)
+        except Exception:
+            sess["proc"].kill()
+    except Exception:
+        pass
+
+
+def ift_stop(reason="stopped"):
+    with ift_lock:
+        sess = ift_sess[0]
+        ift_sess[0] = None
+    if not sess:
+        return {"ok": True, "note": "未在运行"}
+    sess["status"] = "stopped"
+    sess["stop_reason"] = reason
+    _ift_kill(sess)
+    try:
+        _mtr_broadcast(ift_frame(sess))
+    except Exception:
+        pass
+    return {"ok": True, "stopped": True, "ran": round(time.time() - sess["started"], 1)}
+
+
+def ift_reader(sess):
+    p = sess["proc"]
+    buf = []
+    try:
+        for ln in iter(p.stdout.readline, ""):
+            buf.append(ln)
+            if len(buf) > 300:
+                del buf[:len(buf) - 300]
+            sess["buf"] = list(buf)
+    except Exception:
+        pass
+
+
+def ift_ticker(sess):
+    while True:
+        time.sleep(2)
+        if ift_sess[0] is not sess:
+            break
+        rc = sess["proc"].poll()
+        if rc is not None:
+            sess["status"] = "exited"
+            sess["stop_reason"] = "iftop 退出 rc=%s" % rc
+            with ift_lock:
+                if ift_sess[0] is sess:
+                    ift_sess[0] = None
+            try:
+                _mtr_broadcast(ift_frame(sess))
+            except Exception:
+                pass
+            break
+        sess["pairs"] = iftop_parse("".join(sess.get("buf") or []))
+        if sess["pairs"]:
+            sess["screen_ts"] = time.time()
+        if time.time() - sess["hb"] > 25 and _MTR_HUB.count() == 0:
+            ift_stop("页面已关闭 (无心跳/无WS连接)")
+            break
+        try:
+            _mtr_broadcast(ift_frame(sess))
+        except Exception:
+            pass
+
+
+def ift_start(body):
+    iface = str(body.get("iface", "")).strip() or "any"
+    if iface != "any":
+        parts = [x for x in re.split(r"[,\s]+", iface) if x]
+        if not parts:
+            return {"ok": False, "error": "接口为空"}
+        avail = set(ift_ifaces())
+        for x in parts:
+            if not re.match(r"^[A-Za-z0-9._:\-]{1,32}$", x):
+                return {"ok": False, "error": "非法接口名 %r" % x}
+            if x not in avail:
+                return {"ok": False, "error": "未知接口 %r" % x}
+        iface = ",".join(parts)
+    binw = shutil.which("iftop")
+    if not binw:
+        return {"ok": False, "error": "iftop 未安装（apt install iftop）"}
+    ift_stop("replaced")
+    argv = [binw, "-n", "-t", "-s", "86400"]
+    if iface != "any":
+        argv += ["-i", iface]
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+    except OSError as e:
+        return {"ok": False, "error": "iftop 启动失败: %s" % e}
+    sess = {"id": next(ift_seq), "proc": proc, "iface": iface, "status": "running",
+            "started": time.time(), "screen_ts": time.time(), "hb": time.time(),
+            "pairs": [], "buf": []}
+    with ift_lock:
+        ift_sess[0] = sess
+    threading.Thread(target=ift_reader, args=(sess,), daemon=True).start()
+    threading.Thread(target=ift_ticker, args=(sess,), daemon=True).start()
+    return {"ok": True, "id": sess["id"], "iface": iface}
+
+
+# ---------------------------------------------------------------------------
 # geoip (SAME ipdb library + database as the router policy engine)
 # ---------------------------------------------------------------------------
 _geo = {"db": None, "tried": False, "error": None}
@@ -1604,6 +1867,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200 if jid in ping_jobs else 404, ping_jobs.get(jid, {"status": "gone"}))
         elif path == "/api/ping/jobs":
             self.send_json(200, sorted(ping_jobs.values(), key=lambda j: -j["started"])[:20])
+        elif path == "/api/bw":
+            self.send_json(200, bw_json())
+        elif path == "/api/iftop/status":
+            with ift_lock:
+                sess = ift_sess[0]
+            if sess:
+                sess["hb"] = time.time()
+                self.send_json(200, dict(ift_frame(sess), running=True,
+                                         ifaces=ift_ifaces()))
+            else:
+                self.send_json(200, {"t": "iftop", "running": False, "status": "stopped",
+                                     "ifaces": ift_ifaces()})
         elif path == "/api/routes/tables":
             try:
                 self.send_json(200, dict({"ok": True}, **rt_tables_list()))
@@ -1871,6 +2146,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, ipq_run(body, cfg, cp))
             except Exception as e:
                 self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+        elif path == "/api/iftop/start":
+            try:
+                self.send_json(200, ift_start(body))
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+        elif path == "/api/iftop/stop":
+            try:
+                self.send_json(200, ift_stop(str(body.get("reason") or "stopped")))
+            except Exception as e:
+                self.send_json(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
         elif path == "/api/test_line":
             try:
                 self.send_json(200, test_line(self.cfg_path(),
@@ -2079,6 +2364,7 @@ def main(argv=None):
 
     app = App(args)
     app.streamer.start()
+    bw_start()
     Handler.app = app
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print("[webadmin] http://%s:%d  config=%s  redis=%s:%d/%d stream=on" % (
@@ -2087,6 +2373,10 @@ def main(argv=None):
     def bye(sig, frm):
         threading.Thread(target=srv.shutdown, daemon=True).start()
         app.streamer.shutdown()
+        try:
+            ift_stop("webadmin 退出")
+        except Exception:
+            pass
     signal.signal(signal.SIGTERM, bye)
     signal.signal(signal.SIGINT, bye)
     try:
