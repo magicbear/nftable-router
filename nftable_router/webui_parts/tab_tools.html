@@ -65,13 +65,16 @@
   </div>
   <div id=t-ipq class="tsub card">
    <div class=bar>
-    <input id="i-ips" placeholder="IP，多个用空格/逗号/换行分隔（≤16）" style="width:380px">
-    <select id="i-line" style="min-width:220px"></select>
+    <input id="i-ips" placeholder="IP，空格/逗号/换行分隔（≤16）" style="width:300px">
+    <input id="i-src" placeholder="源IP(判 from 用)" style="width:140px">
+    <select id="i-proto"><option value="6">TCP</option><option value="17">UDP</option></select>
+    <input id="i-port" type="number" value="443" style="width:64px">
+    <select id="i-line" style="min-width:170px"></select>
     <button id="i-run" class="good">查询</button>
-    <span class=dim>显示本机路由表选路 + 归属地</span>
+    <span class=dim>复刻 router 策略链判定（优先级/门控/权重ECMP）+ mark 查路由 + ipdb 全字段</span>
     <span id="i-err" class="bad"></span>
    </div>
-   <div style="overflow:auto"><table id="i-tbl"></table></div>
+   <div id="i-res"></div>
   </div>
  </div>
 </section>

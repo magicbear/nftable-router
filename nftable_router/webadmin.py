@@ -1216,7 +1216,7 @@ def _in_nets(a, nets):
     return None
 
 
-def ipq_decide(cfg, dst, geo, names, src=None, proto=6, dport=443):
+def ipq_decide(cfg, dst, geo, names=None, src=None, proto=6, dport=443):
     """FAITHFUL replay of the router.py NFQUEUE decision chain (rules by
     priority, per-line gates, cidr/resolve/geo/any conditions, weight ECMP).
     Runtime-only states are not reproduced: dead-proxy health flags, ECMP

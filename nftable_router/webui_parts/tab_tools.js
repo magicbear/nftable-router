@@ -35,7 +35,8 @@ function fillLines(which){
  if(!todo.length)return;
  function paint(sel){
   sel.innerHTML="";
-  var o=el("option","","default (主路由表)");o.value="default";sel.appendChild(o);
+  var lbl=sel.id=="i-line"?"auto (策略链模拟)":"default (主路由表)";
+  var o=el("option","",lbl);o.value=sel.id=="i-line"?"auto":"default";sel.appendChild(o);
   Object.keys(toolLines||{}).sort().forEach(function(k){
    var L=toolLines[k];
    var op=el("option","",(k.split(":")[1])+"  [0x"+((L.mark||0).toString(16))+"]");op.value=k;sel.appendChild(op)})}
@@ -91,20 +92,54 @@ $("w-run").onclick=function(){
    .catch(function(e){$("w-run").disabled=false;$("w-err").textContent=""+e})};
 $("w-target").addEventListener("keydown",function(e){if(e.key==="Enter")$("w-run").click()});
 
-// ---------- ip query (route decision + geo) ----------
+// ---------- ip query: full router decision-chain replay + mark route + geo fields ----------
+function fhz(m){if(m==null)return "?";return "0x"+(Number(m)>>>0).toString(16)}
+function elAppend(parent,tag){var e=document.createElement(tag);parent.appendChild(e);return e}
+function ipqRender(d){
+ var box=$("i-res");box.innerHTML="";
+ if(d.geo_err)box.appendChild(el("div","bad","geo库不可用: "+d.geo_err));
+ (d.rows||[]).forEach(function(r){
+  var c=el("div","card");box.appendChild(c);
+  var dec=r.decision||{};
+  var hd=el("div","bar");
+  hd.innerHTML="<b>"+r.ip+"</b> → "+(dec.line?("<b class=good>"+dec.line+"</b>"):"")+
+   " · mark <b>"+fhz(r.mark)+"</b>"+(dec.forced?" <span class=warn>(强制线路)</span>":"")+
+   (dec.priority!=null?" · 优先级#"+dec.priority:"")+
+   (dec.ecmp?" <span class=warn>ECMP加权分流</span>":"")+
+   " · <span class=dim>"+(dec.why||"")+"</span>"+
+   (r.seen?" · <span class=dim>实测最近: line="+(r.seen.line||"-")+" mark="+fhz(r.seen.mark)+"</span>":"");
+  c.appendChild(hd);
+  if((dec.candidates||[]).length){
+   putRows(elAppend(c,"table"),["候选线路","mark","权重","占比","命中条件"],
+    dec.candidates.map(function(x){return [x.line,fhz(x.mark),String(x.weight),(x.share||0)+"%",x.why]}));}
+  if((dec.skips||[]).length)c.appendChild(el("div","dim","门控跳过: "+dec.skips.map(function(x){return x.line+"("+x.skip+")"}).join("， ")));
+  var rt=r.route||{}, rl=r.rule||{};
+  var rr=el("div","bar");
+  rr.innerHTML="路由: <b>"+(rt.table||"?")+"</b> 表 · dev <b>"+(rt.dev||"?")+"</b>"+
+   (rt.via?" · via "+rt.via:"")+(rt.src?" · src "+rt.src:"")+
+   (rl.pref!=null?" <span class=dim>(ip rule pref "+rl.pref+")</span>":"")+(rl.note?" <span class=dim>"+rl.note+"</span>":"");
+  c.appendChild(rr);
+  if((r.names||[]).length)c.appendChild(el("div","dim","DNS观测: "+r.names.join(", ")));
+  if(r.geo){
+   var ks=Object.keys(r.geo).sort();
+   var gt=elAppend(c,"table");var trh=document.createElement("tr");
+   ks.forEach(function(k){trh.appendChild(el("th","",k))});gt.appendChild(trh);
+   var tr=document.createElement("tr");
+   ks.forEach(function(k){tr.appendChild(el("td","",String(r.geo[k])))});gt.appendChild(tr);
+  }else c.appendChild(el("div","warn","geo 无数据（将走 0x99 直连旁路）"));
+  if(rt.raw){var det=document.createElement("details");det.appendChild(el("summary","dim","ip route get 原文"));
+   det.appendChild(el("pre","dim",rt.raw));c.appendChild(det)}})}
 $("i-run").onclick=function(){
  var t=$("i-ips").value.trim();if(!t)return toast("填写至少一个 IP","warn");
  $("i-run").disabled=true;$("i-err").textContent="";
  api("/api/ipq",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({ips:t,line:$("i-line").value||"default"})}).then(function(r){
+  body:JSON.stringify({ips:t,line:$("i-line").value||"auto",src:$("i-src").value.trim(),
+   proto:$("i-proto").value,dport:parseInt($("i-port").value,10)||443})}).then(function(r){
     $("i-run").disabled=false;
     if(!r.ok){$("i-err").textContent=r.error;return}
-    var rows=(r.rows||[]).map(function(x){
-     var g=(r.geo||{})[x.ip];
-     var geo=g===undefined?"…":(g===null?"-":((g.cc?flagOf(g.cc)+" ":"")+(g.cn||"")+(g.rg?" "+g.rg:"")+(g.isp?" · "+g.isp:"")+((g.idc)?" [IDC]":"")+((g.ac)?" [任播]":"")));
-     return [x.ip,el("span","",String(x.route)),geo]});
-    putRows($("i-tbl"),["IP","路由选路"+(r.mark?(" (mark 0x"+r.mark.toString(16)+")"):""),"归属"],rows)})
+    ipqRender(r)})
    .catch(function(e){$("i-run").disabled=false;$("i-err").textContent=""+e})};
+$("i-ips").addEventListener("keydown",function(e){if(e.key==="Enter")$("i-run").click()});
 
 // ---------- 带宽趋势 (sampler runs in webadmin forever; WS pushes one point
 // every 5s -- first open pulls the 15min snapshot, after that pure push) ----------

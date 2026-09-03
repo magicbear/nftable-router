@@ -615,6 +615,30 @@ def test_tools_units():
     check("per-ip in aggregation (50.0K+780)", ipa["in"][0] == 50000 + 780, str(ipa))
     check("sorted by live traffic", fr["ips"][0]["ip"] == "192.168.32.2",
           str([x["ip"] for x in fr["ips"]]))
+    cfg = {"proxy": {"L1": {"mark": 11, "ipv4": True, "weight": 3, "udp_v4": True},
+                     "L2": {"mark": 22, "ipv4": True, "weight": 0, "udp_v4": False},
+                     "L3": {"mark": 33, "ipv4": False, "weight": 5}},
+           "rules": [{"L1": {"country_code": ["US"]}, "L3": {"any": True}},
+                     {"L2": {"cidr": ["10.0.0.0/8"], "from": ["192.168.1.0/24"]}},
+                     {"L1": {"resolve": [".taobao.com."]}}]}
+    r = wa.ipq_decide(cfg, "8.8.8.8", {"country_code": "US"})
+    check("geo country rule hits prio0 with L1 mark",
+          r.get("priority") == 0 and r.get("mark") == 11 and r.get("line") == "L1", str(r))
+    check("ipv4-unsupported line listed as skip",
+          any(x["line"] == "L3" and "ipv4" in x["skip"] for x in r.get("skips", [])), str(r.get("skips")))
+    r = wa.ipq_decide(cfg, "1.2.3.4", {"country_code": "JP"}, names={"www.taobao.com"})
+    check("resolve suffix matches prio2", r.get("priority") == 2 and r.get("mark") == 11, str(r))
+    r = wa.ipq_decide(cfg, "1.2.3.4", {"country_code": "JP"}, names={"g.taobao.co"})
+    check("resolve is suffix-anchored not substring", r.get("mark") == 0, str(r))
+    r = wa.ipq_decide(cfg, "10.1.1.1", {"country_code": "JP"}, src="192.168.1.5", proto=17)
+    check("udp-gated line skipped (L2), falls through", r.get("mark") == 0, str(r))
+    r = wa.ipq_decide(cfg, "10.1.1.1", {"country_code": "JP"}, src="192.168.1.5")
+    check("from+cidr tcp hits L2 weight0", r.get("priority") == 1 and r.get("mark") == 22, str(r))
+    r = wa.ipq_decide(cfg, "10.1.1.1", {"country_code": "JP"})
+    check("from-rule noted without src", r.get("mark") == 0, str(r))
+    r = wa.ipq_decide(cfg, "8.8.8.8", None)
+    check("geo miss -> 0x99 bypass like router",
+          r.get("mark") == 0x99 and "0x99" in r.get("why", ""), str(r))
     import os as _os
     if _os.path.isdir("/sys/class/net"):
         check("recommended is a real iface or any",
