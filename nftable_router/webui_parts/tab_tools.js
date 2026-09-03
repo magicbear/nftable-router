@@ -1,4 +1,7 @@
 // ---------- network tools tab (链路MTR/路由表 relocated + ping/dig/whois/ipq) ----------
+// panel timer registry: TOOL_HOOK[name]={show,hide}; must be global because
+// panel modules (further below, outside the IIFE) register into it.
+var TOOL_HOOK={};
 (function(){
  var body=$("tool-body");
  if(!body)return;
@@ -9,7 +12,6 @@
  if(rtS)body.insertBefore(rtS,mtrS?mtrS.nextSibling:body.firstChild);
  var panes={mtr:mtrS,rt:rtS,ping:$("t-ping"),dig:$("t-dig"),whois:$("t-whois"),ipq:$("t-ipq"),bw:$("t-bw"),ift:$("t-ift")};
  var curTool="";
- var TOOL_HOOK={};  // TOOL_HOOK[name]={show,hide} -- panels with timers
  function showTool(k){
   var e=panes[k];if(!e)return;
   if(k===curTool)return;

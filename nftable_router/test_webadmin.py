@@ -562,6 +562,32 @@ def test_webadmin_real_child_smoke():
 
 
 
+def test_iife_scope_lint():
+    print("[6c] no IIFE-local var referenced from outside (TOOL_HOOK-class bug)")
+    for part in sorted(os.listdir(os.path.join(os.path.dirname(
+            os.path.abspath(__file__)), "webui_parts"))):
+        if not part.endswith(".js"):
+            continue
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "webui_parts", part)).read()
+        i = src.find("(function(){")
+        while i != -1:
+            j = src.find("})();", i)
+            if j == -1:
+                break
+            body, outside = src[i:j + 5], src[:i] + src[j + 5:]
+            for name in set(n for n in __import__("re").findall(r"\bvar\s+(\w+)\s*=", body)
+                            if len(n) > 2):          # skip trivial e/x-style locals
+                import re as _r
+                ext = _r.search(r"(?<![.\w])" + name + r"(?:\s*\.|\s*=|\()", outside)
+                if ext:
+                    check("%s: %s referenced outside its IIFE" % (part, name),
+                          bool(_r.search(r"(?m)^var\s+" + name + r"\b", outside)),
+                          "add a global var or move usage inside")
+            i = src.find("(function(){", j + 5)
+    check("scope lint done", True)
+
+
 def test_tools_units():
     print("[8] network tools units (iftop parse / bw / arg validation)")
     screen = (
@@ -618,7 +644,7 @@ def test_tools_units():
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         test_master_signal(d)
-    for t in (test_ws_codec, test_ring_hub, test_validate_config, test_dnsmasq_reload, test_ui_js_syntax,
+    for t in (test_ws_codec, test_ring_hub, test_validate_config, test_dnsmasq_reload, test_ui_js_syntax, test_iife_scope_lint,
               test_server_e2e, test_webadmin_service_lifecycle, test_webadmin_real_child_smoke,
               test_tools_units):
         t()
