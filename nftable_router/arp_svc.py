@@ -79,6 +79,8 @@ def parse_spec(config):
             "user": d.get("user") or None,
             "auth_key": d.get("auth_key") or d.get("authKey") or None,
             "priv_key": d.get("priv_key") or d.get("privKey") or None,
+            "auth_proto": d.get("auth_proto") or d.get("authProto") or None,
+            "priv_proto": d.get("priv_proto") or d.get("privProto") or None,
             "snmp_port": int(d.get("snmp_port", 161)),
         })
     if not devices:
@@ -115,6 +117,10 @@ def device_argv(spec, dev, script=None):
         argv += ["--authKey", dev["auth_key"]]
     if dev.get("priv_key"):
         argv += ["--privKey", dev["priv_key"]]
+    if dev.get("auth_proto"):
+        argv += ["--authProto", dev["auth_proto"]]
+    if dev.get("priv_proto"):
+        argv += ["--privProto", dev["priv_proto"]]
     return argv
 
 

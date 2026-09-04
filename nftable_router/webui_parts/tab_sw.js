@@ -68,11 +68,14 @@ function editSw(idx){
    {name:d.name||"",ip:d.ip||"",snmp_port:d.snmp_port||161,enabled_x:String(d.enabled!==false)});
   g=mgrid(mgroup(body,"SNMP v2c (community) — 与 v3 二选一"));
   mfields(g,[["community","community","text"]],{community:d.community||""});
-  g=mgrid(mgroup(body,"SNMP v3 (推荐; HMAC192SHA256 + AES128)"));
+  g=mgrid(mgroup(body,"SNMP v3 (华为=SHA256+AES128; Cisco NX-OS 常见=SHA+AES128)"));
   mfields(g,[["user","用户名","text",null,"monitor"],
    ["auth_key","认证密钥(authKey)","text"],
-   ["priv_key","加密密钥(privKey)","text"]],
-   {user:d.user||"",auth_key:d.auth_key||d.authKey||"",priv_key:d.priv_key||d.privKey||""});
+   ["priv_key","加密密钥(privKey)","text"],
+   ["auth_proto","认证算法","select",["sha256","sha","sha224","sha384","sha512","md5"]],
+   ["priv_proto","加密算法","select",["aes128","aes192","aes256","des","3des"]]],
+   {user:d.user||"",auth_key:d.auth_key||d.authKey||"",priv_key:d.priv_key||d.privKey||"",
+    auth_proto:d.auth_proto||d.authProto||"sha256",priv_proto:d.priv_proto||d.privProto||"aes128"});
   var h=el("div","dim","提示: 采集器进程的命令行对本机 root 可见(/proc)，密钥会出现在其中；这与原 supervisor 配置的暴露面一致。");
   h.style.marginTop="8px";body.appendChild(h)},
  isNew?"创建":"保存",function(body){
@@ -82,7 +85,9 @@ function editSw(idx){
   out.name=g("name")||out.ip;
   var p=parseInt(g("snmp_port"),10);if(p)out.snmp_port=p;
   out.enabled=g("enabled_x")!=="false";
-  ["community","user","auth_key","priv_key"].forEach(function(f){var v=g(f);if(v)out[f]=v});
+  ["community","user","auth_key","priv_key","auth_proto","priv_proto"].forEach(function(f){var v=g(f);if(v)out[f]=v});
+  if(out.user&&out.auth_proto==="sha256")delete out.auth_proto;   // keep config diffs clean
+  if(out.user&&out.priv_proto==="aes128")delete out.priv_proto;
   if(!out.community&&!(out.user&&out.auth_key))
    return toast("需要 community(v2c) 或 用户名+认证密钥(v3)","bad");
   var dup=(sw.devices||[]).some(function(x,i){return i!==idx&&String(x.name||x.ip)===out.name});

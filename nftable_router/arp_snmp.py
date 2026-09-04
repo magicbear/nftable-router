@@ -58,14 +58,16 @@ OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
 OID_IF_NAME = "1.3.6.1.2.1.31.1.1.1.1"
 OID_IF_ALIAS = "1.3.6.1.2.1.31.1.1.1.18"
 OID_IF_PHYS = "1.3.6.1.2.1.2.2.1.6"
-OID_BRIDGE_ADDR = "1.3.6.1.2.1.17.1.2.0"
+OID_BRIDGE_ADDR = "1.3.6.1.2.1.17.1.2"
 OID_IF_MTU = "1.3.6.1.2.1.2.2.1.4"
 OID_IF_SPEED = "1.3.6.1.2.1.2.2.1.5"
 OID_IF_ADMIN = "1.3.6.1.2.1.2.2.1.7"
 OID_IF_OPER = "1.3.6.1.2.1.2.2.1.8"
 OID_MAC_PORT_IFINDEX = "1.3.6.1.2.1.17.1.4.1.2"
 # --- Cisco (enterprise 9: IOS / IOS-XE / NX-OS) ---------------------------
-OID_SYSOBJID = "1.3.6.1.2.1.1.2.0"
+# NB: walk bases for SCALARS omit the trailing .0 instance -- GETNEXT from
+# the bare node lands on it, from .0 it would skip past the subtree entirely.
+OID_SYSOBJID = "1.3.6.1.2.1.1.2"
 # ipNetToMediaTable (RFC4293-pre IOS: 12.2/15.x): index ifIndex.a.b.c.d,
 # cols 2=phys 3=netaddr 4=type(3 dynamic/4 static)
 OID_CISCO_MEDIA = "1.3.6.1.2.1.4.22.1"
@@ -234,6 +236,15 @@ def plausible_self_mac(m):
             or m.startswith("00-00-94"):
         return False      # zero / VRRP / HSRP virtual macs are NOT the box itself
     return True
+
+
+def valid_arp_mac(m):
+    if not m or len(m) != 17 or m == "00-00-00-00-00-00":
+        return False
+    try:
+        return any(int(x, 16) for x in m.split("-"))
+    except ValueError:          # legacy colon-format junk rows
+        return False
 
 
 def _dec(x):
@@ -588,7 +599,12 @@ class SwitchPoller:
             pass
 
     def checkVendor(self, varBind):
-        oid = str(getattr(varBind[1], "prettyOid", lambda: 0)() or "") or str(varBind[1])
+        v = varBind[1]
+        try:
+            oid = v.prettyOid() if hasattr(v, "prettyOid") else str(v)
+        except Exception:
+            oid = str(v)
+        oid = oid.strip().strip('"').strip("'").lstrip(".")
         if oid.startswith("1.3.6.1.4.1.9"):
             self.vendor = "cisco"
 
@@ -767,6 +783,40 @@ class SwitchPoller:
             except Exception:
                 pass
 
+    def nexusPhyArpCallback(self, varBind):
+        """RFC4293 ipNetToPhysical WITHOUT the mac in the row index --
+        NX-OS layout: col . ifIndex . addrType . addr(N)"""
+        toks = str(varBind[0])[len(OID_ARP_STD) + 1:].split(".")
+        if len(toks) < 4:
+            return
+        col = toks[0]
+        if col not in ("4", "5"):
+            return
+        try:
+            ifIndex = int(toks[1])
+            atype = int(toks[2])
+        except ValueError:
+            return
+        n = {1: 4, 2: 16}.get(atype)
+        if n is None or len(toks) != 3 + n:
+            return
+        if atype == 1:
+            ip = ".".join(toks[3:7])
+        else:
+            ip = ":".join("%02x%02x" % (int(toks[3 + i]), int(toks[4 + i]))
+                          for i in range(0, 16, 2))
+        entry = self.arpList.setdefault(ip, {"interface": ifIndex})
+        if col == "4":
+            try:
+                entry.setdefault("mac", mac_str(varBind[1].asNumbers()))
+            except Exception:
+                pass
+        elif col == "5":
+            try:
+                entry.setdefault("Type", int(varBind[1]))
+            except Exception:
+                pass
+
     def ciscoMediaArpCallback(self, varBind):
         """legacy ipNetToMedia (pre-XE IOS): row index is ifIndex . a.b.c.d,
         col 2=phys 4=type; a real value only, netAddress(col3) skipped."""
@@ -810,9 +860,11 @@ class SwitchPoller:
 
     def poll_arp(self):
         if self.vendor == "cisco":
-            # XE boxes answer only .35, old IOS only .22; walking both is
-            # cheap and rows merge by IP.
+            # XE boxes answer only .35, old IOS only .22, NX-OS answers both
+            # (its .35 index omits the MAC: ifIndex.atype.addr); walking all
+            # is cheap and rows merge by IP.
             self.walk(OID_ARP_STD, self.ciscoPhyArpCallback)
+            self.walk(OID_ARP_STD, self.nexusPhyArpCallback)
             self.walk(OID_CISCO_MEDIA, self.ciscoMediaArpCallback)
         elif self.isVRP:
             self.walk(OID_ARP_STD, self.arpCallback)
@@ -820,8 +872,8 @@ class SwitchPoller:
             self.walk(OID_ARP_HW, self.hwArpTableDataCallback)
         count = 0
         wlan_owned = self._wlan_owned_ips()
+        keep = set()
         for ip, entry in self.arpList.items():
-            count += 1
             entry["sysname"] = self.key_suffix()
             iface = self.interfaces.get(entry.get("interface"), {})
             entry["ifName_L3"] = iface.get("ifName", "")
@@ -834,11 +886,47 @@ class SwitchPoller:
                     entry["ifName_L2"] = self.interfaces.get(int(l2), {}).get("ifName", "")
                 except (TypeError, ValueError):
                     pass
+            mac = entry.get("mac") or ""
+            try:
+                atype = int(entry.get("Type") or 0)
+            except (TypeError, ValueError):
+                atype = 0
+            if not valid_arp_mac(mac) or atype in (1, 2):
+                continue      # incomplete/invalid neighbours (zero-mac
+                              # probes CE Type=2/State=7, S5720 blanks...)
+            keep.add(ip)
+            count += 1
             if self.r is not None:
                 blob = json.dumps(entry)
                 self.r.hset("ARP::MAPPING::%s" % self.key_suffix(), ip, blob)
                 if ip not in wlan_owned:
                     self.r.hset("ARP::MAPPING", ip, blob)
+        if self.r is not None and self.arpList:
+            # drop rows this switch no longer reports (the table used to
+            # accumulate forever -- offline hosts + invalid neighbours)
+            try:
+                per = "ARP::MAPPING::%s" % self.key_suffix()
+                for f in (self.r.hkeys(per) or []):
+                    fs = _dec(f)
+                    if fs in keep:
+                        continue
+                    raw = self.r.hget(per, fs)
+                    try:
+                        row = json.loads(_dec(raw)) if raw else None
+                    except ValueError:
+                        row = None
+                    if row and row.get("source") == "wlan":
+                        continue      # wlan pass owns rows under this same key
+                    self.r.hdel(per, fs)
+                    g = self.r.hget("ARP::MAPPING", fs)
+                    try:
+                        grow = json.loads(_dec(g)) if g else None
+                    except ValueError:
+                        grow = None
+                    if grow and grow.get("sysname") == self.key_suffix():
+                        self.r.hdel("ARP::MAPPING", fs)
+            except Exception:
+                pass
         return count
 
     def _wlan_owned_ips(self):
@@ -1043,20 +1131,53 @@ def _pysnmp_generation():
             "Python<3.12 上的旧环境可继续用 pysnmp 4.4.x。原始错误: %s" % e)
 
 
-def _make_walker_modern(host, community, user, auth_key, priv_key, port, timeout, retries):
+_AUTH_CANDS = {
+    "md5": ["usmHMACMD5AuthProtocol"],
+    "sha": ["usmHMACSHAAuthProtocol", "usmHMAC1SHA1AuthProtocol"],
+    "sha224": ["usmHMAC128SHA224AuthProtocol", "usmHMACSHA224AuthProtocol"],
+    "sha256": ["usmHMAC192SHA256AuthProtocol", "usmHMACSHA256AuthProtocol"],
+    "sha384": ["usmHMAC256SHA384AuthProtocol", "usmHMACSHA384AuthProtocol"],
+    "sha512": ["usmHMAC384SHA512AuthProtocol", "usmHMACSHA512AuthProtocol"],
+}
+_PRIV_CANDS = {
+    "des": ["usmDESPrivProtocol"],
+    "aes128": ["usmAesCfb128Protocol", "usmAES128PrivProtocol"],
+    "aes192": ["usmAesCfb192Protocol", "usmAES192PrivProtocol"],
+    "aes256": ["usmAesCfb256Protocol", "usmAES256PrivProtocol"],
+    "3des": ["usm3DESEDEPrivProtocol"],
+}
+
+
+def _usm_find(names, modules):
+    for n in names:
+        for mod in modules:
+            v = getattr(mod, n, None)
+            if v is not None:
+                return v
+    raise ValueError("本 pysnmp 不支持协议 %s" % names[0])
+
+
+def _make_walker_modern(host, community, user, auth_key, priv_key, port, timeout,
+                        retries, auth_proto="sha256", priv_proto="aes128"):
     """pysnmp 6/7.x: the hlapi is asyncio-only, so each walk is driven to
     completion inside its own event loop and handed to the same sync
     callback contract the rest of this module (and its tests) expect."""
     import asyncio
+    import pysnmp.hlapi.v3arch.asyncio as _hla
     from pysnmp.hlapi.v3arch.asyncio import (
         SnmpEngine, CommunityData, UsmUserData, ContextData,
-        UdpTransportTarget, ObjectType, ObjectIdentity, walk_cmd,
-        usmHMAC192SHA256AuthProtocol, usmAesCfb128Protocol)
+        UdpTransportTarget, ObjectType, ObjectIdentity, walk_cmd)
 
     if user and auth_key:
-        login = UsmUserData(user, authProtocol=usmHMAC192SHA256AuthProtocol,
+        try:
+            from pysnmp.entity import config as _cfg
+            mods = (_cfg, _hla)
+        except Exception:
+            mods = (_hla,)
+        login = UsmUserData(user,
+                            authProtocol=_usm_find(_AUTH_CANDS[auth_proto], mods),
                             authKey=auth_key, privKey=priv_key,
-                            privProtocol=usmAesCfb128Protocol)
+                            privProtocol=_usm_find(_PRIV_CANDS[priv_proto], mods))
     elif community:
         login = CommunityData(community)
     else:
@@ -1096,18 +1217,22 @@ def _make_walker_modern(host, community, user, auth_key, priv_key, port, timeout
 
 
 def make_snmp_walker(host, community=None, user=None, auth_key=None, priv_key=None,
-                     port=161, timeout=5, retries=2, log=print):
+                     port=161, timeout=5, retries=2, log=print,
+                     auth_proto="sha256", priv_proto="aes128"):
     if _pysnmp_generation() == "modern":
         return _make_walker_modern(host, community, user, auth_key, priv_key,
-                                   port, timeout, retries)
+                                   port, timeout, retries, auth_proto, priv_proto)
     from pysnmp.hlapi import (SnmpEngine, CommunityData, UsmUserData, ContextData,
                               UdpTransportTarget, ObjectType, ObjectIdentity, nextCmd)
     from pysnmp.entity import config as snmp_config
+    import pysnmp.hlapi as _hl
 
     if user and auth_key:
-        login = UsmUserData(user, authProtocol=snmp_config.usmHMAC192SHA256AuthProtocol,
+        mods = (snmp_config, _hl)
+        login = UsmUserData(user,
+                            authProtocol=_usm_find(_AUTH_CANDS[auth_proto], mods),
                             authKey=auth_key, privKey=priv_key,
-                            privProtocol=snmp_config.usmAesCfb128Protocol)
+                            privProtocol=_usm_find(_PRIV_CANDS[priv_proto], mods))
     elif community:
         login = CommunityData(community)
     else:
@@ -1168,6 +1293,11 @@ def build_parser():
     p.add_argument("--user", default=None, help="SNMP v3 user")
     p.add_argument("--authKey", dest="auth_key", default=None, help="SNMP v3 auth key")
     p.add_argument("--privKey", dest="priv_key", default=None, help="SNMP v3 priv key")
+    p.add_argument("--authProto", dest="auth_proto", default="sha256",
+                   choices=sorted(_AUTH_CANDS),
+                   help="SNMP v3 auth protocol (default sha256 = 与华为侧既有配置一致; Nexus 常见为 sha)")
+    p.add_argument("--privProto", dest="priv_proto", default="aes128",
+                   choices=sorted(_PRIV_CANDS), help="SNMP v3 priv protocol")
     p.add_argument("--name", default=None, help="display name (default: the IP)")
     p.add_argument("--snmp-port", type=int, default=161)
     p.add_argument("--poll-interval", type=int, default=300)
@@ -1191,7 +1321,8 @@ def main(argv=None):
 
     walk = make_snmp_walker(args.ip, community=args.community, user=args.user,
                             auth_key=args.auth_key, priv_key=args.priv_key,
-                            port=args.snmp_port, log=log)
+                            port=args.snmp_port, log=log,
+                            auth_proto=args.auth_proto, priv_proto=args.priv_proto)
     poller = SwitchPoller(name, walk, redis_client=r,
                           poll_interval=args.poll_interval,
                           iface_interval=args.iface_interval, log=log)

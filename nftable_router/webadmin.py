@@ -70,12 +70,21 @@ except Exception:
 
 try:
     from nftable_router.arp_snmp import (pick_mac_port, resolve_location,
-                                         load_switch_links)
+                                         load_switch_links,
+                                         valid_arp_mac as asn_valid_arp_mac)
 except Exception:
     try:
-        from arp_snmp import pick_mac_port, resolve_location, load_switch_links
+        from arp_snmp import (pick_mac_port, resolve_location,
+                              load_switch_links, valid_arp_mac)
     except Exception:
         pick_mac_port = resolve_location = load_switch_links = None
+try:
+    from nftable_router.arp_snmp import valid_arp_mac as asn_valid_arp_mac
+except Exception:
+    try:
+        from arp_snmp import valid_arp_mac as asn_valid_arp_mac
+    except Exception:
+        asn_valid_arp_mac = lambda m: True
 
 try:
     import psutil
@@ -379,6 +388,9 @@ def arp_table(app, limit=4000):
             except (ValueError, AttributeError):
                 continue
             mac = e.get("mac") or ""
+            if not (resolve_location is None or pick_mac_port is None) and \
+                    not asn_valid_arp_mac(mac):
+                continue      # zero/absent mac = unresolved neighbour, noise
             # Score every MAC-table hit (access port > named edge trunk
             # like "To NAS" > inter-switch uplink). Blindly skipping
             # Eth-Trunk used to leave hosts such as 192.168.11.14 stuck
@@ -529,6 +541,12 @@ def validate_config(cfg):
                 p = d.get("snmp_port")
                 if p is not None and not (isinstance(p, int) and 0 < p < 65536):
                     errors.append("switches.devices[%s]: snmp_port 无效 %r" % (name, p))
+            for pk, allowed in (("auth_proto", ("md5", "sha", "sha224", "sha256", "sha384", "sha512")),
+                                ("priv_proto", ("des", "aes128", "aes192", "aes256", "3des"))):
+                pv = d.get(pk) or d.get({"auth_proto": "authProto", "priv_proto": "privProto"}[pk])
+                if pv and str(pv).lower() not in allowed:
+                    errors.append("switches.devices[%s]: %s 无效 %r (可选 %s)"
+                                  % (name, pk, pv, "/".join(allowed)))
         for k in ("poll_interval", "iface_interval"):
             if k in sw and not (isinstance(sw[k], int) and sw[k] > 0):
                 errors.append("switches.%s must be a positive int" % k)

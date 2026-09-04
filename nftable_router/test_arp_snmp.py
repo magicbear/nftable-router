@@ -69,6 +69,16 @@ class FakeRedis:
             d[str(v)] = ""
     def smembers(self, key):
         return set(self.h.get(key, {}).keys())
+    def hkeys(self, key):
+        return list(self.h.get(key, {}).keys())
+    def hdel(self, key, *fields):
+        d = self.h.get(key, {})
+        n = 0
+        for f in fields:
+            if str(f) in d:
+                del d[str(f)]
+                n += 1
+        return n
     def keys(self, pattern):
         pre = str(pattern).rstrip("*")
         return [k for k in self.h if k.startswith(pre)]
@@ -444,6 +454,19 @@ def test_argv_and_redaction():
     red = " ".join(asvc.redact_argv(argv))
     check("authKey/privKey masked for logs+UI", "AK" not in red and "PK" not in red and "****" in red)
     check("non-secret args survive redaction", "192.168.11.1" in red)
+    nx = asvc.parse_spec({"switches": {"devices": [{"name": "nx", "ip": "10.0.0.9",
+        "user": "monitor", "auth_key": "A", "priv_key": "P",
+        "auth_proto": "sha", "priv_proto": "aes128"}]}})
+    argv = asvc.device_argv(nx, nx["devices"][0], script="s.py")
+    check("authProto/privProto forwarded when set",
+          "--authProto" in argv and argv[argv.index("--authProto") + 1] == "sha")
+    base = asvc.parse_spec({"switches": {"devices": [{"name": "b", "ip": "1.1.1.1",
+        "user": "u", "auth_key": "a", "priv_key": "p"}]}})
+    ab = asvc.device_argv(base, base["devices"][0], script="s.py")
+    check("defaults omit proto flags (sha256 stays implicit)", "--authProto" not in ab)
+    ap = asn.build_parser().parse_args(["--ip", "1.2.3.4", "--user", "u",
+                                        "--authKey", "a", "--authProto", "sha"])
+    check("collector argparse accepts --authProto sha", ap.auth_proto == "sha")
 
 
 def test_supervisor_lifecycle():
@@ -535,6 +558,20 @@ def test_cisco_arp_and_qbridge():
     e2 = q.arpList.get("192.168.9.9")
     check("legacy ipNetToMedia row", e2 and e2["mac"] == "de-ad-00-01-02-03"
           and e2["Type"] == 3, str(e2))
+    # NX-OS layout: col . ifIndex . 1 . a.b.c.d (no mac in index)
+    nxbinds = [
+        ("%s.4.15.1.10.20.30.41" % base, FakeOctets(bytes([0x0c, 0x5a, 0x11, 0x22, 0x33, 0x44]))),
+        ("%s.5.15.1.10.20.30.41" % base, 3),
+    ]
+    nxp = asn.SwitchPoller("nx", walker_from({base: nxbinds}))
+    for oid, val in nxbinds:
+        nxp.nexusPhyArpCallback((oid, val))
+    en = nxp.arpList.get("10.20.30.41")
+    check("nexus .35 (mac-less index) parsed", en and en["mac"] == "0c-5a-11-22-33-44"
+          and en["interface"] == 15 and en["Type"] == 3, str(en))
+    p2v = asn.SwitchPoller("q", walker_from({}))
+    p2v.checkVendor(("x", '"1.3.6.1.4.1.9.12.3.1.3.1856"'))   # pysnmp str() with quotes
+    check("quoted-objectid vendor detect", p2v.vendor == "cisco", p2v.vendor)
     # poll_arp dispatch on vendor
     r = walker_from({base: binds, lb: [("%s.2.7.192.168.9.9" % lb,
                                         FakeOctets(bytes([0xde, 0xad, 0, 1, 2, 3])))]})
@@ -662,9 +699,48 @@ def test_self_mac_links_and_location():
           sm == {"aa-aa-aa-00-00-01", "aa-aa-aa-00-00-09"}, str(sm))
 
 
+def test_arp_validity_and_stale_sweep():
+    print("[12] zero-mac/incomplete filtered, stale rows swept")
+    check("valid_arp_mac", asn.valid_arp_mac("68-77-24-35-ad-c4")
+          and not asn.valid_arp_mac("00-00-00-00-00-00")
+          and not asn.valid_arp_mac("18:9b:a5:82:fe:e6")
+          and not asn.valid_arp_mac(""))
+    r = FakeRedis()
+    pol = asn.SwitchPoller("CE1", walker_from({}), redis_client=r)
+    pol.sysname = "CE1"
+    pol.interfaces = {138: {"ifName": "Vlanif16"}}
+    pol.arpList = {
+        "10.0.0.5": {"interface": 138, "mac": "aa-aa-aa-00-00-05", "Type": 3},
+        "10.0.0.6": {"interface": 138, "mac": "00-00-00-00-00-00", "Type": 2},
+        "10.0.0.7": {"interface": 138, "mac": ""},
+    }
+    n = pol.poll_arp()
+    check("only resolved entries counted/stored", n == 1
+          and "10.0.0.5" in r.h.get("ARP::MAPPING::CE1", {})
+          and "10.0.0.6" not in r.h.get("ARP::MAPPING::CE1", {}), str(n))
+    # pre-seed junk incl. stale + wlan-owned + foreign-owned global
+    r.hset("ARP::MAPPING::CE1", "10.0.0.9", json.dumps({"mac": "bb-bb-bb-bb-bb-09"}))
+    r.hset("ARP::MAPPING::CE1", "10.0.0.8", json.dumps({"source": "wlan", "mac": "cc-08"}))
+    r.hset("ARP::MAPPING", "10.0.0.9", json.dumps({"mac": "bb-bb-bb-bb-bb-09", "sysname": "CE1"}))
+    r.hset("ARP::MAPPING", "10.0.0.4", json.dumps({"mac": "bb-bb-bb-bb-bb-04", "sysname": "OTHER"}))
+    pol.arpList = {"10.0.0.5": {"interface": 138, "mac": "aa-aa-aa-00-00-05", "Type": 3}}
+    pol.poll_arp()
+    per = r.h.get("ARP::MAPPING::CE1", {})
+    check("stale swept from own table", "10.0.0.9" not in per, str(list(per)))
+    check("wlan-owned row kept", "10.0.0.8" in per, str(list(per)))
+    check("global stale (owned) deleted", "10.0.0.9" not in r.h.get("ARP::MAPPING", {}))
+    check("global foreign entry untouched", "10.0.0.4" in r.h.get("ARP::MAPPING", {}))
+    # empty walk must NOT wipe the table (SNMP failure safety)
+    pol.arpList = {}
+    pol.poll_arp()
+    check("empty arpList skips sweep entirely", "10.0.0.5" in r.h.get("ARP::MAPPING::CE1", {}),
+          str(list(r.h.get("ARP::MAPPING::CE1", {}))))
+
+
 if __name__ == "__main__":
     for t in (test_mac_format, test_arp_std_parse, test_hw_arp_parse,
               test_cisco_arp_and_qbridge,
+              test_arp_validity_and_stale_sweep,
               test_descr_adjacency_and_owner,
               test_self_mac_links_and_location,
               test_hw_arp_l3_ifindex_regression, test_interface_and_mac_table, test_redis_key_layout_and_sysname_fallback,
