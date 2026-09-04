@@ -122,10 +122,11 @@ function ipqRender(d){
   if((r.names||[]).length)c.appendChild(el("div","dim","DNS观测: "+r.names.join(", ")));
   if(r.geo){
    var ks=Object.keys(r.geo).sort();
-   var gt=elAppend(c,"table");var trh=document.createElement("tr");
-   ks.forEach(function(k){trh.appendChild(el("th","",k))});gt.appendChild(trh);
-   var tr=document.createElement("tr");
-   ks.forEach(function(k){tr.appendChild(el("td","",String(r.geo[k])))});gt.appendChild(tr);
+   var det=document.createElement("details");det.open=true;
+   det.appendChild(el("summary","dim","geo 全字段 ("+ks.length+")"));
+   putRows(elAppend(det,"table"),["字段","值"],
+    ks.map(function(k){return [k,String(r.geo[k])]}));
+   c.appendChild(det);
   }else c.appendChild(el("div","warn","geo 无数据（将走 0x99 直连旁路）"));
   if(rt.raw){var det=document.createElement("details");det.appendChild(el("summary","dim","ip route get 原文"));
    det.appendChild(el("pre","dim",rt.raw));c.appendChild(det)}})}
