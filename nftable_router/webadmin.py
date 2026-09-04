@@ -729,6 +729,14 @@ def health_snapshot(app):
                        "v4": parse("test_v4"), "v6": parse("test_v6")}
     except Exception as e:
         res["test"] = {"error": str(e), "caps": caps}
+    # header-dot compat: the old /api/status carried check_master() fields;
+    # WS t=status consumers (d-master dot) rely on alive/is_router.
+    cm = check_master(getattr(app.args, "pidfile", None))
+    if isinstance(res.get("master"), dict):
+        res["master"].setdefault("alive", cm.get("alive", False))
+        res["master"].setdefault("is_router", cm.get("is_router", False))
+    elif cm.get("alive"):
+        res["master"] = cm
     return res
 
 

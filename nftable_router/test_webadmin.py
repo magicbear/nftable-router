@@ -449,6 +449,17 @@ def test_server_e2e():
                     kinds.append("?")
             check("hello + snap(frames) received", "hello" in kinds and "snap" in kinds, str(kinds))
             check("status frame pushed on connect (no polling)", "status" in kinds, str(kinds))
+            _st = None
+            for _, _pl in frames:
+                try:
+                    if json.loads(_pl).get("t") == "status":
+                        _st = json.loads(_pl); break
+                except ValueError:
+                    pass
+            check("status frame master compat (alive/is_router present)",
+                  _st is not None and isinstance(_st.get("master"), dict)
+                  and "alive" in _st["master"] and "is_router" in _st["master"],
+                  str(_st.get("master") if _st else None)[:120])
 
             def read_rows(timeout=6):
                 """collect DATA frames, skipping any interleaved push frames
