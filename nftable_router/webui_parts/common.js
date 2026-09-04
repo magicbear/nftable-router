@@ -26,7 +26,15 @@ function putRows(t,cols,rows){
  t.appendChild(tb)}
 
 // ---------- modal infra ----------
-function closeModal(){var o=$("modal_ov");if(o)o.remove()}
+// modal stack: openModal = level1 (id modal_ov), openListEditor = level2
+// (z60, no id). ESC must close the TOPMOST popup first -- previously it hit
+// closeModal() which grabbed #modal_ov (level 1) and orphaned level 2.
+var MODAL_STACK=[];
+function closeModal(){while(MODAL_STACK.length){var m=MODAL_STACK.pop();m.node.remove()}}
+function popModal(){var m=MODAL_STACK.pop();if(m)m.node.remove();return m}
+function modalPopNode(node){
+ for(var i=MODAL_STACK.length-1;i>=0;i--)if(MODAL_STACK[i].node===node){MODAL_STACK.splice(i,1);break}
+ node.remove()}
 function openModal(title,buildFn,okLabel,onSave){
  closeModal();
  var ov=el("div","modal");ov.id="modal_ov";
@@ -42,7 +50,8 @@ function openModal(title,buildFn,okLabel,onSave){
  ov.appendChild(card);
  ov.onclick=function(e){if(e.target===ov)closeModal()};
  document.body.appendChild(ov);
- document.onkeydown=function(e){if(e.key==="Escape")closeModal()};
+ MODAL_STACK.push({node:ov});
+ document.onkeydown=function(e){if(e.key==="Escape")popModal()};
  if(buildFn)buildFn(body);
  return body}
 function mgroup(body,title){var s=el("div","msec");s.appendChild(el("b","",title));body.appendChild(s);return s}
@@ -150,7 +159,7 @@ function openListEditor(title,values,onDone){
  var ov=el("div","modal");ov.style.zIndex="60";
  var card=el("div","modalcard");card.style.maxWidth="520px";
  var h=el("div","bar");h.appendChild(el("b","",title));
- var x=el("button","dim","✕");x.style.marginLeft="auto";x.onclick=function(){ov.remove()};
+ var x=el("button","dim","✕");x.style.marginLeft="auto";x.onclick=function(){modalPopNode(ov)};
  h.appendChild(x);card.appendChild(h);
  var body=el("div");card.appendChild(body);
  var cur=values.slice();
@@ -177,11 +186,12 @@ function openListEditor(title,values,onDone){
  var bar=el("div","bar");bar.style.marginTop="12px";
  var ok=el("button","good","保存");ok.onclick=function(){
   var clean=[];cur.forEach(function(v){v=(v||"").trim();if(v&&clean.indexOf(v)<0)clean.push(v)});
-  ov.remove();onDone(clean)};
- var cancel=el("button","dim","取消");cancel.onclick=function(){ov.remove()};
+  modalPopNode(ov);onDone(clean)};
+ var cancel=el("button","dim","取消");cancel.onclick=function(){modalPopNode(ov)};
  bar.appendChild(ok);bar.appendChild(cancel);card.appendChild(bar);
  ov.appendChild(card);
  document.body.appendChild(ov);
+ MODAL_STACK.push({node:ov});   // ESC closes THIS first now; level1 survives
  setTimeout(function(){var f=body.querySelector("input");if(f)f.focus()},0)}
 
 connect();

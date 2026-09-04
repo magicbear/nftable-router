@@ -68,19 +68,43 @@ function renderPingChips(){
   if(tp)lab.style.borderColor="#8a6d3b";
   box.appendChild(lab)})}
 var pingJobs={},pingLeft=0;
+function mchip(k,v,cls){var sp=el("span","");sp.style.cssText="margin-right:12px";
+ sp.appendChild(el("span","dim",k+" "));sp.appendChild(el("span",cls||"",v));return sp}
+function rowSpan(t,cls){var d=el("div",cls||"");d.style.cssText="padding:1px 0";if(t)d.textContent=t;return d}
 function pingPane(ln){
- var d=el("div");d.style.cssText="flex:1 1 340px;min-width:300px;border:1px solid #22304a;border-radius:6px;padding:4px 8px";
- var hd=el("div","dim");
+ var d=el("div");d.style.cssText="flex:1 1 360px;min-width:330px;border:1px solid #22304a;border-radius:6px;padding:6px 10px";
+ var hd=el("div");hd.style.cssText="display:flex;align-items:center;gap:8px;flex-wrap:wrap";
  hd.appendChild(el("b","",lineLabel(ln)));
- var badge=el("span",""," 运行中…");badge.style.marginLeft="8px";hd.appendChild(badge);
- d.appendChild(hd);
- var pre=el("pre","dim");pre.style.cssText="margin:4px 0 0;min-height:70px;max-height:300px;overflow:auto;white-space:pre-wrap;font-size:11px";
- d.appendChild(pre);$("p-out").appendChild(d);
- return {badge:badge,pre:pre}}
+ var badge=el("span","dim","运行中…");hd.appendChild(badge);d.appendChild(hd);
+ var meta=el("div");meta.style.cssText="font-size:12px;margin:5px 0;display:flex;flex-wrap:wrap;gap:2px 4px";d.appendChild(meta);
+ var rows=el("div");rows.style.cssText="font-family:monospace;font-size:12px";d.appendChild(rows);
+ var stat=el("div");stat.style.cssText="margin-top:5px;font-size:12px;border-top:1px solid #1d2a44;padding-top:4px";d.appendChild(stat);
+ $("p-out").appendChild(d);
+ return {badge:badge,meta:meta,rows:rows,stat:stat,rec:0,sum:0}}
+function pingFeed(j,txt){
+ var m;
+ if(txt.indexOf("目标:")===0){j.meta.appendChild(mchip("目标",txt.slice(3).trim()));return}
+ if(txt.indexOf("出口IP:")===0){var v=txt.slice(5).trim();
+  j.meta.appendChild(mchip("出口",v,v.indexOf("ERROR")>=0?"bad":"good"));return}
+ if(txt.indexOf("Route:")===0){j.meta.appendChild(mchip("路由",txt.slice(6).trim(),"dim"));return}
+ if((m=txt.match(/icmp_seq=(\d+).*ttl=(\d+).*?time=([\d.]+)/))){
+  var t=parseFloat(m[3]);j.rec++;j.sum+=t;
+  var row=rowSpan();
+  row.appendChild(el("span","dim","  seq "+m[1]+" · ttl "+m[2]+" · "));
+  row.appendChild(el("b",t<50?"good":(t<200?"warn":"bad"),t.toFixed(2)+" ms"));
+  j.rows.appendChild(row);return}
+ if((m=txt.match(/(\d+) packets transmitted, (\d+)(?: packets)? received/))){
+  var sent=+m[1],rec=+m[2],loss=sent?Math.round((sent-rec)/sent*100):0;
+  j.stat.appendChild(mchip("收",rec+"/"+sent,rec===sent?"good":"warn"));
+  j.stat.appendChild(mchip("丢包",loss+"%",loss?"bad":"good"));
+  if(j.rec)j.stat.appendChild(mchip("均值",(j.sum/j.rec).toFixed(1)+"ms","dim"));
+  return}
+ if(/^PING /.test(txt))return;
+ j.rows.appendChild(rowSpan(txt,"dim"))}
 window.__ping_on=function(m){
  if(!m||m.t!=="ping")return;
  var j=pingJobs[m.id];if(!j)return;
- if(m.out!=null){j.pre.textContent+=m.out+"\n";j.pre.scrollTop=j.pre.scrollHeight}
+ if(m.out!=null)pingFeed(j,m.out);
  if(m.status){
   if(m.status==="done"){j.badge.textContent="完成 "+(m.ms||0)+"ms"+(m.note?(" · "+m.note):"");j.badge.style.color="#6fbf73"}
   else{j.badge.textContent="× "+m.status+(m.error?(": "+m.error):"");j.badge.style.color="#d66969"}
