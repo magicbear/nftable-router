@@ -665,6 +665,67 @@ def orphan_proxy_pids(port, binary_hint, master_pid):
     return out
 
 
+def port_owner_pids(port):
+    """PIDs bound to port (TCP LISTEN or UDP) via /proc/net/{tcp,udp}[6]
+    socket inodes -> /proc/*/fd links. No external tools, no shell."""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return []
+    inodes = set()
+    for proto, st in (("tcp", "0A"), ("tcp6", "0A"), ("udp", None), ("udp6", None)):
+        try:
+            with open("/proc/net/%s" % proto) as f:
+                for line in f.read().splitlines()[1:]:
+                    fl = line.split()
+                    try:
+                        lp = int(fl[1].rsplit(":", 1)[1], 16)
+                    except (IndexError, ValueError):
+                        continue
+                    if lp == port and (st is None or (len(fl) > 3 and fl[3] == st)):
+                        inodes.add(fl[9])
+        except OSError:
+            continue
+    if not inodes:
+        return []
+    out = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        pid = int(d)
+        try:
+            for fd in os.listdir("/proc/%d/fd" % pid):
+                try:
+                    tgt = os.readlink("/proc/%d/fd/%s" % (pid, fd))
+                except OSError:
+                    continue
+                if tgt.startswith("socket:[") and tgt[8:-1] in inodes:
+                    out.append(pid)
+                    break
+        except OSError:
+            continue
+    return sorted(out)
+
+
+def proc_proxy_like(pid, binary_hint, master_pid):
+    """cmdline description of pid if it looks like a proxy daemon AND is not
+    a child of the current master (those are ours, never takeover targets);
+    returns None otherwise."""
+    try:
+        raw = open("/proc/%d/cmdline" % pid, "rb").read()
+        cl = [c.decode("utf-8", "replace") for c in raw.split(b"\0") if c]
+        ppid = int(re.search(r"^PPid:\s*(\d+)",
+                             open("/proc/%d/status" % pid).read(), re.M).group(1))
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not cl or ppid == master_pid:
+        return None
+    names = set(PROXY_BINARIES) | ({os.path.basename(str(binary_hint))} if binary_hint else set())
+    if os.path.basename(cl[0]) not in names:
+        return None
+    return " ".join(cl)[:120]
+
+
 def kill_orphan(pid, grace=1.5):
     """SIGTERM -> SIGKILL for a NON-child process (init reaps it)."""
     import time as _t
@@ -832,14 +893,27 @@ class ProxySupervisor(threading.Thread):
         sib_alive = any(self.proxies.get(k2) and self.proxies[k2].proc
                         and self.proxies[k2].proc.poll() is None for k2 in siblings)
         if my_port and not sib_alive and self._port_wait(my_port, timeout=0.5):
-            # port busy by a foreign listener -> try TAKEOVER of stale proxies
-            # (orphans of previous router runs / supervisor copies of the SAME
-            # managed line). Only when the line allows it (takeover!=false).
-            if cfg.get("takeover", False):
+            # port busy by a foreign listener -> TAKEOVER of stale proxies by
+            # default (orphans of previous router runs / manual launches of
+            # the same managed line). opt-out per line with takeover:false.
+            if cfg.get("takeover", True):
+                killed = set()
                 for o in orphan_proxy_pids(my_port, cfg.get("binary"), os.getpid()):
                     self.log("%s: takeover killing stale proxy pid=%d ppid=%d [%s]"
                              % (key, o["pid"], o["ppid"], o["cmd"]))
                     kill_orphan(o["pid"])
+                    killed.add(o["pid"])
+                # cmdline scan can miss leftovers (flag style variants): who
+                # actually holds the socket? kill it too IF it is proxy-like.
+                for opid in port_owner_pids(my_port):
+                    if opid in killed:
+                        continue
+                    desc = proc_proxy_like(opid, cfg.get("binary"), os.getpid())
+                    if desc:
+                        self.log("%s: takeover killing port owner pid=%d [%s]"
+                                 % (key, opid, desc))
+                        kill_orphan(opid)
+                        killed.add(opid)
                 if not self._port_wait(my_port, timeout=0.8):
                     self.on_status(key, "takeover", None)
                     try:
@@ -851,9 +925,10 @@ class ProxySupervisor(threading.Thread):
                         self.log("%s: spawn failed after takeover: %s" % (key, e))
                         return
             p.state = "external"
-            self.log("%s: port %s held by a live non-orphan listener (managed by "
-                     "supervisor/another tool?) - not spawning; stop it there or set "
-                     "'takeover': false" % (key, my_port))
+            owners = ", ".join(str(x) for x in port_owner_pids(my_port)[:4]) or "?"
+            self.log("%s: port %s held by pid(s) %s not recognised as stale proxy - "
+                     "not spawning; stop it there or set 'takeover': false to accept "
+                     "external" % (key, my_port, owners))
             self.on_status(key, "external", None)
             return
         try:
@@ -971,6 +1046,14 @@ class ProxySupervisor(threading.Thread):
                         # deferred earlier (dependency down / not ready):
                         # re-run the full gated bring-up
                         if p.state == "deferred":
+                            self._bring_up(n)
+                        elif (p.state == "external"
+                              and self._now() - getattr(p, "_ext_try", 0.0) >= 30.0):
+                            # external holder may die/leave at any time --
+                            # re-attempt takeover (with retry logging capped
+                            # at one line per 30s per instance)
+                            p._ext_try = self._now()
+                            p.state = "stopped"
                             self._bring_up(n)
                         continue
                     rc = p.proc.poll()

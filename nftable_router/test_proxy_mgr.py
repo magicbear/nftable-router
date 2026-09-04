@@ -685,12 +685,28 @@ def test_spec_quarantine():
           "GOOD" in sup.proxies and "BAD" not in sup.proxies)
 
 
+
+def test_port_owner_probe():
+    print("[takeover] port_owner_pids real-socket probe")
+    import socket as _sk
+    srv = _sk.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+    port = srv.getsockname()[1]
+    pids = pm.port_owner_pids(port)
+    check("real TCP listener found via /proc", os.getpid() in pids, str(pids))
+    check("own pid is not proxy-like (python)",
+          pm.proc_proxy_like(os.getpid(), None, 1) is None)
+    check("non-proxy-string port tolerated", pm.port_owner_pids("x") == [])
+    srv.close()
+
+
+
 if __name__ == "__main__":
     for t in (test_build_cmd, test_chain_validation, test_uid_uniqueness, test_chain_rules, test_mark_upstream_chain, test_multi_instances, test_spec_quarantine,
               test_instance_fields_do_not_leak,
               test_supervisor_restart, test_supervisor_stop_semantics,
               test_dependency_gating, test_redact, test_uid_optional_and_identity,
-              test_reconfigure_diff, test_monitor_thread_safe_with_reconfigure):
+              test_reconfigure_diff, test_monitor_thread_safe_with_reconfigure,
+              test_port_owner_probe):
         t()
     print("\n==== %d passed, %d failed ====" % (PASS, FAIL))
     sys.exit(1 if FAIL else 0)
