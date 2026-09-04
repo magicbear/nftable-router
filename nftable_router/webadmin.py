@@ -69,12 +69,13 @@ except Exception:
         pa = None
 
 try:
-    from nftable_router.arp_snmp import pick_mac_port
+    from nftable_router.arp_snmp import (pick_mac_port, resolve_location,
+                                         load_switch_links)
 except Exception:
     try:
-        from arp_snmp import pick_mac_port
+        from arp_snmp import pick_mac_port, resolve_location, load_switch_links
     except Exception:
-        pick_mac_port = None
+        pick_mac_port = resolve_location = load_switch_links = None
 
 try:
     import psutil
@@ -369,6 +370,7 @@ def arp_table(app, limit=4000):
                     for m, v in (r.hgetall(key) or {}).items()}
             except (ValueError, AttributeError):
                 pass
+        links, fan = ({}, {}) if not load_switch_links else load_switch_links(r, list(mac_tables))
         rows = []
         for ip_b, blob in raw.items():
             ip = ip_b.decode("utf-8", "replace")
@@ -388,16 +390,19 @@ def arp_table(app, limit=4000):
                     hits.append((sw, hit))
             if e.get("ifName_L2"):
                 hits.append((e.get("sysname") or "", {
-                    "ifName": e["ifName_L2"], "ifDescr": e["ifName_L2"]}))
+                    "ifName": e["ifName_L2"], "ifDescr": e["ifName_L2"],
+                    "ifIndex": e.get("ifIndex")}))
             if e.get("ap_name"):
                 hits.append((e.get("sysname") or "", {
                     "ifName": e["ap_name"], "ifDescr": e["ap_name"]}))
-            picked = pick_mac_port(hits) if pick_mac_port else None
-            if picked:
-                port_sw, ifName, ifDescr = picked
+            port, port_sw = "", ""
+            loc = (resolve_location(hits, links, fan, l3_owner=e.get("sysname") or "")
+                   if resolve_location else None)
+            if loc and loc[0] == "final":
+                port_sw, ifName, ifDescr = loc[1], loc[2], loc[3]
                 port = ifDescr or ifName
-            else:
-                port, port_sw = "", ""
+            elif loc and loc[0] == "toward":
+                port, port_sw = "→ " + loc[1], loc[1]
             rows.append({"ip": ip, "mac": mac, "sysname": e.get("sysname") or "",
                          "ifName_L3": e.get("ifName_L3") or "", "vlan": e.get("vlan"),
                          "ap_name": e.get("ap_name") or "", "ssid": e.get("ssid") or "",

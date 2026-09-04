@@ -58,6 +58,20 @@ class FakeRedis:
         self.h.setdefault(key, {})[str(field)] = value
     def hgetall(self, key):
         return self.h.get(key, {})
+    def hget(self, key, field):
+        return self.h.get(key, {}).get(str(field))
+    def delete(self, *keys):
+        for k in keys:
+            self.h.pop(k, None)
+    def sadd(self, key, *vals):
+        d = self.h.setdefault(key, {})
+        for v in vals:
+            d[str(v)] = ""
+    def smembers(self, key):
+        return set(self.h.get(key, {}).keys())
+    def keys(self, pattern):
+        pre = str(pattern).rstrip("*")
+        return [k for k in self.h if k.startswith(pre)]
     def hlen(self, key):
         return len(self.h.get(key, {}))
 
@@ -557,9 +571,86 @@ def test_cisco_arp_and_qbridge():
           and list(f.macTable.values())[0]["ifIndex"] == 7, str(f.macTable))
 
 
+def test_descr_adjacency_and_owner():
+    print("[11b] port-description adjacency + l3_owner in toward pick")
+    toks = asn.switch_name_tokens("HSDJ-47-CORE-CE6881")
+    check("core distinctive token", toks == ["ce6881"], str(toks))
+    check("AC1 token", asn.switch_name_tokens("AC1") == ["ac1"])
+    check("ambiguous token kept per-name (dedup by owners set in builder)",
+          len(set(asn.switch_name_tokens("HSDJ-46-ACC-S5732-2"))
+              & set(asn.switch_name_tokens("HSDJ-47-ACC-S5732"))) == 1)
+    links = {}
+    asn.build_descr_links({
+        "AC1": {22: ("Eth-Trunk0", "To CE6881-Eth-Trunk 10")},
+        "HSDJ-47-CORE-CE6881": {111: ("Eth-Trunk-0", "To AC-1 Eth-Trunk-0"),
+                                112: ("10GE2/0/42", "To Outdoor SW - 192.168.11.18")},
+        "HSDJ-46-ACC-S5732-2": {55: ("25GE0/0/1", ""), "56": ("GE1/0/9", "会议室AP")},
+    }, ["AC1", "HSDJ-47-CORE-CE6881", "HSDJ-46-ACC-S5732-2"], links)
+    check("AC1 uplink descr -> core", links.get(("AC1", 22)) == "HSDJ-47-CORE-CE6881", str(links))
+    check("core 'To AC-1' -> AC1", links.get(("HSDJ-47-CORE-CE6881", 111)) == "AC1", str(links))
+    check("unmanaged outdoor descr matches nothing",
+          ("HSDJ-47-CORE-CE6881", 112) not in links, str(links))
+    check("ambiguous s5732 token skipped",
+          not any(k[0] == "HSDJ-46-ACC-S5732-2" for k in links), str(links))
+    # 19.104 case: every hit is transit; owner CORE must NOT win the toward pick
+    hits = [("HSDJ-47-CORE-CE6881", {"ifIndex": 111, "ifName": "Eth-Trunk-0",
+                                      "ifDescr": "To AC-1 Eth-Trunk-0"}),
+            ("AC1", {"ifIndex": 22, "ifName": "Eth-Trunk0",
+                     "ifDescr": "To CE6881-Eth-Trunk 10"})]
+    loc = asn.resolve_location(hits, links, {}, l3_owner="HSDJ-47-CORE-CE6881")
+    check("STA resolves toward the AC, not the gateway",
+          loc == ("toward", "AC1"), str(loc))
+    loc = asn.resolve_location(hits, links, {}, l3_owner="AC1")
+    check("...but toward CORE when CORE is not the owner",
+          loc == ("toward", "HSDJ-47-CORE-CE6881"), str(loc))
+
+
+def test_self_mac_links_and_location():
+    print("[11] selfmac adjacency / fanout / resolve_location")
+    check("plausible_self_mac filters vrrp/zero",
+          not asn.plausible_self_mac("00-00-5e-00-01-01")
+          and not asn.plausible_self_mac("00-00-00-00-00-00")
+          and asn.plausible_self_mac("68-77-24-35-ad-c4"))
+    r = FakeRedis()
+    r.sadd("SW::SELFMAC::B", "bb-bb-bb-00-00-01")
+    r.sadd("SW::SELFMAC::A", "aa-aa-aa-00-00-01")
+    r.hset("MAC::TABLE::A", "bb-bb-bb-00-00-01",
+           json.dumps({"ifIndex": 22, "ifName": "25GE0/0/1"}))
+    r.hset("MAC::TABLE::B", "host-mac-1", json.dumps({"ifIndex": 5, "ifName": "GE1/0/24"}))
+    r.hset("SW::PORTFAN::A", "22", "300")
+    links, fan = asn.load_switch_links(r, ["A", "B"])
+    check("adjacency from learned self mac", links.get(("A", 22)) == "B", str(links))
+    check("fanout loaded", fan.get(("A", 22)) == 300, str(fan))
+    loc = asn.resolve_location(
+        [("A", {"ifIndex": 22, "ifName": "25GE0/0/1"}),
+         ("B", {"ifIndex": 5, "ifName": "GE1/0/24"})], links, fan)
+    check("transit excluded -> final on B", loc == ("final", "B", "GE1/0/24", ""), str(loc))
+    loc = asn.resolve_location([("A", {"ifIndex": 22, "ifName": "25GE0/0/1"})], links, fan)
+    check("all-transit -> toward neighbour (19.104 case)", loc == ("toward", "B"), str(loc))
+    loc = asn.resolve_location([("X", {"ifIndex": 1, "ifName": "25GE0/0/2"}),
+                                ("Y", {"ifIndex": 2, "ifName": "GE1/0/9"})],
+                               {}, {("X", 1): 120})
+    check("high-fanout unnamed port loses to access port (28.6 case)",
+          loc[0] == "final" and loc[1] == "Y", str(loc))
+    loc = asn.resolve_location([("X", {"ifIndex": 1, "ifName": "25GE0/0/2"})],
+                               {}, {("X", 1): 120})
+    check("lone high-fanout hit still kept after relax", loc[0] == "final", str(loc))
+    fr = FakeRedis()
+    pol = asn.SwitchPoller("swA", walker_from({}), redis_client=fr)
+    pol.interfaces = {1: {"ifPhys": "aa-aa-aa-00-00-01"},
+                      2: {"ifPhys": "00-00-5e-00-01-02"}}
+    pol.bridge_mac = "aa-aa-aa-00-00-09"
+    pol.store_self_macs()
+    sm = fr.smembers("SW::SELFMAC::swA")
+    check("collector exports SELFMAC (own only)",
+          sm == {"aa-aa-aa-00-00-01", "aa-aa-aa-00-00-09"}, str(sm))
+
+
 if __name__ == "__main__":
     for t in (test_mac_format, test_arp_std_parse, test_hw_arp_parse,
               test_cisco_arp_and_qbridge,
+              test_descr_adjacency_and_owner,
+              test_self_mac_links_and_location,
               test_hw_arp_l3_ifindex_regression, test_interface_and_mac_table, test_redis_key_layout_and_sysname_fallback,
               test_dhcp_callback_missing_mac, test_status_heartbeat,
               test_wlan_sta_parse_and_merge, test_oid_mac_and_skip_zero_ip,

@@ -39,7 +39,7 @@ from nftable_router import proxy_mgr as pmm
 from nftable_router import udp_tproxy as utp
 from nftable_router.webadmin_svc import WebadminService
 from nftable_router.arp_svc import ArpCollectorService
-from nftable_router.arp_snmp import pick_mac_port
+from nftable_router.arp_snmp import pick_mac_port, resolve_location, load_switch_links
 from nftable_router.compat import TputFormatter
 import subprocess, urllib, psutil
 from queue import Queue, Empty
@@ -1118,6 +1118,10 @@ def get_term_width():
     return g_term_width
 
 
+def _dec_dev(x):
+    return x.decode("utf-8", "replace") if isinstance(x, (bytes, bytearray)) else str(x)
+
+
 class PrintResultThread(threading.Thread):
     def resolve_src_iface(self, src):
         """Resolve a source IP's physical location via redis ARP::MAPPING +
@@ -1146,19 +1150,34 @@ class PrintResultThread(threading.Thread):
                     except (ValueError, TypeError):
                         continue
                     sw = dev[12:] if isinstance(dev, (bytes, bytearray)) else dev[len("MAC::TABLE::"):]
+                    if isinstance(sw, bytes):
+                        sw = sw.decode("utf-8", "replace")
+                    if not sw:
+                        continue          # legacy empty-sysname junk key
                     hits.append((sw, row))
             if arp_record:
                 if arp_record.get("ifName_L2"):
                     hits.append((arp_record.get("sysname") or "", {
                         "ifName": arp_record["ifName_L2"],
                         "ifDescr": arp_record["ifName_L2"],
+                        "ifIndex": arp_record.get("ifIndex"),
                     }))
                 if arp_record.get("ap_name"):
                     hits.append((arp_record.get("sysname") or "", {
                         "ifName": arp_record["ap_name"],
                         "ifDescr": arp_record["ap_name"],
                     }))
-            picked = pick_mac_port(hits)
+            loc = resolve_location(hits, getattr(self, "sw_links", None),
+                                   getattr(self, "sw_fan", None),
+                                   l3_owner=arp_record.get("sysname") or "")
+            if loc and loc[0] == "toward":
+                nb = loc[1]
+                if re.match(r"^[A-Z]{4}\-[0-9]{2}", nb):
+                    nb = nb[8:]
+                src_interfaces = tf.format("{a:s} {interface:27s,yellow,bold}",
+                                           a="→", interface=nb)
+                return src_interfaces, "→" + nb
+            picked = (loc[1], loc[2], loc[3]) if loc and loc[0] == "final" else None
             if picked:
                 sw, ifName, ifDescr = picked
                 if isinstance(sw, bytes):
@@ -1242,6 +1261,15 @@ class PrintResultThread(threading.Thread):
                         if self.device_list is None or now - getattr(self, "_device_list_ts", 0) > 30:
                             self.device_list = self.r.keys("MAC::TABLE::*")
                             self._device_list_ts = now
+                            try:
+                                _names = []
+                                for _d in self.device_list:
+                                    _n = _dec_dev(_d)[len("MAC::TABLE::"):]
+                                    if _n:
+                                        _names.append(_n)
+                                self.sw_links, self.sw_fan = load_switch_links(self.r, _names)
+                            except Exception:
+                                self.sw_links, self.sw_fan = {}, {}
 
                         # source device location, resolved ONCE per result:
                         # colored -> console column, plain -> pr_stream 'dev'

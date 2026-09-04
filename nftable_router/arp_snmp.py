@@ -42,6 +42,7 @@ Run standalone exactly like the old script (flags are compatible):
 import argparse
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -56,6 +57,8 @@ OID_SYSNAME = "1.3.6.1.2.1.1.5"
 OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
 OID_IF_NAME = "1.3.6.1.2.1.31.1.1.1.1"
 OID_IF_ALIAS = "1.3.6.1.2.1.31.1.1.1.18"
+OID_IF_PHYS = "1.3.6.1.2.1.2.2.1.6"
+OID_BRIDGE_ADDR = "1.3.6.1.2.1.17.1.2.0"
 OID_IF_MTU = "1.3.6.1.2.1.2.2.1.4"
 OID_IF_SPEED = "1.3.6.1.2.1.2.2.1.5"
 OID_IF_ADMIN = "1.3.6.1.2.1.2.2.1.7"
@@ -89,6 +92,7 @@ INTERFACE_KEYS = {
     "1.3.6.1.2.1.2.2.1.5.": "ifSpeed",
     "1.3.6.1.2.1.2.2.1.7.": "ifAdminStatus",
     "1.3.6.1.2.1.2.2.1.8.": "ifOperStatus",
+    "1.3.6.1.2.1.2.2.1.6.": "ifPhys",
 }
 MAC_KEYS = {
     "1.3.6.1.2.1.17.4.3.1.1.": "mac",
@@ -223,6 +227,174 @@ def pick_mac_port(hits):
     return best[1], best[2], best[3]
 
 
+def plausible_self_mac(m):
+    if not m or len(m) != 17:
+        return False
+    if m == "00-00-00-00-00-00" or m.startswith("00-00-5e-00-01") \
+            or m.startswith("00-00-94"):
+        return False      # zero / VRRP / HSRP virtual macs are NOT the box itself
+    return True
+
+
+def _dec(x):
+    return x.decode("utf-8", "replace") if isinstance(x, (bytes, bytearray)) else str(x)
+
+
+_TOKEN_STOP = ("hsdj", "acc", "core", "sw", "to", "uplink", "eth", "trunk",
+               "vlan", "vlanif", "ge", "xge", "25ge", "10ge", "ce", "ac", "nas")
+
+
+def switch_name_tokens(name):
+    """Distinctive lowercase alnum tokens of a managed sysname that can be
+    matched inside port descriptions ('To AC-1 ...' -> ac1, 'To SW1-CE6881'
+    -> ce6881/s...). Generic role words and short junk are dropped."""
+    toks = []
+    for part in re.split(r"[^A-Za-z0-9]+", name):
+        t = part.lower()
+        if len(t) >= 2 and t not in _TOKEN_STOP and not t.isdigit():
+            toks.append(t)
+    return toks
+
+
+def build_descr_links(mac_tables_rows, names, links):
+    """(sw, ifIndex) -> neighbour when the port DESCRIPTION names another
+    managed switch -- complements self-mac adjacency for boxes whose
+    ifPhysAddress comes back empty (Huawei WLAN ACs)."""
+    owner_of = {}
+    for n in names:
+        for t in switch_name_tokens(n):
+            owner_of.setdefault(t, set()).add(n)
+    for n, rows in mac_tables_rows.items():
+        for ii, (ifName, descr) in rows.items():
+            if (n, ii) in links:
+                continue
+            hay = re.sub(r"[^a-z0-9]", "", ("%s %s" % (ifName, descr)).lower())
+            for t, owners in owner_of.items():
+                if len(owners) != 1:
+                    continue          # ambiguous token (two S5732s) - skip
+                owner = next(iter(owners))
+                if owner == n or t not in hay:
+                    continue
+                links[(n, ii)] = owner
+                break
+    return links
+
+
+def load_switch_links(r, names):
+    """-> (links, fan)
+    links: (switch, ifIndex) -> neighbour switch whose SELF MAC was learned
+    on that port, OR whose name token appears in the port description
+    (i.e. the port points INTO that switch's direction);
+    fan:   (switch, ifIndex) -> mac count (anonymous, label-free trunk hint)."""
+    links = {}
+    fan = {}
+    if r is None or not names:
+        return links, fan
+    own = {}
+    for n in names:
+        try:
+            for m in (r.smembers("SW::SELFMAC::%s" % n) or set()):
+                own[_dec(m)] = n
+        except Exception:
+            pass
+    for n in names:
+        for m, owner in own.items():
+            if owner == n:
+                continue
+            try:
+                raw = r.hget("MAC::TABLE::%s" % n, m)
+            except Exception:
+                continue
+            if not raw:
+                continue
+            try:
+                row = json.loads(_dec(raw))
+            except ValueError:
+                continue
+            ii = row.get("ifIndex")
+            if ii is not None:
+                try:
+                    links[(n, int(ii))] = owner
+                except (TypeError, ValueError):
+                    pass
+        try:
+            for k, v in (r.hgetall("SW::PORTFAN::%s" % n) or {}).items():
+                try:
+                    fan[(n, int(_dec(k)))] = int(_dec(v))
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+    try:
+        descr_rows = {}
+        for n in names:
+            got = {}
+            for mac, raw in (r.hgetall("MAC::TABLE::%s" % n) or {}).items():
+                try:
+                    row = json.loads(_dec(raw))
+                except ValueError:
+                    continue
+                ii = row.get("ifIndex")
+                if ii is None:
+                    continue
+                got[int(ii)] = (row.get("ifName", ""), row.get("ifDescr", ""))
+            descr_rows[n] = got
+        build_descr_links(descr_rows, names, links)
+    except Exception:
+        pass
+    return links, fan
+
+
+def resolve_location(hits, links=None, fan=None, fan_trunk=50, l3_owner=None):
+    """Multi-switch arbitration for one MAC.
+    -> ('final', sysname, ifName, ifDescr)  : most specific real access/edge port
+    -> ('toward', neighbour)                : every hit is a transit port into a
+                                               known switch -- the host lives
+                                               BEYOND that neighbour (e.g. a
+                                               wireless STA behind 'To AC-1')
+    -> None
+    Transit rules: (a) port learned a managed switch's own MAC => points to it;
+    (b) port description names another managed switch => points to it;
+    (c) unlabeled high-fanout physical port (>= fan_trunk MACs) => suspected
+    uplink, only used when nothing better exists.
+    l3_owner: the switch that owns the ARP entry (the gateway) carries no new
+    info as a toward-candidate -- prefer other directions when picking."""
+    links = links or {}
+    fan = fan or {}
+
+    def classify(strict):
+        real = []
+        toward = []
+        for sw, row in hits:
+            if not row:
+                continue
+            ii = row.get("ifIndex")
+            nb = links.get((sw, ii)) if ii is not None else None
+            if nb:
+                toward.append(nb)
+                continue
+            if strict and ii is not None and fan.get((sw, ii), 0) >= fan_trunk \
+                    and rank_mac_port(row.get("ifName", ""), row.get("ifDescr", "")) >= 3:
+                continue
+            real.append((sw, row))
+        return real, toward
+
+    real, toward = classify(True)
+    picked = pick_mac_port(real)
+    if picked:
+        return ("final",) + picked
+    real, toward2 = classify(False)
+    picked = pick_mac_port(real)
+    if picked:
+        return ("final",) + picked
+    cands = [t for t in sorted(set(toward + toward2)) if t != l3_owner]
+    if cands:
+        return ("toward", cands[0])
+    if toward or toward2:
+        return ("toward", sorted(set(toward + toward2))[0])
+    return None
+
+
 class SwitchPoller:
     """One switch. `walk(oid, callback)` is injected so the whole parsing
     layer is testable without a live switch (see test_arp_snmp.py)."""
@@ -245,6 +417,7 @@ class SwitchPoller:
         self.vendor = ""        # "" | huawei | huawei-vrp | cisco
         self.qFdb = {}
         self.qFdbStatus = {}
+        self.bridge_mac = ""
         self.sysname = ""
         self.stopping = False
         self.last_error = None
@@ -291,6 +464,12 @@ class SwitchPoller:
                     return
                 slot = self.interfaces.setdefault(intIndex, {})
                 val = varBind[1]
+                if field == "ifPhys":
+                    try:
+                        slot[field] = mac_str(val.asNumbers())
+                    except Exception:
+                        pass
+                    return
                 if hasattr(val, "asOctets"):
                     try:
                         slot[field] = val.asOctets().decode("utf-8")
@@ -387,6 +566,12 @@ class SwitchPoller:
     def assignSysName(self, varBind):
         self.sysname = str(varBind[1])
 
+    def assignBridge(self, varBind):
+        try:
+            self.bridge_mac = mac_str(varBind[1].asNumbers())
+        except Exception:
+            pass
+
     def checkVendor(self, varBind):
         oid = str(getattr(varBind[1], "prettyOid", lambda: 0)() or "") or str(varBind[1])
         if oid.startswith("1.3.6.1.4.1.9"):
@@ -435,10 +620,12 @@ class SwitchPoller:
             self.vendor = "huawei-vrp" if self.isVRP else "huawei"
         self.walk(OID_IF_DESCR, self.interfaceDataCallback)
         self.walk(OID_IF_NAME, self.interfaceDataCallback)
+        self.walk(OID_IF_PHYS, self.interfaceDataCallback)
+        self.walk(OID_BRIDGE_ADDR, self.assignBridge)
 
     def refresh_interfaces(self):
         for oid in (OID_IF_MTU, OID_IF_SPEED, OID_IF_ADMIN, OID_IF_OPER,
-                    OID_IF_NAME, OID_IF_ALIAS):
+                    OID_IF_NAME, OID_IF_ALIAS, OID_IF_PHYS):
             self.walk(oid, self.interfaceDataCallback)
 
     def store_interfaces(self):
@@ -446,6 +633,31 @@ class SwitchPoller:
             return
         for intIndex, data in self.interfaces.items():
             self.r.hset("SW::INT::%s" % self.key_suffix(), intIndex, json.dumps(data))
+
+    def store_self_macs(self):
+        """SW::SELFMAC::<name>: MACs that belong to this switch itself
+        (port phys addrs + bridge addr). Another switch learning one of
+        these on a port means THAT port is the link toward this switch --
+        exactly what resolve_location needs to stop presenting uplink
+        trunks as a host's final access port."""
+        if self.r is None:
+            return
+        macs = set()
+        for d in self.interfaces.values():
+            m = d.get("ifPhys")
+            if plausible_self_mac(m):
+                macs.add(m)
+        if plausible_self_mac(self.bridge_mac):
+            macs.add(self.bridge_mac)
+        key = "SW::SELFMAC::%s" % self.key_suffix()
+        try:
+            if macs:
+                self.r.delete(key)
+                self.r.sadd(key, *sorted(macs))
+            else:
+                self.r.delete(key)
+        except Exception:
+            pass
 
     def poll_mac_table(self):
         self.macTable = {}
@@ -482,6 +694,19 @@ class SwitchPoller:
                     blob["vlan"] = row["vlan"]
                 self.r.hset("MAC::TABLE::%s" % self.key_suffix(), row["mac"], json.dumps(blob))
             stored += 1
+        fan = {}
+        for row in self.macTable.values():
+            ii = row.get("ifIndex")
+            if ii is not None and row.get("mac"):
+                fan[ii] = fan.get(ii, 0) + 1
+        if self.r is not None:
+            try:
+                k = "SW::PORTFAN::%s" % self.key_suffix()
+                self.r.delete(k)
+                for ii, n in fan.items():
+                    self.r.hset(k, str(ii), str(n))
+            except Exception:
+                pass
         return stored
 
     def poll_dhcp(self):
@@ -737,6 +962,7 @@ class SwitchPoller:
         try:
             self.probe_identity()
             self.store_interfaces()
+            self.store_self_macs()
             self.publish_status("running")
             self.log("[%s] sysname=%s vrp=%s interfaces=%d" % (
                 self.name, self.sysname, self.isVRP, len(self.interfaces)))
@@ -753,6 +979,7 @@ class SwitchPoller:
                 try:
                     self.refresh_interfaces()
                     self.store_interfaces()
+                    self.store_self_macs()
                 except Exception as e:
                     self.last_error = "%s: %s" % (type(e).__name__, e)
                     self.log("[%s] interface refresh error: %s" % (self.name, self.last_error))
