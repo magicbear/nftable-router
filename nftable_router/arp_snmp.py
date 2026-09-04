@@ -12,6 +12,9 @@ PrintResultThread / webadmin "源设备" lookups keep working as-is:
   ARP::MAPPING::<sysname>   hash ip      -> {mac, ifIndex, sysname, ifName_L3, ...}
   ARP::MAPPING              hash ip      -> same (merged view across switches)
 
+Cisco IOS/IOS-XE (sysObjectID under enterprise 9): ARP via RFC4293
+ipNetToPhysical when present, legacy ipNetToMedia otherwise (both walked,
+rows merge); MAC table additionally via Q-BRIDGE so non-default VLANs show.
 Huawei WLAN AC (HUAWEI-WLAN-STATION-MIB hwWlanStationTable) is the same
 collector: STA IP/MAC/AP name/SSID/VLAN are merged into ARP::MAPPING with
 source=wlan, and MAC::TABLE::<ac> so the flow view's 源设备 shows
@@ -58,6 +61,14 @@ OID_IF_SPEED = "1.3.6.1.2.1.2.2.1.5"
 OID_IF_ADMIN = "1.3.6.1.2.1.2.2.1.7"
 OID_IF_OPER = "1.3.6.1.2.1.2.2.1.8"
 OID_MAC_PORT_IFINDEX = "1.3.6.1.2.1.17.1.4.1.2"
+# --- Cisco (enterprise 9: IOS / IOS-XE / NX-OS) ---------------------------
+OID_SYSOBJID = "1.3.6.1.2.1.1.2.0"
+# ipNetToMediaTable (RFC4293-pre IOS: 12.2/15.x): index ifIndex.a.b.c.d,
+# cols 2=phys 3=netaddr 4=type(3 dynamic/4 static)
+OID_CISCO_MEDIA = "1.3.6.1.2.1.4.22.1"
+# Q-BRIDGE-MIB fdb: index vlan.o1..o6 ; col 2=port(dot1dBasePort space)
+# 3=status(3 learned/4 self). dot1d alone only shows the default VLAN.
+OID_Q_TP_FDB = "1.3.6.1.2.1.17.7.1.2.2"
 OID_MAC_TABLE = "1.3.6.1.2.1.17.4.3.1"
 OID_DHCPS_POOL_NAME = "1.3.6.1.4.1.2011.5.7.2.1.1.1."
 OID_DHCPS_POOL_CFG = "1.3.6.1.4.1.2011.5.7.2.1.2.1."
@@ -231,6 +242,9 @@ class SwitchPoller:
         self.ipPools = {}
         self.staList = {}
         self.isVRP = False
+        self.vendor = ""        # "" | huawei | huawei-vrp | cisco
+        self.qFdb = {}
+        self.qFdbStatus = {}
         self.sysname = ""
         self.stopping = False
         self.last_error = None
@@ -373,6 +387,11 @@ class SwitchPoller:
     def assignSysName(self, varBind):
         self.sysname = str(varBind[1])
 
+    def checkVendor(self, varBind):
+        oid = str(getattr(varBind[1], "prettyOid", lambda: 0)() or "") or str(varBind[1])
+        if oid.startswith("1.3.6.1.4.1.9"):
+            self.vendor = "cisco"
+
     def checkVRP(self, varBind):
         self.isVRP = str(varBind[1]) == "VRP"
 
@@ -409,8 +428,11 @@ class SwitchPoller:
         """sysName + VRP flavour + interface list. Determines which ARP MIB
         to walk and what the redis key suffix will be."""
         self.isVRP = False
+        self.walk(OID_SYSOBJID, self.checkVendor)
         self.walk(OID_VRP_PROBE, self.checkVRP)
         self.walk(OID_SYSNAME, self.assignSysName)
+        if not self.vendor:
+            self.vendor = "huawei-vrp" if self.isVRP else "huawei"
         self.walk(OID_IF_DESCR, self.interfaceDataCallback)
         self.walk(OID_IF_NAME, self.interfaceDataCallback)
 
@@ -430,6 +452,22 @@ class SwitchPoller:
         self.macPortIndex = {}
         self.walk(OID_MAC_PORT_IFINDEX, self.macTableDataCallback)
         self.walk(OID_MAC_TABLE, self.macTableDataCallback)
+        if self.vendor == "cisco":
+            # dot1dTpFdb on a multi-VLAN switch only shows the default
+            # bridge; Q-BRIDGE gives every (vlan,mac)->port. port numbers
+            # share the dot1dBasePort space -> existing macPortIndex maps.
+            self.qFdb = {}
+            self.qFdbStatus = {}
+            self.walk(OID_Q_TP_FDB + ".1.2", self.qBridgeCallback)
+            self.walk(OID_Q_TP_FDB + ".1.3", self.qBridgeCallback)
+            for (vlan, mac), port in self.qFdb.items():
+                if self.qFdbStatus.get((vlan, mac)) not in (3, 4):
+                    continue
+                row = self.macTable.setdefault("q%d.%s" % (vlan, mac), {})
+                row["mac"] = mac
+                row["vlan"] = vlan
+                if port in self.macPortIndex:
+                    row["ifIndex"] = self.macPortIndex[port]
         stored = 0
         for index, row in self.macTable.items():
             if "ifIndex" not in row or "mac" not in row:
@@ -437,23 +475,106 @@ class SwitchPoller:
             ifIndex = row["ifIndex"]
             iface = self.interfaces.get(ifIndex, {})
             if self.r is not None:
-                self.r.hset("MAC::TABLE::%s" % self.key_suffix(), row["mac"], json.dumps({
-                    "ifIndex": ifIndex,
-                    "ifName": iface.get("ifName", ""),
-                    "ifDescr": iface.get("ifDescr", ""),
-                }))
+                blob = {"ifIndex": ifIndex,
+                        "ifName": iface.get("ifName", ""),
+                        "ifDescr": iface.get("ifDescr", "")}
+                if row.get("vlan"):
+                    blob["vlan"] = row["vlan"]
+                self.r.hset("MAC::TABLE::%s" % self.key_suffix(), row["mac"], json.dumps(blob))
             stored += 1
         return stored
 
     def poll_dhcp(self):
-        if self.isVRP:
+        if self.isVRP or self.vendor == "cisco":
             return
         for oid in (OID_DHCPS_POOL_NAME, OID_DHCPS_POOL_CFG,
                     OID_DHCPS_INUSE_IP, OID_DHCPS_INUSE_POOL):
             self.walk(oid, self.dhcpsCallback)
 
+    def ciscoPhyArpCallback(self, varBind):
+        """RFC4293 ipNetToPhysical (IOS-XE 16+ / NX-OS): row index is
+        ifIndex . mac(6) . addrType . addr(N) and the LAST subid is the
+        column (4=physAddress, 5=netToMediaType)."""
+        # row OID = entry . col . ifIndex . mac(6) . addrType . addr(N)
+        toks = str(varBind[0])[len(OID_ARP_STD) + 1:].split(".")
+        if len(toks) < 10:
+            return
+        col = toks[0]
+        if col not in ("4", "5"):
+            return
+        try:
+            ifIndex = int(toks[1])
+            atype = int(toks[8])
+        except ValueError:
+            return
+        n = {1: 4, 2: 16}.get(atype)
+        if n is None or len(toks) != 9 + n:
+            return
+        if atype == 1:
+            ip = ".".join(toks[9:13])
+        else:
+            ip = ":".join("%02x%02x" % (int(toks[9 + i]), int(toks[10 + i]))
+                          for i in range(0, 16, 2))
+        entry = self.arpList.setdefault(ip, {"interface": ifIndex})
+        if col == "4":
+            try:
+                entry["mac"] = mac_str(varBind[1].asNumbers())
+            except Exception:
+                pass
+        elif col == "5":
+            try:
+                entry["Type"] = int(varBind[1])
+            except Exception:
+                pass
+
+    def ciscoMediaArpCallback(self, varBind):
+        """legacy ipNetToMedia (pre-XE IOS): row index is ifIndex . a.b.c.d,
+        col 2=phys 4=type; a real value only, netAddress(col3) skipped."""
+        toks = str(varBind[0])[len(OID_CISCO_MEDIA) + 1:].split(".")
+        # row OID = entry . col . ifIndex . a.b.c.d  (6 subids)
+        if len(toks) != 6:
+            return
+        col = toks[0]
+        if col not in ("2", "4"):
+            return
+        ip = ".".join(toks[2:6])
+        try:
+            ifIndex = int(toks[1])
+        except ValueError:
+            return
+        entry = self.arpList.setdefault(ip, {"interface": ifIndex})
+        if col == "2" and hasattr(varBind[1], "asNumbers"):
+            entry["mac"] = mac_str(varBind[1].asNumbers())
+        elif col == "4":
+            try:
+                entry["Type"] = int(varBind[1])
+            except Exception:
+                pass
+
+    def qBridgeCallback(self, varBind):
+        # row OID = table . 1 . col . vlan . mac(6)  (prefix = table oid)
+        toks = str(varBind[0])[len(OID_Q_TP_FDB) + 1:].split(".")
+        if len(toks) != 9 or toks[0] != "1" or toks[1] not in ("2", "3"):
+            return
+        col = toks[1]
+        try:
+            vlan = int(toks[2])
+            mac = mac_str([int(x) for x in toks[3:9]])
+        except ValueError:
+            return
+        try:
+            val = int(varBind[1])
+        except Exception:
+            return
+        (self.qFdb if col == "2" else self.qFdbStatus)[(vlan, mac)] = val
+
     def poll_arp(self):
-        if self.isVRP:
+        if self.vendor == "cisco":
+            # XE boxes answer only .35, old IOS only .22; walking both is
+            # cheap and rows merge by IP.
+            self.walk(OID_ARP_STD, self.ciscoPhyArpCallback)
+            self.walk(OID_CISCO_MEDIA, self.ciscoMediaArpCallback)
+        elif self.isVRP:
             self.walk(OID_ARP_STD, self.arpCallback)
         else:
             self.walk(OID_ARP_HW, self.hwArpTableDataCallback)

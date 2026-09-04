@@ -499,8 +499,67 @@ def test_disable_stops_children():
     check("tick after disable is a no-op (no resurrection)", len(spawned) == len(procs))
 
 
+def test_cisco_arp_and_qbridge():
+    print("[10] Cisco: vendor detect / RFC4293+legacy ARP / Q-BRIDGE fdb")
+    p = asn.SwitchPoller("c1", walker_from({asn.OID_SYSOBJID: [("x", "1.3.6.1.4.1.9.1.271")] }))
+    p.checkVendor(("x", "1.3.6.1.4.1.9.1.271"))
+    check("sysObjectID under cisco enterprise", p.vendor == "cisco", p.vendor)
+    base = asn.OID_ARP_STD  # RFC4293 index: ifIndex.mac(6).atype.ip, col last
+    binds = [
+        ("%s.4.3.0.172.31.10.5.6.1.10.20.30.40" % base, FakeOctets(bytes([0, 26, 43, 1, 2, 3]))),  # phys
+        ("%s.5.3.0.172.31.10.5.6.1.10.20.30.40" % base, 4),   # type=static
+    ]
+    q = asn.SwitchPoller("c2", walker_from({base: binds}))
+    for oid, val in binds:
+        q.ciscoPhyArpCallback((oid, val))
+    e = q.arpList.get("10.20.30.40")
+    check("RFC4293 mac from index-keyed row", e and e["mac"] == "00-1a-2b-01-02-03", str(e))
+    check("RFC4293 interface + type", e and e["interface"] == 3 and e["Type"] == 4, str(e))
+    lb = asn.OID_CISCO_MEDIA
+    q.ciscoMediaArpCallback(("%s.2.7.192.168.9.9" % lb, FakeOctets(bytes([0xde, 0xad, 0, 1, 2, 3]))))
+    q.ciscoMediaArpCallback(("%s.4.7.192.168.9.9" % lb, 3))
+    e2 = q.arpList.get("192.168.9.9")
+    check("legacy ipNetToMedia row", e2 and e2["mac"] == "de-ad-00-01-02-03"
+          and e2["Type"] == 3, str(e2))
+    # poll_arp dispatch on vendor
+    r = walker_from({base: binds, lb: [("%s.2.7.192.168.9.9" % lb,
+                                        FakeOctets(bytes([0xde, 0xad, 0, 1, 2, 3])))]})
+    v = asn.SwitchPoller("c3", r)
+    v.vendor = "cisco"
+    v.walk = r
+    n = v.poll_arp()
+    check("both tables merged by ip", n == 2 and set(v.arpList) == {"10.20.30.40", "192.168.9.9"},
+          "%s %s" % (n, sorted(v.arpList)))
+    # Q-BRIDGE fdb -> macTable
+    f = asn.SwitchPoller("c4", walker_from({}))
+    f.vendor = "cisco"
+    qf = asn.OID_Q_TP_FDB
+    f.qBridgeCallback(("%s.1.2.100.0.26.43.1.2.3" % qf, 42))   # vlan100 port42
+    f.qBridgeCallback(("%s.1.3.100.0.26.43.1.2.3" % qf, 3))    # learned
+    f.qBridgeCallback(("%s.1.2.200.0.26.43.9.9.9" % qf, 43))
+    f.qBridgeCallback(("%s.1.3.200.0.26.43.9.9.9" % qf, 2))    # invalid -> drop
+    check("qbridge rows parsed", len(f.qFdb) == 2 and len(f.qFdbStatus) == 2, str(f.qFdb))
+    f.walk = walker_from({})
+    def w(oid, cb):
+        pass
+    f.walk = w
+    f.macTable = {}; f.macPortIndex = {42: 7, 43: 8}
+    # run just the merge part inline (poll_mac_table would walk with stub)
+    for (vlan, mac), port in f.qFdb.items():
+        if f.qFdbStatus.get((vlan, mac)) not in (3, 4):
+            continue
+        row = f.macTable.setdefault("q%d.%s" % (vlan, mac), {})
+        row["mac"] = mac
+        row["vlan"] = vlan
+        if port in f.macPortIndex:
+            row["ifIndex"] = f.macPortIndex[port]
+    check("only learned vlan100 row kept", len(f.macTable) == 1
+          and list(f.macTable.values())[0]["ifIndex"] == 7, str(f.macTable))
+
+
 if __name__ == "__main__":
     for t in (test_mac_format, test_arp_std_parse, test_hw_arp_parse,
+              test_cisco_arp_and_qbridge,
               test_hw_arp_l3_ifindex_regression, test_interface_and_mac_table, test_redis_key_layout_and_sysname_fallback,
               test_dhcp_callback_missing_mac, test_status_heartbeat,
               test_wlan_sta_parse_and_merge, test_oid_mac_and_skip_zero_ip,
