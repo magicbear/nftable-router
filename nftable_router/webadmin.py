@@ -1488,6 +1488,19 @@ def bw_loop():
             pass
 
 
+def status_loop(app):
+    """push t=status every ~4s while anyone is attached; health_snapshot
+    itself can take seconds on loaded hosts (psutil scan) -- that is fine,
+    the cadence just stretches, nothing polls it from the browser anymore."""
+    while True:
+        time.sleep(4)
+        try:
+            if _MTR_HUB.count() or app.hub.count():
+                _mtr_broadcast(dict(health_snapshot(app), t="status"))
+        except Exception:
+            pass
+
+
 def bw_start():
     if _bw_thread[0] is None:
         _bw_thread[0] = threading.Thread(target=bw_loop, daemon=True, name="bwsamp")
@@ -2583,6 +2596,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             conn.sendall(ws_encode(json.dumps({"t": "hello", "server": "nft-route webadmin"})))
             conn.sendall(ws_encode(json.dumps({"t": "snap", "rows": self.app.ring.snapshot()})))
+            try:                    # first status frame right on connect (no
+                conn.sendall(ws_encode(json.dumps(   # more polls from the client)
+                    dict(health_snapshot(self.app), t="status")).encode()))
+            except Exception:
+                pass
             closed = False
             while not closed:
                 r, w, _ = select.select([conn], [conn] if pending else [], [], 0.05)
@@ -2681,6 +2699,7 @@ def main(argv=None):
     app = App(args)
     app.streamer.start()
     bw_start()
+    threading.Thread(target=status_loop, args=(app,), daemon=True, name="statuspush").start()
     Handler.app = app
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print("[webadmin] http://%s:%d  config=%s  redis=%s:%d/%d stream=on" % (

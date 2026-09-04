@@ -423,13 +423,21 @@ def test_server_e2e():
                 time.sleep(0.05)
             p = wa.WSParser()
             frames = p.feed(rest) if rest else []   # do NOT drop the bytes that trailed the 101 header
-            deadline = time.time() + 2
-            while len(frames) < 2 and time.time() < deadline:
-                s.settimeout(1)
+            deadline = time.time() + 12   # health_snapshot can be slow under
+            def has(tname):               # load on dev boxes (psutil scan)
+                for _, pl in frames:
+                    try:
+                        if json.loads(pl).get("t") == tname:
+                            return True
+                    except ValueError:
+                        pass
+                return False
+            while time.time() < deadline and not (has("hello") and has("snap") and has("status")):
+                s.settimeout(0.5)
                 try:
                     data = s.recv(4096)
                 except socket.timeout:
-                    break
+                    continue
                 if not data:
                     break
                 frames += p.feed(data)
@@ -440,11 +448,34 @@ def test_server_e2e():
                 except ValueError:
                     kinds.append("?")
             check("hello + snap(frames) received", "hello" in kinds and "snap" in kinds, str(kinds))
+            check("status frame pushed on connect (no polling)", "status" in kinds, str(kinds))
+
+            def read_rows(timeout=6):
+                """collect DATA frames, skipping any interleaved push frames
+                (status/bw/mtr/ping/iftop/gap) the server now streams freely"""
+                out = []
+                end = time.time() + timeout
+                while time.time() < end and not out:
+                    s.settimeout(max(0.1, end - time.time()))
+                    try:
+                        data = s.recv(4096)
+                    except socket.timeout:
+                        break
+                    if not data:
+                        break
+                    for op, pl in p.feed(data):
+                        try:
+                            if json.loads(pl).get("t", "row") in ("hello", "snap", "status",
+                                                                  "bw", "mtr", "ping", "iftop", "gap"):
+                                continue
+                        except ValueError:
+                            pass
+                        out.append((op, pl))
+                return out
             # broadcast live event through hub queue
             app.hub.broadcast(json.dumps({"proto": 6, "src": "9.9.9.9", "dst": "8.8.8.8",
                                           "mark": 51, "sess": 0, "ts": time.time(), "ms": 0.1}).encode())
-            data = s.recv(4096)
-            got = p.feed(data)
+            got = read_rows()
             row = json.loads(got[0][1]) if got and got[0][0] == 1 else {}
             check("live event streamed to client", row.get("src") == "9.9.9.9", str(got)[:60])
             # client close frame -> handler cleans up

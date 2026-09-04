@@ -4,7 +4,7 @@ function lvl(v){if(v==null||isNaN(v))return"⚫";if(v<0)return"🔴";if(v<=0)ret
 function ago(t){if(t==null)return"-";var s=Math.max(0,Date.now()/1000-t);
  return s<90?Math.round(s)+"s前":s<5400?Math.round(s/60)+"m前":Math.round(s/3600)+"h前"}
 function tdTb(tbl,rows){var t=$(tbl);t.innerHTML="";if(t.tHead)t.tHead.remove();return t}
-function loadInfo(){api("/api/health").then(function(d){
+function infoRender(d){
  var cm=d.config_mtime, lr=d.last_reload;
  var stale_ui=localStorage.getItem("nft_dirty")==="1";
  var stale=(cm&&(!lr||cm>lr))||stale_ui;
@@ -81,7 +81,9 @@ function loadInfo(){api("/api/health").then(function(d){
   ext.map(function(e){return[e.pid,(e.ppid!=null?("ppid "+e.ppid+(e.ppname?" ("+e.ppname+")":"")):""),e.user,e.cmd]}));
  else $("i-ext").innerHTML="";
  if(d.error){var er=el("div","bad","health: "+d.error);$("i-master").appendChild(er)}
- }).catch(function(e){$("i-round").textContent="health 加载失败: "+e})}
+}
+function loadInfo(pre){if(pre&&pre.webadmin){infoRender(pre);return}
+ api("/api/health").then(infoRender).catch(function(e){$("i-round").textContent="health 加载失败: "+e})}
 function testLine(name,proto,family,btn){
  var old=btn?btn.textContent:"";
  if(btn){btn.disabled=true;btn.textContent="⋯"}

@@ -127,15 +127,19 @@ function connect(){
   if(m.t=="bw"){if(window.__bw_on)window.__bw_on(m);return}
   if(m.t=="iftop"){if(window.__iftop_on)window.__iftop_on(m);return}
   if(m.t=="ping"){if(window.__ping_on)window.__ping_on(m);return}
+  if(m.t=="status"){if(window.__status_on)window.__status_on(m);return}
   if(m.t=="gap"){window.__gap=(window.__gap||0)+m.n;$("n-evt").textContent=evtTotal+" (丢"+window.__gap+")";return}
   if(m.t=="hello"||!m.dst)return;
   push(m)}}
 
-// ---------- header status dots (master/redis), 4s heartbeat ----------
-setInterval(function(){api("/api/status").then(function(d){
+// ---------- header status dots + info tab: server pushes t=status frames
+// (health_snapshot every 4s while any WS client is attached; one frame
+// immediately on connect). No polling. ----------
+window.__status_on=function(d){if(!d)return;window.__status_last=d;
+ var w=d.webadmin||{};
  $("d-master").className="dot "+(d.master&&d.master.alive&&d.master.is_router?"on":"err");
- $("d-redis").className="dot "+(d.redis_stream?"on":"err");
- if($("s-info").classList.contains("sel"))loadInfo()}).catch(function(){})},4000);
+ $("d-redis").className="dot "+((w.redis_stream!==undefined?w.redis_stream:d.redis_stream)?"on":"err");
+ if($("s-info").classList.contains("sel")&&window.loadInfo)loadInfo(d)};
 
 // ---------- stacked list editor (secondary popup) ----------
 // Edits an array of strings in place; onDone receives the cleaned array
