@@ -1023,7 +1023,20 @@ def _tool_target(body, field="target"):
     return tgt, None
 
 
+def _is_ip_literal(x):
+    try:
+        ipaddress.ip_address(x)
+        return True
+    except ValueError:
+        return False
+
+
 def ping_start(body, cfg):
+    """test-ping.py in the browser: per-line egress-IP probe (DSCP for proxy
+    lines, SO_MARK dig for egress bindings), the line's route table, and a
+    real ping via 'ping -m <mark>' (SO_MARK socket option, root -- no need
+    for markexec here). tproxy/ss-redir lines: egress info only, ICMP cannot
+    ride a redirect proxy so ping is skipped (exactly like test-ping.py)."""
     tgt, err = _tool_target(body)
     if err:
         return {"ok": False, "error": err}
@@ -1038,76 +1051,131 @@ def ping_start(body, cfg):
         return {"ok": False, "error": "一次最多 64 条（防误操作上限，非功能限制）"}
     try:
         count = min(200, max(1, int(body.get("count", 3))))
-        interval = min(5.0, max(0.2, float(body.get("interval", 1))))
+        interval = min(5.0, max(0.1, float(body.get("interval", 0.3))))
         size = min(65000, max(1, int(body.get("size", 56))))
     except (TypeError, ValueError):
         return {"ok": False, "error": "count/interval/size 需为数字"}
-    fam = str(body.get("family", "auto"))
-    jobs, errs = [], []
+    fam_s = str(body.get("family", "auto"))
+    fam = 6 if (fam_s == "6" or (fam_s == "auto" and ":" in tgt)) else 4
+    ip = tgt
+    if not _is_ip_literal(tgt):
+        try:
+            ip = socket.getaddrinfo(tgt, None,
+                                    socket.AF_INET6 if fam == 6 else socket.AF_INET)[0][4][0]
+        except Exception as e:
+            return {"ok": False, "error": "域名解析失败(主路由表): %s" % e}
     all_lines = mtr_line_marks(cfg)
+    jobs, errs = [], []
     for ln in lines:
-        if (all_lines.get(ln) or {}).get("tproxy"):
-            # ss-redir/tproxy lines hijack TCP at the redirect port; marked
-            # ICMP never rides the proxy -- "ping via this line" is meaningless
-            errs.append("%s: tproxy线路不支持ping" % ln)
+        meta = all_lines.get(ln) or {}
+        mark = int(meta.get("mark") or 0)
+        if ln != "default" and not meta:
+            errs.append("%s: 未知线路" % ln)
             continue
-        env, mark, err = _tool_env(cfg, ln)
-        if err:
-            errs.append("%s: %s" % (ln, err))
-            continue
-        argv = ["ping", "-n", "-c", str(count), "-i", str(interval),
-                "-s", str(size), "-W", "2"]
-        if fam == "4":
-            argv.append("-4")
-        elif fam == "6":
-            argv.append("-6")
-        elif ":" in tgt:
-            argv.append("-6")
-        argv.append(tgt)
+        tproxy = bool(meta.get("tproxy"))
+        env = dict(os.environ)
+        if mark:
+            # dig probe rides SO_MARK (box dig is too old for +dscp; test-ping
+            # used DSCP only to select the line -- mark selects it identically,
+            # and for tproxy lines the redirect fires on the mark either way)
+            e2, _m2, err = _tool_env(cfg, ln)
+            if err:
+                errs.append("%s: %s" % (ln, err))
+                continue
+            env = e2
         with PING_LOCK:
             if ping_running[0] >= 64:
                 errs.append("全局并发 ping 已满(64，含其他页面在跑的)，本条未启动")
                 break
             ping_running[0] += 1
             jid = str(next(ping_seq))
-            ping_jobs[jid] = {"id": jid, "status": "running", "target": tgt,
+            ping_jobs[jid] = {"id": jid, "status": "running", "target": tgt, "ip": ip,
                               "line": ln, "mark": mark,
-                              "count": count, "started": time.time(), "out": []}
+                              "tproxy": tproxy, "env": env, "family": fam,
+                              "count": count, "interval": interval, "size": size,
+                              "started": time.time(), "out": []}
             if len(ping_jobs) > 80:
                 for k in sorted(ping_jobs, key=lambda x: ping_jobs[x]["started"])[:len(ping_jobs) - 80]:
                     if ping_jobs[k]["status"] != "running":
                         del ping_jobs[k]
-        threading.Thread(target=ping_job_run, args=(jid, argv, env, count, interval),
-                         daemon=True).start()
-        jobs.append({"id": jid, "line": ln, "mark": mark})
+        threading.Thread(target=ping_line_run, args=(jid,), daemon=True).start()
+        jobs.append({"id": jid, "line": ln, "mark": mark, "tproxy": tproxy})
     if jobs:
         return {"ok": True, "jobs": jobs, "ids": [j["id"] for j in jobs],
                 "errors": errs or None}
     return {"ok": False, "error": "; ".join(errs) or "没有可启动的线路"}
 
 
-def ping_job_run(jid, argv, env, count, interval):
+def _pf(jid, text):
+    j = ping_jobs[jid]
+    j["out"].append(text)
+    _mtr_broadcast({"t": "ping", "id": jid, "ln": j["line"], "out": text})
+
+
+def _dig_egress(j):
+    if j["family"] == 6:
+        args = ["dig", "-6", "myip.opendns.com", "+short", "aaaa",
+                "@resolver1.ipv6-sandbox.opendns.com", "+retry=1", "+timeout=1"]
+    else:
+        args = ["dig", "-4", "myip.opendns.com", "+short",
+                "@resolver1.opendns.com", "+retry=1", "+timeout=1"]
+    args.append("+tcp")
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=8, env=j["env"])
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return r.stdout.strip().splitlines()[-1]
+    except Exception:
+        pass
+    return None
+
+
+def ping_line_run(jid):
     j = ping_jobs[jid]
     t0 = time.time()
-    buf = []
     try:
+        tgt, ip = j["target"], j.get("ip") or j["target"]
+        _pf(jid, "目标: %s%s  Mark: 0x%x" % (
+            ip, (" (" + tgt + ")") if ip != tgt else "", j["mark"]))
+        egress = _dig_egress(j)
+        j["egress"] = egress
+        _pf(jid, "出口IP: %s" % (egress or "CONNECTION ERROR (dig探针失败)"))
+        if j["mark"]:
+            try:
+                rc, out = _ip(["route", "show", "table", str(j["mark"])], timeout=5)
+                route = "\n".join((out or "").strip().splitlines()[:3])[:400]
+            except Exception as e:
+                route = "ip route 失败: %s" % e
+            j["route"] = route
+            for rl in route.splitlines():
+                _pf(jid, "Route: %s" % rl)
+        if j["tproxy"]:
+            j.update({"status": "done", "note": "tproxy线路: ICMP不经代理, 仅出口IP/路由",
+                      "ms": int((time.time() - t0) * 1000)})
+            return
+        argv = ["ping", "-n", "-c", str(j["count"]), "-i", str(j["interval"]),
+                "-s", str(j["size"]), "-W", "2",
+                "-6" if j["family"] == 6 else "-4"]
+        if j["mark"]:
+            argv += ["-m", str(j["mark"])]
+        argv.append(ip)
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             env=env, text=True, bufsize=1)
-        deadline = t0 + count * (interval + 3) + 30
-        for ln in iter(p.stdout.readline, ""):
-            ln = ln.rstrip()
-            buf.append(ln)
-            if len(buf) > 400:
-                del buf[:len(buf) - 400]
-            j["out"] = list(buf)
-            _mtr_broadcast({"t": "ping", "id": jid, "ln": j["line"], "out": ln})
-            if time.time() > deadline:
-                p.kill()
-                break
+                             text=True, bufsize=1)
+        deadline = t0 + j["count"] * (j["interval"] + 3) + 30
         try:
+            for ln in iter(p.stdout.readline, ""):
+                ln = ln.rstrip()
+                if not ln:
+                    continue
+                _pf(jid, ln)
+                if time.time() > deadline:
+                    p.kill()
+                    break
             rc = p.wait(timeout=5)
         except Exception:
-            p.kill()
+            try:
+                p.kill()
+            except Exception:
+                pass
             rc = -9
         j.update({"status": "done", "rc": rc, "ms": int((time.time() - t0) * 1000)})
     except Exception as e:
@@ -1121,7 +1189,7 @@ def ping_job_run(jid, argv, env, count, interval):
             ping_running[0] -= 1
         _mtr_broadcast({"t": "ping", "id": jid, "ln": j["line"],
                         "status": j["status"], "ms": j.get("ms"),
-                        "error": j.get("error")})
+                        "error": j.get("error"), "note": j.get("note")})
 
 
 def dig_run(body, cfg):

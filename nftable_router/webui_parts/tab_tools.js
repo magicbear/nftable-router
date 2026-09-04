@@ -62,12 +62,10 @@ function renderPingChips(){
   lab.style.cssText="border:1px solid #456;padding:2px 8px;border-radius:10px;cursor:pointer;font-size:12px";
   var cbx=document.createElement("input");cbx.type="checkbox";cbx.value=k;cbx.checked=(k==="default");
   function paint(){lab.style.borderColor=cbx.checked?"#6fbf73":"#456";lab.style.color=cbx.checked?"#cfe8cf":"#8fa3c0"}
-  if(tp){cbx.disabled=true;lab.title="tproxy(ss-redir)线路不支持ping";
-   lab.style.cssText="border:1px dashed #553;padding:2px 8px;border-radius:10px;font-size:12px;opacity:.45;cursor:not-allowed";
-   lab.appendChild(cbx);lab.appendChild(document.createTextNode(" "+lineLabel(k)+" (不支持)"));
-   box.appendChild(lab);return}
+  if(tp)lab.title="tproxy(ss-redir): 只测出口IP/路由, ICMP不经代理不ping";
   cbx.onchange=paint;paint();
-  lab.appendChild(cbx);lab.appendChild(document.createTextNode(" "+lineLabel(k)));
+  lab.appendChild(cbx);lab.appendChild(document.createTextNode(" "+lineLabel(k)+(tp?" (仅出口)":"")));
+  if(tp)lab.style.borderColor="#8a6d3b";
   box.appendChild(lab)})}
 var pingJobs={},pingLeft=0;
 function pingPane(ln){
@@ -84,7 +82,7 @@ window.__ping_on=function(m){
  var j=pingJobs[m.id];if(!j)return;
  if(m.out!=null){j.pre.textContent+=m.out+"\n";j.pre.scrollTop=j.pre.scrollHeight}
  if(m.status){
-  if(m.status==="done"){j.badge.textContent="完成 "+(m.ms||0)+"ms";j.badge.style.color="#6fbf73"}
+  if(m.status==="done"){j.badge.textContent="完成 "+(m.ms||0)+"ms"+(m.note?(" · "+m.note):"");j.badge.style.color="#6fbf73"}
   else{j.badge.textContent="× "+m.status+(m.error?(": "+m.error):"");j.badge.style.color="#d66969"}
   delete pingJobs[m.id];
   pingLeft=Math.max(0,pingLeft-1);
@@ -96,7 +94,7 @@ $("p-run").onclick=function(){
  $("p-run").disabled=true;$("p-err").textContent="";
  api("/api/ping",{method:"POST",headers:{"Content-Type":"application/json"},
   body:JSON.stringify({target:t,lines:lns,count:parseInt($("p-count").value,10)||3,
-   interval:parseFloat($("p-int").value)||1,size:parseInt($("p-size").value,10)||56,
+   interval:parseFloat($("p-int").value)||0.3,size:parseInt($("p-size").value,10)||56,
    family:$("p-fam").value})}).then(function(r){
     if(!r.ok){$("p-run").disabled=false;$("p-err").textContent=r.error;return toast(String(r.error),"bad")}
     if(r.errors&&r.errors.length)toast("部分线路未启动: "+r.errors.join("；"),"warn");

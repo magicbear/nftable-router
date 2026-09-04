@@ -719,8 +719,8 @@ def test_tools_units():
     cfg_tp = {"proxy": {"TP": {"mark": 99, "port": 1080, "ipv4": True, "weight": 1}},
               "rules": []}
     r = wa.ping_start({"target": "example.com", "lines": ["line:TP"]}, cfg_tp)
-    check("tproxy line refused with (不支持ping)",
-          not r["ok"] and "tproxy" in r["error"], str(r))
+    check("tproxy line starts egress-only job (ping skipped by runner)",
+          r["ok"] and r["jobs"][0]["tproxy"] is True, str(r))
     r = wa.ping_start({"target": "example.com", "lines": ["zzz"]}, {})
     check("ping unknown line rejected (no spawn)",
           not r["ok"] and "未知线路" in r["error"], str(r))
