@@ -816,7 +816,8 @@ def mtr_line_marks(cfg):
         if isinstance(m, int) and m > 0 and m not in (0x99, 0x100):
             out["line:" + name] = {"mark": m, "name": name,
                                    "kind": "proxy" + (" (managed)" if c.get("daemon") else ""),
-                                   "via": c.get("server") or c.get("proxy_ip") or ""}
+                                   "via": c.get("server") or c.get("proxy_ip") or "",
+                                   "tproxy": "port" in c}
     for b in cfg.get("egress_marks", []):
         if isinstance(b.get("mark"), int):
             key = "egress:" + (b.get("iface") or b.get("ip", ""))
@@ -1033,8 +1034,8 @@ def ping_start(body, cfg):
         lines = [lines]
     lines = [str(x) for x in lines if str(x)] or ["default"]
     lines = list(dict.fromkeys(lines))
-    if len(lines) > 10:
-        return {"ok": False, "error": "一次最多并行 10 条线路"}
+    if len(lines) > 64:
+        return {"ok": False, "error": "一次最多 64 条（防误操作上限，非功能限制）"}
     try:
         count = min(200, max(1, int(body.get("count", 3))))
         interval = min(5.0, max(0.2, float(body.get("interval", 1))))
@@ -1043,7 +1044,13 @@ def ping_start(body, cfg):
         return {"ok": False, "error": "count/interval/size 需为数字"}
     fam = str(body.get("family", "auto"))
     jobs, errs = [], []
+    all_lines = mtr_line_marks(cfg)
     for ln in lines:
+        if (all_lines.get(ln) or {}).get("tproxy"):
+            # ss-redir/tproxy lines hijack TCP at the redirect port; marked
+            # ICMP never rides the proxy -- "ping via this line" is meaningless
+            errs.append("%s: tproxy线路不支持ping" % ln)
+            continue
         env, mark, err = _tool_env(cfg, ln)
         if err:
             errs.append("%s: %s" % (ln, err))
@@ -1058,8 +1065,8 @@ def ping_start(body, cfg):
             argv.append("-6")
         argv.append(tgt)
         with PING_LOCK:
-            if ping_running[0] >= 16:
-                errs.append("并发 ping 已满(16)，部分线路未启动")
+            if ping_running[0] >= 64:
+                errs.append("全局并发 ping 已满(64，含其他页面在跑的)，本条未启动")
                 break
             ping_running[0] += 1
             jid = str(next(ping_seq))

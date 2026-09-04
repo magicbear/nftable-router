@@ -713,7 +713,14 @@ def test_tools_units():
         check("%s rejected" % why, not r.get("ok"), str(r))
     r = wa.ping_start({"target": "example.com",
                        "lines": ["l%d" % i for i in range(11)]}, {})
-    check("ping >10 lines rejected", not r["ok"] and "10" in r["error"], str(r))
+    check("11 unknown lines: no parallel-count rejection",
+          not r["ok"] and "最多并行" not in r["error"]
+          and all("未知线路" in r["error"] for _ in [0]), str(r)[:100])
+    cfg_tp = {"proxy": {"TP": {"mark": 99, "port": 1080, "ipv4": True, "weight": 1}},
+              "rules": []}
+    r = wa.ping_start({"target": "example.com", "lines": ["line:TP"]}, cfg_tp)
+    check("tproxy line refused with (不支持ping)",
+          not r["ok"] and "tproxy" in r["error"], str(r))
     r = wa.ping_start({"target": "example.com", "lines": ["zzz"]}, {})
     check("ping unknown line rejected (no spawn)",
           not r["ok"] and "未知线路" in r["error"], str(r))

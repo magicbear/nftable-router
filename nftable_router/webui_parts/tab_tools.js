@@ -57,10 +57,15 @@ function renderPingChips(){
  if(!toolLines){if(!box.childNodes.length)box.textContent="线路加载中…";loadToolLines(renderPingChips);return}
  box.innerHTML="";
  ["default"].concat(Object.keys(toolLines).sort()).forEach(function(k){
+  var tp=!!(toolLines[k]||{}).tproxy;
   var lab=el("label","pl-chip");
   lab.style.cssText="border:1px solid #456;padding:2px 8px;border-radius:10px;cursor:pointer;font-size:12px";
   var cbx=document.createElement("input");cbx.type="checkbox";cbx.value=k;cbx.checked=(k==="default");
   function paint(){lab.style.borderColor=cbx.checked?"#6fbf73":"#456";lab.style.color=cbx.checked?"#cfe8cf":"#8fa3c0"}
+  if(tp){cbx.disabled=true;lab.title="tproxy(ss-redir)线路不支持ping";
+   lab.style.cssText="border:1px dashed #553;padding:2px 8px;border-radius:10px;font-size:12px;opacity:.45;cursor:not-allowed";
+   lab.appendChild(cbx);lab.appendChild(document.createTextNode(" "+lineLabel(k)+" (不支持)"));
+   box.appendChild(lab);return}
   cbx.onchange=paint;paint();
   lab.appendChild(cbx);lab.appendChild(document.createTextNode(" "+lineLabel(k)));
   box.appendChild(lab)})}
