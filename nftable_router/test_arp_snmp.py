@@ -580,12 +580,20 @@ def test_descr_adjacency_and_owner():
           len(set(asn.switch_name_tokens("HSDJ-46-ACC-S5732-2"))
               & set(asn.switch_name_tokens("HSDJ-47-ACC-S5732"))) == 1)
     links = {}
+    bridges = ["AC1", "HSDJ-47-CORE-CE6881", "HSDJ-46-ACC-S5732-2"]
     asn.build_descr_links({
         "AC1": {22: ("Eth-Trunk0", "To CE6881-Eth-Trunk 10")},
         "HSDJ-47-CORE-CE6881": {111: ("Eth-Trunk-0", "To AC-1 Eth-Trunk-0"),
                                 112: ("10GE2/0/42", "To Outdoor SW - 192.168.11.18")},
         "HSDJ-46-ACC-S5732-2": {55: ("25GE0/0/1", ""), "56": ("GE1/0/9", "会议室AP")},
-    }, ["AC1", "HSDJ-47-CORE-CE6881", "HSDJ-46-ACC-S5732-2"], links)
+    }, ["AC1", "HSDJ-47-CORE-CE6881", "HSDJ-46-ACC-S5732-2"], links, bridges)
+    # end hosts (MB-2288X-style, tiny table) must NEVER make a port transit
+    links2 = {}
+    asn.build_descr_links(
+        {"HSDJ-47-CORE-CE6881": {40: ("10GE1/0/30", "MB-2288X sFlow")}},
+        ["HSDJ-47-CORE-CE6881", "MB-2288X"], links2, ["HSDJ-47-CORE-CE6881"])
+    check("descr toward an end host is not transit", (
+        "HSDJ-47-CORE-CE6881", 40) not in links2, str(links2))
     check("AC1 uplink descr -> core", links.get(("AC1", 22)) == "HSDJ-47-CORE-CE6881", str(links))
     check("core 'To AC-1' -> AC1", links.get(("HSDJ-47-CORE-CE6881", 111)) == "AC1", str(links))
     check("unmanaged outdoor descr matches nothing",
@@ -612,12 +620,20 @@ def test_self_mac_links_and_location():
           and not asn.plausible_self_mac("00-00-00-00-00-00")
           and asn.plausible_self_mac("68-77-24-35-ad-c4"))
     r = FakeRedis()
+    for i in range(35):      # B must look like a middlebridge (>=30 macs)
+        r.hset("MAC::TABLE::B", "fill-%02d" % i, json.dumps({"ifIndex": 9}))
     r.sadd("SW::SELFMAC::B", "bb-bb-bb-00-00-01")
     r.sadd("SW::SELFMAC::A", "aa-aa-aa-00-00-01")
     r.hset("MAC::TABLE::A", "bb-bb-bb-00-00-01",
            json.dumps({"ifIndex": 22, "ifName": "25GE0/0/1"}))
     r.hset("MAC::TABLE::B", "host-mac-1", json.dumps({"ifIndex": 5, "ifName": "GE1/0/24"}))
     r.hset("SW::PORTFAN::A", "22", "300")
+    r.sadd("SW::SELFMAC::C", "bb-bb-bb-00-00-01")   # shared vendor block -> ambiguous
+    r.hset("MAC::TABLE::C", "x", json.dumps({"ifIndex": 1}))
+    r.hset("MAC::TABLE::B", "y", json.dumps({"ifIndex": 1}))
+    links, fan = asn.load_switch_links(r, ["A", "B", "C"])
+    check("ambiguous shared self mac skipped", ("A", 22) not in links, str(links))
+    r.delete("SW::SELFMAC::C")
     links, fan = asn.load_switch_links(r, ["A", "B"])
     check("adjacency from learned self mac", links.get(("A", 22)) == "B", str(links))
     check("fanout loaded", fan.get(("A", 22)) == 300, str(fan))

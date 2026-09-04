@@ -256,12 +256,14 @@ def switch_name_tokens(name):
     return toks
 
 
-def build_descr_links(mac_tables_rows, names, links):
+def build_descr_links(mac_tables_rows, names, links, bridge_names=None):
     """(sw, ifIndex) -> neighbour when the port DESCRIPTION names another
     managed switch -- complements self-mac adjacency for boxes whose
     ifPhysAddress comes back empty (Huawei WLAN ACs)."""
     owner_of = {}
     for n in names:
+        if bridge_names is not None and n not in bridge_names:
+            continue              # pointing at an end host is NOT transit
         for t in switch_name_tokens(n):
             owner_of.setdefault(t, set()).add(n)
     for n, rows in mac_tables_rows.items():
@@ -290,16 +292,29 @@ def load_switch_links(r, names):
     fan = {}
     if r is None or not names:
         return links, fan
-    own = {}
+    # a switch must look like a MIDDLEBRIDGE to make ports pointing at it
+    # transit: an end host (even one we poll like a Linux box) never is.
+    bridge_min_macs = 30
+    tab_sizes = {}
+    for n in names:
+        try:
+            tab_sizes[n] = r.hlen("MAC::TABLE::%s" % n)
+        except Exception:
+            tab_sizes[n] = 0
+    bridge_names = {n for n in names if tab_sizes.get(n, 0) >= bridge_min_macs}
+    owners_of = {}
     for n in names:
         try:
             for m in (r.smembers("SW::SELFMAC::%s" % n) or set()):
-                own[_dec(m)] = n
+                owners_of.setdefault(_dec(m), set()).add(n)
         except Exception:
             pass
     for n in names:
-        for m, owner in own.items():
-            if owner == n:
+        for m, owners in owners_of.items():
+            if len(owners) != 1:
+                continue          # shared vendor mac-block ambiguity (CORE/AC)
+            owner = next(iter(owners))
+            if owner == n or owner not in bridge_names:
                 continue
             try:
                 raw = r.hget("MAC::TABLE::%s" % n, m)
@@ -339,7 +354,7 @@ def load_switch_links(r, names):
                     continue
                 got[int(ii)] = (row.get("ifName", ""), row.get("ifDescr", ""))
             descr_rows[n] = got
-        build_descr_links(descr_rows, names, links)
+        build_descr_links(descr_rows, names, links, bridge_names)
     except Exception:
         pass
     return links, fan

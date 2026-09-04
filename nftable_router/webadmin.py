@@ -401,6 +401,8 @@ def arp_table(app, limit=4000):
             if loc and loc[0] == "final":
                 port_sw, ifName, ifDescr = loc[1], loc[2], loc[3]
                 port = ifDescr or ifName
+                if ifName and ifDescr and ifName != ifDescr:
+                    port = "%s (%s)" % (ifDescr, ifName)
             elif loc and loc[0] == "toward":
                 port, port_sw = "→ " + loc[1], loc[1]
             rows.append({"ip": ip, "mac": mac, "sysname": e.get("sysname") or "",
