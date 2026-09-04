@@ -25,13 +25,21 @@ var TOOL_HOOK={};
  document.querySelectorAll("#tool-tabs button").forEach(function(b){b.onclick=function(){showTool(b.dataset.tool)}});
  showTool("mtr");
 })();
-// shared line selector population (same source as the MTR tab)
-var toolLines=null;
+// shared line lists (same source as the MTR tab)
+var toolLines=null,toolLinesWaiters=[];
+function loadToolLines(cb){
+ if(toolLines){cb();return}
+ toolLinesWaiters.push(cb);
+ api("/api/mtr/lines").then(function(d){toolLines=d.lines||{};
+  var ws=toolLinesWaiters;toolLinesWaiters=[];ws.forEach(function(f){try{f()}catch(e){}})}).catch(function(){})}
+function lineLabel(k){
+ if(!k||k==="default"||k==="auto")return "default";
+ return (k.split(":")[1]||k)+" [0x"+((((toolLines||{})[k]||{}).mark)||0).toString(16)+"]"}
 function fillLines(which){
+ if(which==="ping"){renderPingChips();return}
  var todo=[];
- if(which==="ping"&&!$("p-line").options.length)todo.push(["p-line",$("p-line")]);
- if(which==="dig"&&!$("d-line").options.length)todo.push(["d-line",$("d-line")]);
- if(which==="ipq"&&!$("i-line").options.length)todo.push(["i-line",$("i-line")]);
+ if(which==="dig"&&!$("d-line").options.length)todo.push($("d-line"));
+ if(which==="ipq"&&!$("i-line").options.length)todo.push($("i-line"));
  if(!todo.length)return;
  function paint(sel){
   sel.innerHTML="";
@@ -40,32 +48,59 @@ function fillLines(which){
   Object.keys(toolLines||{}).sort().forEach(function(k){
    var L=toolLines[k];
    var op=el("option","",(k.split(":")[1])+"  [0x"+((L.mark||0).toString(16))+"]");op.value=k;sel.appendChild(op)})}
- if(toolLines){todo.forEach(function(x){paint(x[1])});return}
- api("/api/mtr/lines").then(function(d){toolLines=d.lines||{};todo.forEach(function(x){paint(x[1])})}).catch(function(){})}
+ if(toolLines){todo.forEach(paint);return}
+ loadToolLines(function(){todo.forEach(paint)})}
 
-// ---------- ping (live over the existing /ws/stream socket) ----------
-var pingId=null;
+// ---------- ping (multi-line parallel, live over /ws/stream) ----------
+function renderPingChips(){
+ var box=$("p-lines");if(!box)return;
+ if(!toolLines){if(!box.childNodes.length)box.textContent="线路加载中…";loadToolLines(renderPingChips);return}
+ box.innerHTML="";
+ ["default"].concat(Object.keys(toolLines).sort()).forEach(function(k){
+  var lab=el("label","pl-chip");
+  lab.style.cssText="border:1px solid #456;padding:2px 8px;border-radius:10px;cursor:pointer;font-size:12px";
+  var cbx=document.createElement("input");cbx.type="checkbox";cbx.value=k;cbx.checked=(k==="default");
+  function paint(){lab.style.borderColor=cbx.checked?"#6fbf73":"#456";lab.style.color=cbx.checked?"#cfe8cf":"#8fa3c0"}
+  cbx.onchange=paint;paint();
+  lab.appendChild(cbx);lab.appendChild(document.createTextNode(" "+lineLabel(k)));
+  box.appendChild(lab)})}
+var pingJobs={},pingLeft=0;
+function pingPane(ln){
+ var d=el("div");d.style.cssText="flex:1 1 340px;min-width:300px;border:1px solid #22304a;border-radius:6px;padding:4px 8px";
+ var hd=el("div","dim");
+ hd.appendChild(el("b","",lineLabel(ln)));
+ var badge=el("span",""," 运行中…");badge.style.marginLeft="8px";hd.appendChild(badge);
+ d.appendChild(hd);
+ var pre=el("pre","dim");pre.style.cssText="margin:4px 0 0;min-height:70px;max-height:300px;overflow:auto;white-space:pre-wrap;font-size:11px";
+ d.appendChild(pre);$("p-out").appendChild(d);
+ return {badge:badge,pre:pre}}
 window.__ping_on=function(m){
- if(!m||String(m.id)!==String(pingId))return;
- var o=$("p-out");
- if(m.line!=null){o.textContent+=m.line+"\n";o.scrollTop=o.scrollHeight}
+ if(!m||m.t!=="ping")return;
+ var j=pingJobs[m.id];if(!j)return;
+ if(m.out!=null){j.pre.textContent+=m.out+"\n";j.pre.scrollTop=j.pre.scrollHeight}
  if(m.status){
-  $("p-run").disabled=false;
-  if(m.status==="done"){o.textContent+="\n—— 完成 "+(m.ms||0)+"ms ——\n";$("p-err").textContent=""}
-  else $("p-err").textContent="ping "+m.status+(m.error?(": "+m.error):"");
-  o.scrollTop=o.scrollHeight}}
+  if(m.status==="done"){j.badge.textContent="完成 "+(m.ms||0)+"ms";j.badge.style.color="#6fbf73"}
+  else{j.badge.textContent="× "+m.status+(m.error?(": "+m.error):"");j.badge.style.color="#d66969"}
+  delete pingJobs[m.id];
+  pingLeft=Math.max(0,pingLeft-1);
+  if(!pingLeft)$("p-run").disabled=false}}
 $("p-run").onclick=function(){
  var t=$("p-target").value.trim();if(!t)return toast("填写目标 IP / 域名","warn");
+ var lns=[].slice.call($("p-lines").querySelectorAll("input:checked")).map(function(x){return x.value});
+ if(!lns.length)return toast("至少勾选一条线路","warn");
  $("p-run").disabled=true;$("p-err").textContent="";
  api("/api/ping",{method:"POST",headers:{"Content-Type":"application/json"},
-  body:JSON.stringify({target:t,line:$("p-line").value||"default",
-   count:parseInt($("p-count").value,10)||20,interval:parseFloat($("p-int").value)||1,
-   size:parseInt($("p-size").value,10)||56,family:$("p-fam").value})}).then(function(r){
+  body:JSON.stringify({target:t,lines:lns,count:parseInt($("p-count").value,10)||3,
+   interval:parseFloat($("p-int").value)||1,size:parseInt($("p-size").value,10)||56,
+   family:$("p-fam").value})}).then(function(r){
     if(!r.ok){$("p-run").disabled=false;$("p-err").textContent=r.error;return toast(String(r.error),"bad")}
-    pingId=r.id;$("p-out").textContent="";toast("Ping #"+r.id+" 运行中（流式）","good")
-  }).catch(function(e){$("p-run").disabled=false;$("p-err").textContent=""+e})};
+    if(r.errors&&r.errors.length)toast("部分线路未启动: "+r.errors.join("；"),"warn");
+    pingJobs={};pingLeft=r.jobs.length;$("p-out").innerHTML="";
+    r.jobs.forEach(function(jb){pingJobs[jb.id]=pingPane(jb.line)});
+    toast("Ping 启动: "+r.jobs.length+" 条线路","good")})
+   .catch(function(e){$("p-run").disabled=false;$("p-err").textContent=""+e})};
 $("p-target").addEventListener("keydown",function(e){if(e.key==="Enter")$("p-run").click()});
-$("p-clear").onclick=function(){$("p-out").textContent=""};
+$("p-clear").onclick=function(){$("p-out").innerHTML="";pingJobs={};pingLeft=0;$("p-run").disabled=false};
 
 // ---------- dig ----------
 $("d-run").onclick=function(){

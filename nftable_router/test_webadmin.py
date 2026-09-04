@@ -711,6 +711,12 @@ def test_tools_units():
                        (wa.ping_start, dict(bad, target="a b"), "ping space")):
         r = fn(b, {}) if fn is not wa.whois_run else fn(b)
         check("%s rejected" % why, not r.get("ok"), str(r))
+    r = wa.ping_start({"target": "example.com",
+                       "lines": ["l%d" % i for i in range(11)]}, {})
+    check("ping >10 lines rejected", not r["ok"] and "10" in r["error"], str(r))
+    r = wa.ping_start({"target": "example.com", "lines": ["zzz"]}, {})
+    check("ping unknown line rejected (no spawn)",
+          not r["ok"] and "未知线路" in r["error"], str(r))
     r = wa.dig_run({"target": "example.com", "type": "A", "line": "zzz"}, {})
     check("dig unknown line rejected before spawn", not r["ok"] and "未知线路" in r["error"], str(r))
     r = wa.ipq_run({"ips": "not an ip"}, {}, "")

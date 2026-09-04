@@ -13,9 +13,8 @@
  <div id=tool-body>
   <div id=t-ping class="tsub card">
    <div class=bar>
-    <select id="p-line" style="min-width:220px"></select>
     <input id="p-target" placeholder="目标 IP / 域名" style="width:220px">
-    <label>次数</label><input id="p-count" type="number" value="20" style="width:60px">
+    <label>次数</label><input id="p-count" type="number" value="3" style="width:60px">
     <label>间隔s</label><input id="p-int" value="1" style="width:56px">
     <label>包大小B</label><input id="p-size" type="number" value="56" style="width:64px">
     <select id="p-fam"><option value="auto">自动</option><option value="4">IPv4</option><option value="6">IPv6</option></select>
@@ -23,7 +22,8 @@
     <button id="p-clear">清屏</button>
     <span id="p-err" class="bad"></span>
    </div>
-   <pre id="p-out" class="dim" style="min-height:140px;max-height:440px;overflow:auto;white-space:pre-wrap;margin:6px 0 0"></pre>
+   <div id="p-lines" class="dim" style="display:flex;flex-wrap:wrap;gap:6px;margin:4px 0"></div>
+   <div id="p-out" style="display:flex;flex-wrap:wrap;gap:8px"></div>
   </div>
   <div id=t-dig class="tsub card">
    <div class=bar>

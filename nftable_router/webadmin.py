@@ -1026,39 +1026,57 @@ def ping_start(body, cfg):
     tgt, err = _tool_target(body)
     if err:
         return {"ok": False, "error": err}
-    env, mark, err = _tool_env(cfg, body.get("line"))
-    if err:
-        return {"ok": False, "error": err}
+    lines = body.get("lines")
+    if lines is None:
+        lines = [body.get("line") or "default"]
+    if isinstance(lines, str):
+        lines = [lines]
+    lines = [str(x) for x in lines if str(x)] or ["default"]
+    lines = list(dict.fromkeys(lines))
+    if len(lines) > 10:
+        return {"ok": False, "error": "一次最多并行 10 条线路"}
     try:
-        count = min(200, max(1, int(body.get("count", 20))))
+        count = min(200, max(1, int(body.get("count", 3))))
         interval = min(5.0, max(0.2, float(body.get("interval", 1))))
         size = min(65000, max(1, int(body.get("size", 56))))
     except (TypeError, ValueError):
         return {"ok": False, "error": "count/interval/size 需为数字"}
-    argv = ["ping", "-n", "-c", str(count), "-i", str(interval), "-s", str(size), "-W", "2"]
     fam = str(body.get("family", "auto"))
-    if fam == "4":
-        argv.append("-4")
-    elif fam == "6":
-        argv.append("-6")
-    elif ":" in tgt:
-        argv.append("-6")
-    argv.append(tgt)
-    with PING_LOCK:
-        if ping_running[0] >= 4:
-            return {"ok": False, "error": "并发 ping 已满(4)，稍后再试"}
-        ping_running[0] += 1
-        jid = str(next(ping_seq))
-        ping_jobs[jid] = {"id": jid, "status": "running", "target": tgt,
-                          "line": str(body.get("line") or "default"), "mark": mark,
-                          "count": count, "started": time.time(), "out": []}
-        if len(ping_jobs) > 40:
-            for k in sorted(ping_jobs, key=lambda x: ping_jobs[x]["started"])[:len(ping_jobs) - 40]:
-                if ping_jobs[k]["status"] != "running":
-                    del ping_jobs[k]
-    threading.Thread(target=ping_job_run, args=(jid, argv, env, count, interval),
-                     daemon=True).start()
-    return {"ok": True, "id": jid}
+    jobs, errs = [], []
+    for ln in lines:
+        env, mark, err = _tool_env(cfg, ln)
+        if err:
+            errs.append("%s: %s" % (ln, err))
+            continue
+        argv = ["ping", "-n", "-c", str(count), "-i", str(interval),
+                "-s", str(size), "-W", "2"]
+        if fam == "4":
+            argv.append("-4")
+        elif fam == "6":
+            argv.append("-6")
+        elif ":" in tgt:
+            argv.append("-6")
+        argv.append(tgt)
+        with PING_LOCK:
+            if ping_running[0] >= 16:
+                errs.append("并发 ping 已满(16)，部分线路未启动")
+                break
+            ping_running[0] += 1
+            jid = str(next(ping_seq))
+            ping_jobs[jid] = {"id": jid, "status": "running", "target": tgt,
+                              "line": ln, "mark": mark,
+                              "count": count, "started": time.time(), "out": []}
+            if len(ping_jobs) > 80:
+                for k in sorted(ping_jobs, key=lambda x: ping_jobs[x]["started"])[:len(ping_jobs) - 80]:
+                    if ping_jobs[k]["status"] != "running":
+                        del ping_jobs[k]
+        threading.Thread(target=ping_job_run, args=(jid, argv, env, count, interval),
+                         daemon=True).start()
+        jobs.append({"id": jid, "line": ln, "mark": mark})
+    if jobs:
+        return {"ok": True, "jobs": jobs, "ids": [j["id"] for j in jobs],
+                "errors": errs or None}
+    return {"ok": False, "error": "; ".join(errs) or "没有可启动的线路"}
 
 
 def ping_job_run(jid, argv, env, count, interval):
@@ -1075,7 +1093,7 @@ def ping_job_run(jid, argv, env, count, interval):
             if len(buf) > 400:
                 del buf[:len(buf) - 400]
             j["out"] = list(buf)
-            _mtr_broadcast({"t": "ping", "id": jid, "line": ln})
+            _mtr_broadcast({"t": "ping", "id": jid, "ln": j["line"], "out": ln})
             if time.time() > deadline:
                 p.kill()
                 break
@@ -1094,8 +1112,9 @@ def ping_job_run(jid, argv, env, count, interval):
             pass
         with PING_LOCK:
             ping_running[0] -= 1
-        _mtr_broadcast({"t": "ping", "id": jid, "status": j["status"],
-                        "ms": j.get("ms"), "error": j.get("error")})
+        _mtr_broadcast({"t": "ping", "id": jid, "ln": j["line"],
+                        "status": j["status"], "ms": j.get("ms"),
+                        "error": j.get("error")})
 
 
 def dig_run(body, cfg):
