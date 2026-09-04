@@ -7,6 +7,7 @@ Run: python3 test_arp_snmp.py"""
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import arp_snmp as asn
@@ -469,6 +470,31 @@ def test_argv_and_redaction():
     check("collector argparse accepts --authProto sha", ap.auth_proto == "sha")
 
 
+def test_batch_stop_parallel():
+    print("[13] _stop_children: one SIGTERM wave, shared reap deadline")
+    import subprocess
+    code = ("import signal,time\n"
+            "def h(*a):\n time.sleep(1.0); raise SystemExit\n"
+            "signal.signal(signal.SIGTERM,h)\n"
+            "time.sleep(30)\n")
+    svc = asvc.ArpCollectorService(
+        spawn=lambda argv, outfile: subprocess.Popen(["python3", "-c", code]),
+        log=lambda m: None, script="s.py")
+    children = []
+    for i in range(3):
+        ch = asvc._Child({"name": "d%d" % i, "ip": "1.1.1.%d" % i}, ["x"])
+        ch.proc = svc._spawn(["x"], None)
+        ch.state = "running"
+        children.append(ch)
+    t0 = time.time()
+    svc._stop_children(children, grace=5)
+    dt = time.time() - t0
+    check("3 slow-to-die collectors stopped in parallel (<2.5s; serial would be ~3s)",
+          dt < 2.5, "%.2fs" % dt)
+    check("all reaped and marked stopped",
+          all(c.proc is None and c.state == "stopped" for c in children))
+
+
 def test_supervisor_lifecycle():
     print("[10] supervisor: start / diff-reconcile / crash-restart / rate-limit")
     svc, spawned = make_svc()
@@ -749,7 +775,8 @@ if __name__ == "__main__":
               test_poll_once_survives_mac_table_oid_not_increasing,
               test_poll_once_wlan_skips_bridge,
               test_pick_mac_port_prefers_named_edge_over_vlanif,
-              test_spec_parsing, test_argv_and_redaction, test_supervisor_lifecycle,
+              test_spec_parsing, test_argv_and_redaction,
+              test_batch_stop_parallel, test_supervisor_lifecycle,
               test_disable_stops_children):
         t()
     print("\n==== %d passed, %d failed ====" % (PASS, FAIL))

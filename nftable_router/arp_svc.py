@@ -198,17 +198,34 @@ class ArpCollectorService:
             self.log("collector %s spawn failed: %s" % (child.dev["name"], e))
 
     def _stop_child(self, child, grace=5):
-        if child.proc is not None and child.proc.poll() is None:
+        self._stop_children([child], grace=grace)
+
+    def _stop_children(self, children, grace=5):
+        """Signal ALL at once, then reap against one shared deadline.
+        Waiting per child made shutdown/removal cost N x grace (a wave of
+        'collector ... stopped' log lines seconds apart)."""
+        live = [c for c in children if c.proc is not None and c.proc.poll() is None]
+        for c in live:
             try:
-                child.proc.terminate()
-                try:
-                    child.proc.wait(timeout=grace)
-                except subprocess.TimeoutExpired:
-                    child.proc.kill()
+                c.proc.terminate()
             except OSError:
                 pass
-        child.proc = None
-        child.state = "stopped"
+        deadline = time.monotonic() + grace
+        pending = list(live)
+        while pending and time.monotonic() < deadline:
+            pending = [c for c in pending if c.proc.poll() is None]
+            if pending:
+                time.sleep(0.05)
+        for c in live:
+            if c.proc is not None and c.proc.poll() is None:
+                try:
+                    c.proc.kill()
+                    c.proc.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            c.proc = None
+            c.state = "stopped"
+        return live
 
     # ------------------------------------------------------------------
     def reconcile(self, config, script=None):
@@ -225,14 +242,15 @@ class ArpCollectorService:
         for dev in spec["devices"]:
             want[dev["name"]] = device_argv(spec, dev, script)
 
-        # removed / renamed
+        # removed / renamed: gather, then one signal wave reaps them together
+        removed = []
         for name in list(self.children):
             if name not in want:
-                self._stop_child(self.children[name])
+                removed.append(self.children.pop(name))
                 self.log("collector %s removed from config, stopped" % name)
-                del self.children[name]
 
         started = changed = kept = 0
+        work = []
         for dev in spec["devices"]:
             name = dev["name"]
             argv = want[name]
@@ -242,12 +260,13 @@ class ArpCollectorService:
                 cur.dev = dev
                 kept += 1
                 continue
-            if cur is not None:
-                if cur.argv != argv:
-                    changed += 1
-                self._stop_child(cur)
+            if cur is not None and cur.argv != argv:
+                changed += 1
+            work.append((dev, argv, cur))
+        self._stop_children(removed + [c for _, _, c in work if c is not None])
+        for dev, argv, _old in work:
             child = _Child(dev, argv)
-            self.children[name] = child
+            self.children[dev["name"]] = child
             self._start(spec, child)
             started += 1
         self.spec = spec
@@ -300,7 +319,7 @@ class ArpCollectorService:
         return out
 
     def stop_all(self, grace=5):
-        for name, child in self.children.items():
-            self._stop_child(child, grace=grace)
-            self.log("collector %s stopped" % name)
+        live = self._stop_children(list(self.children.values()), grace=grace)
+        for c in live:
+            self.log("collector %s stopped" % c.dev["name"])
         self.children = {}
